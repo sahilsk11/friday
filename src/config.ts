@@ -6,7 +6,7 @@ const defaultOpencodeUrl = process.env.OPENCODE_URL || 'http://127.0.0.1:7395';
 
 export const opencodeByProject: Record<string, string> = {
   factorbacktest: process.env.OPENCODE_FACTORBACKTEST_URL || 'http://127.0.0.1:7395',
-  friday: process.env.OPENCODE_FRIDAY_URL || 'http://127.0.0.1:7398',
+  friday: process.env.OPENCODE_FRIDAY_URL || 'http://127.0.0.1:7399',
   strange: process.env.OPENCODE_STRANGE_URL || 'http://127.0.0.1:7397',
 };
 
