@@ -8,18 +8,11 @@ interface Session {
   created: number;
 }
 
-const PROJECTS = [
-  { id: 'factorbacktest', name: 'Factor Backtest' },
-  { id: 'friday', name: 'Friday' },
-  { id: 'strange', name: 'Strange' },
-];
-
 export default function App() {
   const [inputText, setInputText] = useState('');
   const [messages, setMessages] = useState<Array<{ role: 'user' | 'agent'; text: string }>>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [selectedProject, setSelectedProject] = useState('factorbacktest');
 const {
     connected,
     sessionTitle,
@@ -38,11 +31,11 @@ const {
   const [isRecording, setIsRecording] = useState(false);
 
   useEffect(() => {
-    fetch(`/api/sessions?project=${selectedProject}`, { credentials: 'include' })
+    fetch('/api/sessions', { credentials: 'include' })
       .then(r => r.json())
       .then(d => setSessions(d.sessions || []))
       .catch(() => {});
-  }, [selectedProject]);
+  }, []);
 
   useEffect(() => {
     if (agentText) {
@@ -72,12 +65,7 @@ const {
     setMessages([]);
     setSessionTitle(null);
     setSidebarOpen(false);
-    const r = await fetch('/api/session', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ project: selectedProject }),
-    });
+    const r = await fetch('/api/session', { method: 'POST', credentials: 'include' });
     if (r.ok) {
       const j = await r.json();
       setSession(j.sessionId, 'New Session');
@@ -178,23 +166,6 @@ const {
               {sessionTitle}
             </span>
           )}
-          <select
-            value={selectedProject}
-            onChange={(e) => setSelectedProject(e.target.value)}
-            style={{
-              padding: '6px 10px',
-              borderRadius: '6px',
-              border: '1px solid #4b5563',
-              background: '#1f2937',
-              color: 'white',
-              fontSize: '14px',
-              cursor: 'pointer',
-            }}
-          >
-            {PROJECTS.map(p => (
-              <option key={p.id} value={p.id}>{p.name}</option>
-            ))}
-          </select>
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: connected ? '#4ade80' : '#f87171' }} />
           <span style={{ fontSize: '14px', color: '#9ca3af' }}>{connected ? 'Connected' : 'Disconnected'}</span>

@@ -53,10 +53,9 @@ export class SessionManager extends EventEmitter {
     this.speakingPolicy = new SpeakingPolicy();
   }
 
-  async createSession(title?: string, opencodeUrl?: string): Promise<{ sessionId: string }> {
+  async createSession(title?: string): Promise<{ sessionId: string }> {
     const sessionId = uuidv4();
-    const url = opencodeUrl || this.defaultOpencodeUrl;
-    const agentAdapter = new OpenCodeAdapter(url);
+    const agentAdapter = new OpenCodeAdapter(this.defaultOpencodeUrl);
     const agentSession = await agentAdapter.createSession({ title });
 
     const session: Session = {
