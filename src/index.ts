@@ -71,8 +71,8 @@ const server = http.createServer(async (req, res) => {
 
     if (method === 'GET' && path === '/api/sessions') {
       const response = await fetch(`${config.opencodeUrl}/session`);
-      const sessions = await response.json();
-      const list = sessions.map((s: { id: string; title: string; time: { created: number } }) => ({
+      const sessions = (await response.json()) as Array<{ id: string; title: string; time: { created: number } }>;
+      const list = sessions.map(s => ({
         id: s.id,
         title: s.title || 'Untitled',
         created: s.time?.created,
@@ -93,8 +93,8 @@ const server = http.createServer(async (req, res) => {
     if (method === 'GET' && messagesMatch) {
       const opencodeSessionId = messagesMatch[1];
       const response = await fetch(`${config.opencodeUrl}/session/${opencodeSessionId}/message`);
-      const messages = await response.json();
-      const list = messages.map((m: { info: { role: string; id: string }; parts: { type: string; text: string }[] }) => ({
+      const messages = (await response.json()) as Array<{ info: { role: string; id: string }; parts: { type: string; text: string }[] }>;
+      const list = messages.map(m => ({
         role: m.info?.role,
         id: m.info?.id,
         content: m.parts?.find(p => p.type === 'text')?.text || '',
