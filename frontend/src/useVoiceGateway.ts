@@ -12,6 +12,7 @@ export function useVoiceGateway({ onMessage }: UseVoiceGatewayOptions = {}) {
   const [sessionState, setSessionState] = useState<string>('idle');
   const [transcript, setTranscript] = useState('');
   const [agentText, setAgentText] = useState('');
+  const prevSessionStateRef = useRef<string>('idle');
   const [lastError, setLastError] = useState<string | null>(null);
 
   // sessionId is also captured in a ref so audio onaudioprocess (which closes
@@ -29,6 +30,13 @@ export function useVoiceGateway({ onMessage }: UseVoiceGatewayOptions = {}) {
   // — overkill for short responses.
   const ttsBufRef = useRef<Map<string, Uint8Array[]>>(new Map());
   const playbackCtxRef = useRef<AudioContext | null>(null);
+
+  useEffect(() => {
+    if (prevSessionStateRef.current !== 'running' && sessionState === 'running') {
+      setAgentText('');
+    }
+    prevSessionStateRef.current = sessionState;
+  }, [sessionState]);
 
   const decodeBase64 = (b64: string): Uint8Array => {
     const bin = atob(b64);
@@ -142,8 +150,14 @@ export function useVoiceGateway({ onMessage }: UseVoiceGatewayOptions = {}) {
   connectRef.current = connect;
 
   const startRecording = useCallback(async () => {
-    const sid = sessionIdRef.current;
-    if (!sid) return;
+    let sid = sessionIdRef.current;
+    if (!sid) {
+      if (connectRef.current) {
+        await connectRef.current();
+        sid = sessionIdRef.current;
+      }
+      if (!sid) return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
