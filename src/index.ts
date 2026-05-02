@@ -2,7 +2,14 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 
-import { config } from './config.js';
+import { config, opencodeByProject } from './config.js';
+
+function getOpencodeUrl(project?: string): string {
+  if (project && opencodeByProject[project]) {
+    return opencodeByProject[project];
+  }
+  return config.opencodeUrl;
+}
 import { logger } from './logger.js';
 import { SessionManager } from './sessionManager.js';
 import type { RuntimeConfig, ServerMessage } from './types.js';
@@ -70,7 +77,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === 'GET' && path === '/api/sessions') {
-      const response = await fetch(`${config.opencodeUrl}/session`);
+      const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+      const project = url.searchParams.get('project') || undefined;
+      const opencodeUrl = getOpencodeUrl(project);
+      const response = await fetch(`${opencodeUrl}/session`);
       const sessions = (await response.json()) as Array<{ id: string; title: string; time: { created: number } }>;
       const list = sessions.map(s => ({
         id: s.id,
@@ -104,9 +114,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === 'POST' && path === '/api/session') {
-      const body = await readJson<{ title?: string }>(req);
-      const result = await sessionManager.createSession(body.title);
-      jsonResp(res, 200, { sessionId: result.sessionId, title: body.title });
+      const body = await readJson<{ title?: string; project?: string }>(req);
+      const opencodeUrl = getOpencodeUrl(body.project);
+      const result = await sessionManager.createSession(body.title, opencodeUrl);
+      jsonResp(res, 200, { sessionId: result.sessionId, title: body.title, project: body.project });
       return;
     }
 

@@ -2,7 +2,6 @@ import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 
 import { OpenCodeAdapter } from './agent/opencodeAdapter.js';
-import type { AgentAdapter } from './agent/types.js';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { SpeakingPolicy } from './pipelines/speakingPolicy.js';
@@ -26,18 +25,19 @@ interface Session {
   // and ElevenLabs gets "config + empty" with no actual text to speak.
   ttsQueue?: Promise<void>;
   opencodeSessionId?: string;
+  agentAdapter: OpenCodeAdapter;
 }
 
 export class SessionManager extends EventEmitter {
   private sessions = new Map<string, Session>();
-  private agentAdapter: AgentAdapter;
   private sttFactory: () => SttAdapter;
   private ttsFactory: () => TtsAdapter;
   private speakingPolicy: SpeakingPolicy;
+  private defaultOpencodeUrl: string;
 
   constructor() {
     super();
-    this.agentAdapter = new OpenCodeAdapter(config.opencodeUrl);
+    this.defaultOpencodeUrl = config.opencodeUrl;
     this.sttFactory = () =>
       new ElevenLabsSttAdapter(
         config.elevenlabsApiKey,
@@ -53,9 +53,11 @@ export class SessionManager extends EventEmitter {
     this.speakingPolicy = new SpeakingPolicy();
   }
 
-  async createSession(title?: string): Promise<{ sessionId: string }> {
+  async createSession(title?: string, opencodeUrl?: string): Promise<{ sessionId: string }> {
     const sessionId = uuidv4();
-    const agentSession = await this.agentAdapter.createSession({ title });
+    const url = opencodeUrl || this.defaultOpencodeUrl;
+    const agentAdapter = new OpenCodeAdapter(url);
+    const agentSession = await agentAdapter.createSession({ title });
 
     const session: Session = {
       id: sessionId,
@@ -63,6 +65,7 @@ export class SessionManager extends EventEmitter {
       config: { ...DEFAULT_CONFIG },
       turnQueue: [],
       opencodeSessionId: agentSession.sessionId,
+      agentAdapter,
     };
 
     this.sessions.set(sessionId, session);
@@ -74,7 +77,8 @@ export class SessionManager extends EventEmitter {
   }
 
   async adoptOpenCodeSession(opencodeSessionId: string): Promise<{ sessionId: string }> {
-    await this.agentAdapter.resumeSession(opencodeSessionId);
+    const agentAdapter = new OpenCodeAdapter(this.defaultOpencodeUrl);
+    await agentAdapter.resumeSession(opencodeSessionId);
 
     const sessionId = uuidv4();
     const session: Session = {
@@ -83,6 +87,7 @@ export class SessionManager extends EventEmitter {
       config: { ...DEFAULT_CONFIG },
       turnQueue: [],
       opencodeSessionId,
+      agentAdapter,
     };
 
     this.sessions.set(sessionId, session);
@@ -106,7 +111,7 @@ export class SessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session || !session.opencodeSessionId) return;
 
-    await this.agentAdapter.subscribe(
+    await session.agentAdapter.subscribe(
       session.opencodeSessionId,
       {
         onTextDelta: (text, turnId) => {
@@ -271,7 +276,7 @@ export class SessionManager extends EventEmitter {
       });
 
       if (session.opencodeSessionId) {
-        await this.agentAdapter.sendTurn(session.opencodeSessionId, text);
+        await session.agentAdapter.sendTurn(session.opencodeSessionId, text);
       }
     } else {
       session.turnQueue.push(text);
@@ -302,7 +307,7 @@ export class SessionManager extends EventEmitter {
       });
 
       if (session.opencodeSessionId) {
-        await this.agentAdapter.sendTurn(session.opencodeSessionId, nextText);
+        await session.agentAdapter.sendTurn(session.opencodeSessionId, nextText);
       }
     } else {
       this.updateSessionState(sessionId, 'idle');
@@ -313,7 +318,7 @@ export class SessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session || !session.opencodeSessionId) return;
 
-    await this.agentAdapter.cancelTurn(session.opencodeSessionId, turnId);
+    await session.agentAdapter.cancelTurn(session.opencodeSessionId, turnId);
     session.turnQueue = [];
 
     this.emit('message', sessionId, {
