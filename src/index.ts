@@ -1,9 +1,26 @@
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { SessionManager } from './sessionManager.js';
 import type { RuntimeConfig, ServerMessage } from './types.js';
+
+const frontentDist = path.join(new URL('.', import.meta.url).pathname, '../frontend/dist');
+
+function serveStatic(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  const urlPath = (req.url || '/').split('?')[0];
+  const filePath = path.join(frontentDist, urlPath === '/' ? 'index.html' : urlPath);
+  const resolved = path.resolve(filePath);
+  if (!resolved.startsWith(path.resolve(frontentDist))) return false;
+  if (!fs.existsSync(resolved) || fs.statSync(resolved).isDirectory()) return false;
+  const ext = path.extname(resolved);
+  const ct = ext === '.html' ? 'text/html' : ext === '.js' ? 'text/javascript' : ext === '.css' ? 'text/css' : 'application/octet-stream';
+  res.writeHead(200, { 'Content-Type': ct });
+  res.end(fs.readFileSync(resolved));
+  return true;
+}
 
 const sessionManager = new SessionManager();
 
@@ -42,6 +59,7 @@ function jsonResp(res: http.ServerResponse, status: number, body: unknown): void
 
 const server = http.createServer(async (req, res) => {
   try {
+    if (req.method === 'GET' && serveStatic(req, res)) return;
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const path = url.pathname;
     const method = req.method || 'GET';
