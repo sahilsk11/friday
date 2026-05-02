@@ -18,7 +18,7 @@ export function useVoiceGateway({ onMessage }: UseVoiceGatewayOptions = {}) {
   // over its own scope) can read the latest value without re-binding.
   const sessionIdRef = useRef<string | null>(null);
   const esRef = useRef<EventSource | null>(null);
-  const connectRef = useRef<() => Promise<void>>();
+  const connectRef = useRef<() => Promise<void>>(undefined);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const isRecordingRef = useRef(false);
