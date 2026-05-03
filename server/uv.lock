@@ -528,7 +528,7 @@ dependencies = [
     { name = "httpx" },
     { name = "httpx-sse" },
     { name = "loguru" },
-    { name = "pipecat-ai", extra = ["cartesia", "deepgram", "webrtc"] },
+    { name = "pipecat-ai", extra = ["cartesia", "deepgram", "elevenlabs", "webrtc"] },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
@@ -553,7 +553,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "httpx-sse", specifier = ">=0.4.0" },
     { name = "loguru", specifier = ">=0.7.2" },
-    { name = "pipecat-ai", extras = ["deepgram", "cartesia", "silero", "webrtc"], specifier = ">=0.0.100" },
+    { name = "pipecat-ai", extras = ["deepgram", "cartesia", "elevenlabs", "silero", "webrtc"], specifier = ">=0.0.100" },
     { name = "pydantic", specifier = ">=2.9.0" },
     { name = "pydantic-settings", specifier = ">=2.6.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
@@ -1397,6 +1397,9 @@ cartesia = [
 ]
 deepgram = [
     { name = "deepgram-sdk" },
+    { name = "websockets" },
+]
+elevenlabs = [
     { name = "websockets" },
 ]
 webrtc = [

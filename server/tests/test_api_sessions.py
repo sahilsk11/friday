@@ -48,9 +48,7 @@ def client(manager: SessionManager) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, base_url="http://friday.test")
 
 
-async def test_list_sessions_returns_rows(
-    httpx_mock: HTTPXMock, client: httpx.AsyncClient
-) -> None:
+async def test_list_sessions_returns_rows(httpx_mock: HTTPXMock, client: httpx.AsyncClient) -> None:
     httpx_mock.add_response(
         url=f"{OPENCODE_URL}/session",
         json=[
@@ -247,5 +245,3 @@ async def test_get_manager_503_when_unset() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://friday.test") as c:
         resp = await c.get("/sessions")
     assert resp.status_code == 503
-
-

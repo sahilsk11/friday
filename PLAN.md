@@ -149,35 +149,16 @@ Skipped: a long-lived `click` CLI is dead weight when ad-hoc Python scripts agai
 
 ---
 
-## Step 4 — Voice pipeline (pipecat)
+## Step 4 — Voice pipeline (pipecat)  ✅ done
 
-Speak in, hear out, end-to-end.
+- [`voice/pipecat_adapter.py`](server/friday/voice/pipecat_adapter.py) — `OpencodeProcessor(FrameProcessor)`:
+  - Consumes `TranscriptionFrame(finalized=True)` → POST `/sessions/:id/turn`.
+  - Subscribes to the bound `OpencodeSession`; emits `LLMFullResponseStartFrame → LLMTextFrame* → LLMFullResponseEndFrame` for each assistant response.
+  - Immediate ack: pushes `TTSSpeakFrame("on it")` once when `session.status:busy` arrives before any text deltas. Suppressed if real text starts first or on duplicate busy events.
+- [`voice/server.py`](server/friday/voice/server.py) — mounts `POST/PATCH /voice/api/offer` on the same FastAPI app. Each new connection runs a per-call pipeline: `transport.input() → VADProcessor(Silero) → DeepgramSTT → OpencodeProcessor → CartesiaTTS → transport.output() → RTVIProcessor` with `RTVIObserver`. `request_data.session_id` selects which opencode session to attach to (creates one if absent).
+- 8 unit tests in [`tests/test_pipecat_adapter.py`](server/tests/test_pipecat_adapter.py): `process_frame` + observer-callback paths exercised via `OpencodeSession.dispatch` with `pytest-httpx` for the wire side. `push_frame` is replaced with a capture list so we don't need a full pipecat lifecycle.
 
-**`voice/pipecat_adapter.py`** — `OpencodeProcessor(FrameProcessor)`:
-
-- **In:** `TranscriptionFrame(finalized=True)` → `POST /sessions/:id/turn`. Forwarded to opencode immediately, even if a turn is in-flight (opencode queues it).
-- **In:** `InterruptionFrame` from pipecat → ignored for v1. We don't cancel; we let the current turn finish and queue the new one. Pipecat may emit this on barge-in but we deliberately don't act on it.
-- **Out:** subscribe to the OpencodeSession; on `text_delta` → emit `LLMTextFrame` (matches the contract that the assistant aggregator + TTS expect).
-- **Out (immediate ack):** on `session.status: busy` arriving before any assistant deltas → push `TTSSpeakFrame("on it")`. Skipped if assistant text has already started.
-- Use `self.create_task()`, never raw `asyncio.create_task()`.
-
-**`voice/server.py`** — WebRTC signaling + pipeline assembly:
-
-```
-transport.input() → STT → user_aggregator
-                  → OpencodeProcessor
-                  → TTS → transport.output()
-                  → assistant_aggregator
-                  → RTVIObserver  (UI state for voice-ui-kit only)
-```
-
-- `SmallWebRTCTransport` per `examples/transports/transports-small-webrtc.py`.
-- Tests:
-  - Inject a `TranscriptionFrame`; assert opencode received the turn.
-  - Inject two `TranscriptionFrame`s back-to-back; assert both were forwarded and TTS narrates them in order without overlap.
-  - Assert the immediate-ack `TTSSpeakFrame` fires before the first `LLMTextFrame`.
-
-Files: `friday/voice/pipecat_adapter.py`, `friday/voice/server.py`, `tests/test_pipecat_adapter.py`.
+Files: [`friday/voice/pipecat_adapter.py`](server/friday/voice/pipecat_adapter.py), [`friday/voice/server.py`](server/friday/voice/server.py), [`tests/test_pipecat_adapter.py`](server/tests/test_pipecat_adapter.py).
 
 ---
 
