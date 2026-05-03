@@ -1,160 +1,123 @@
-"""WebRTC signaling + per-connection pipeline assembly.
+"""WebSocket transport + per-connection pipeline assembly.
 
-Mounts ``POST /api/offer`` and ``PATCH /api/offer`` onto the same FastAPI app
-as the REST/SSE session router. The browser exchanges SDP with those
-endpoints; ``SmallWebRTCRequestHandler`` keeps track of peer connections and
-invokes our callback when a new one is established.
+Mounts ``WS /api/voice`` onto the same FastAPI app as the REST/SSE session
+router. The browser opens a WebSocket; pipecat's ``FastAPIWebsocketTransport``
+runs both directions of audio over it (PCM frames serialized via protobuf).
 
-URL choice: we use ``/api/offer`` (no prefix) to match the default
-``connectParams.webrtcUrl`` that voice-ui-kit ships with — see
-[voice-ui-kit/examples/04-vite/src/main.tsx]. A frontend serving from a
-different origin can override the URL on its side; we don't need to.
-
-Body handling: pipecat's ``SmallWebRTCRequest`` / ``SmallWebRTCPatchRequest``
-are plain ``@dataclass`` types — FastAPI's pydantic validator can't introspect
-them and 422s on every request if we annotate route bodies with these types.
-We accept raw JSON and construct the dataclasses manually.
+We previously used WebRTC (``SmallWebRTCTransport``). The handshake — ICE
+candidate gathering, candidate-pair STUN checks, DTLS-SRTP — added 8-15s of
+connect latency on multi-interface machines (Tailscale, virtual bridges,
+IPv6) for zero benefit: friday is one user per machine, browser and server
+sharing localhost in dev, sharing an origin behind Caddy in prod. WebRTC's
+NAT-traversal ceremony has nothing to do here. WebSocket is sub-second.
 
 Pipeline shape per connection::
 
     transport.input()
-        → VAD (Silero)
-        → STT (ElevenLabs realtime, or Deepgram)
-        → OpencodeProcessor       # replaces the LLM slot
+        → STT (ElevenLabs realtime, or Deepgram)   # owns its own VAD
+        → OpencodeProcessor                         # replaces the LLM slot
         → TTS (ElevenLabs, or Cartesia)
         → transport.output()
-        → RTVIProcessor           # surfaces voice-UI state to voice-ui-kit
+        → RTVIProcessor                             # voice-UI state surface
+
+Why no Silero VAD anymore: ElevenLabs realtime STT and Deepgram both ship
+with their own VAD that knows their commit semantics. With pipecat's Silero
+in front, the local VAD's ``stop_secs=0.2`` cut off audio before
+ElevenLabs' ``vad_silence_threshold_secs=1.5`` saw enough trailing silence
+to commit a transcript — second turn never finalized. Letting STT do its
+own VAD is the simpler, working path. If we ever swap to a STT without
+built-in VAD, re-add Silero here.
 
 Notes:
 
 - App data (sessions, transcripts, agent state) flows through REST/SSE in
-  ``friday.api.sessions`` — **not** via RTVI custom messages. RTVI is read-only
-  voice-UI state.
-- Auth lives in Step 6 (config). For now the offer endpoint is open and
-  expects to be reachable on localhost.
-- ``request.request_data["session_id"]`` attaches to an existing opencode
-  session; if absent, we create a new one. The browser is expected to call
-  ``GET /sessions`` first and pass the chosen id here.
+  ``friday.api.sessions`` — not via RTVI custom messages. RTVI is voice-UI
+  state only.
+- ``?session_id=…`` on the WS URL attaches to an existing opencode session;
+  if absent, we create a new one.
+- Auth (Step 6) will accept ``?t=…`` here once it lands; until then the
+  endpoint is open and expects to be reachable on localhost.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, WebSocket
 from loguru import logger
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
-from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frameworks.rtvi.observer import RTVIObserver
 from pipecat.processors.frameworks.rtvi.processor import RTVIProcessor
+from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.stt_service import STTService
 from pipecat.services.tts_service import TTSService
-from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
-from pipecat.transports.smallwebrtc.request_handler import (
-    IceCandidate,
-    SmallWebRTCPatchRequest,
-    SmallWebRTCRequest,
-    SmallWebRTCRequestHandler,
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
 )
-from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
-from friday.api.sessions import get_manager
 from friday.core.session_manager import SessionManager
 from friday.voice.pipecat_adapter import OpencodeProcessor
 
 router = APIRouter(tags=["voice"])
 
-# Shared across the process. Lifespan tears it down via ``shutdown()``.
-_handler = SmallWebRTCRequestHandler()
 
-ManagerDep = Annotated[SessionManager, Depends(get_manager)]
-
-
-@router.post("/api/offer")
-async def offer(
-    request: Request, manager: ManagerDep, background_tasks: BackgroundTasks
-) -> dict[str, str] | None:
-    body = await request.json()
-    try:
-        webrtc_request = SmallWebRTCRequest(
-            sdp=body["sdp"],
-            type=body["type"],
-            pc_id=body.get("pc_id"),
-            restart_pc=body.get("restart_pc"),
-            request_data=body.get("request_data"),
-        )
-    except KeyError as err:
-        raise HTTPException(status_code=400, detail=f"missing field: {err.args[0]}") from err
-
-    request_data: dict[str, Any] = webrtc_request.request_data or {}
-
-    async def on_connection(connection: SmallWebRTCConnection) -> None:
-        background_tasks.add_task(_run_pipeline, connection, manager, request_data)
-
-    return await _handler.handle_web_request(
-        request=webrtc_request, webrtc_connection_callback=on_connection
-    )
+# We can't use the HTTP-flavored ``get_manager`` Depends from
+# ``friday.api.sessions`` here — FastAPI's WebSocket scope doesn't have a
+# ``Request`` to inject. Read straight off ``app.state`` instead.
+def _resolve_manager(websocket: WebSocket) -> SessionManager:
+    manager: SessionManager | None = getattr(websocket.app.state, "manager", None)
+    if manager is None:
+        raise RuntimeError("session manager not ready")
+    return manager
 
 
-@router.patch("/api/offer")
-async def offer_patch(request: Request) -> dict[str, str]:
-    body = await request.json()
-    try:
-        candidates_raw = body.get("candidates") or []
-        candidates = [
-            IceCandidate(
-                candidate=c["candidate"],
-                sdp_mid=c.get("sdpMid") or c.get("sdp_mid") or "",
-                sdp_mline_index=c.get("sdpMLineIndex") or c.get("sdp_mline_index") or 0,
-            )
-            for c in candidates_raw
-        ]
-        patch = SmallWebRTCPatchRequest(pc_id=body["pc_id"], candidates=candidates)
-    except KeyError as err:
-        raise HTTPException(status_code=400, detail=f"missing field: {err.args[0]}") from err
-
-    await _handler.handle_patch_request(patch)
-    return {"status": "ok"}
+# Sample rates match the @pipecat-ai/websocket-transport client defaults
+# (recorderSampleRate=16000 for mic input, playerSampleRate=24000 for TTS
+# output). Keeping these aligned avoids resampling on either side.
+_AUDIO_IN_SAMPLE_RATE = 16_000
+_AUDIO_OUT_SAMPLE_RATE = 24_000
 
 
-async def shutdown() -> None:
-    """Close all open WebRTC connections. Called from the FastAPI lifespan."""
-    await _handler.close()
+@router.websocket("/api/voice")
+async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
+    """Bidirectional voice stream.
 
+    Accepts ``?session_id=…`` to attach to an existing opencode session.
+    Without it, lazily creates a new session.
 
-async def _run_pipeline(
-    connection: SmallWebRTCConnection,
-    manager: SessionManager,
-    request_data: dict[str, Any],
-) -> None:
-    """Build and run the per-connection pipecat pipeline.
-
-    Spawned as a FastAPI background task. Returns when the WebRTC connection
-    closes; pipecat handles cleanup of its own tasks via ``TaskManager``.
+    Returns when the client closes the WebSocket; pipecat's PipelineRunner
+    tears down its pipeline and closes the underlying ``FastAPIWebsocketClient``.
     """
-    session_id = request_data.get("session_id")
-    if isinstance(session_id, str) and session_id:
+    manager = _resolve_manager(websocket)
+    await websocket.accept()
+
+    if session_id:
         opencode_session = manager.attach(session_id)
+        logger.info("voice: attached to opencode session | id={}", opencode_session.id)
     else:
         opencode_session = await manager.create()
         logger.info("voice: created new opencode session | id={}", opencode_session.id)
 
-    transport = SmallWebRTCTransport(
-        webrtc_connection=connection,
-        params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_in_sample_rate=_AUDIO_IN_SAMPLE_RATE,
+            audio_out_sample_rate=_AUDIO_OUT_SAMPLE_RATE,
+            add_wav_header=False,
+            serializer=ProtobufFrameSerializer(),
+        ),
     )
 
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
     stt = _select_stt()
     tts = _select_tts()
     opencode = OpencodeProcessor(opencode_session)
@@ -163,7 +126,6 @@ async def _run_pipeline(
     pipeline = Pipeline(
         [
             transport.input(),
-            vad,
             stt,
             opencode,
             tts,
@@ -179,9 +141,15 @@ async def _run_pipeline(
     try:
         await runner.run(task)
     except Exception:
-        # Log and let the connection close — the runner has already torn the
-        # pipeline down by the time we reach here.
         logger.exception("voice: pipeline run failed | session={}", opencode_session.id)
+
+
+async def shutdown() -> None:
+    """No-op for compatibility with the old WebRTC handler.
+
+    The WebSocket transport has no process-wide handler to close; each
+    connection owns its own pipeline lifecycle and tears down on disconnect.
+    """
 
 
 def _select_stt() -> STTService:
