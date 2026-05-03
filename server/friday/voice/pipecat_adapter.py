@@ -21,7 +21,8 @@ work spawned from observer paths so pipecat's ``TaskManager`` cleans up.
 
 from __future__ import annotations
 
-from typing import override
+import asyncio
+from typing import Any, override
 
 from loguru import logger
 from pipecat.frames.frames import (
@@ -35,9 +36,10 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
-from friday.core.narration_policy import StreamingFilter, checkpoint_for_tool
+from friday.core.narration_policy import StreamingFilter
 from friday.core.opencode_session import OpencodeSession
 from friday.core.state import AgentState
+from friday.core.tool_narrator import describe_tool
 
 DEFAULT_ACK_TEXT = "on it"
 
@@ -72,6 +74,9 @@ class OpencodeProcessor(FrameProcessor):
         # responses so a turn that opens a fence and never closes (model
         # interrupted) doesn't poison the next turn.
         self._narration = StreamingFilter()
+        # Strong references to background narration tasks — prevents GC before
+        # the event loop runs them (loop only keeps weak refs to tasks).
+        self._bg_tasks: set[asyncio.Task] = set()
 
         session.on_text_delta(self._on_delta)
         session.on_text_final(self._on_final)
@@ -137,15 +142,27 @@ class OpencodeProcessor(FrameProcessor):
             RTVIServerMessageFrame(data={"type": RTVI_ASSISTANT_TEXT_FINAL, "text": text})
         )
 
-    async def _on_tool_start(self, tool_name: str) -> None:
-        # Always surface the tool start in the activity feed, even for tools
-        # that have no narration phrase. The user wants to see "running grep"
-        # while opencode works; the spoken narration is a separate (TTS)
-        # concern with a deliberately limited vocabulary.
-        await self.push_frame(
-            RTVIServerMessageFrame(data={"type": RTVI_TOOL_STARTED, "name": tool_name})
+    async def _on_tool_start(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+        # Spawn narration as a background task so the SSE loop isn't blocked
+        # waiting for the OpenRouter HTTP call. Hold a strong ref so the event
+        # loop's weak ref doesn't let the task get GC'd before it runs.
+        task = asyncio.create_task(self._narrate_tool(tool_name, tool_input))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        task.add_done_callback(
+            lambda t: logger.error(
+                "opencode_processor: narrate_tool failed | tool={} err={}", tool_name, t.exception()
+            )
+            if not t.cancelled() and t.exception()
+            else None
         )
-        phrase = checkpoint_for_tool(tool_name)
-        if phrase is None:
-            return
-        await self.push_frame(TTSSpeakFrame(phrase))
+
+    async def _narrate_tool(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+        label = await describe_tool(tool_name, tool_input)
+        logger.debug("opencode_processor: narrate_tool | tool={} label={!r}", tool_name, label)
+        rtvi_data: dict[str, object] = {"type": RTVI_TOOL_STARTED, "name": tool_name}
+        if label:
+            rtvi_data["label"] = label
+        await self.push_frame(RTVIServerMessageFrame(data=rtvi_data))
+        if label:
+            await self.push_frame(TTSSpeakFrame(label))

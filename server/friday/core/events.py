@@ -12,7 +12,7 @@ those are discarded here because the unwrapped event arrives on the same stream.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
@@ -75,6 +75,7 @@ class MessagePartUpdated:
     text: str | None
     tool_name: str | None
     tool_status: str | None
+    tool_input: dict[str, Any] = field(default_factory=dict)
     type: Literal["message.part.updated"] = "message.part.updated"
 
 
@@ -161,6 +162,7 @@ def _parse_message_part_updated(props: dict[str, Any]) -> OpencodeEvent:
         text=part.get("text"),
         tool_name=part.get("tool"),
         tool_status=state.get("status"),
+        tool_input=state.get("input") or {},
     )
 
 
