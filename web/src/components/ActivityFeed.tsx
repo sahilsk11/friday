@@ -26,10 +26,10 @@ import { useCallback, useState } from 'react';
 type FeedEntry =
   | { kind: 'user'; id: string; text: string }
   | { kind: 'assistant'; id: string; text: string; final: boolean }
-  | { kind: 'tool'; id: string; name: string };
+  | { kind: 'tool'; id: string; name: string; label?: string };
 
 type ServerMessageData =
-  | { type: 'tool-started'; name: string }
+  | { type: 'tool-started'; name: string; label?: string }
   | { type: 'assistant-text-delta'; text: string }
   | { type: 'assistant-text-final'; text: string }
   | { type: 'agent-state'; state: string };
@@ -66,7 +66,7 @@ export function ActivityFeed(): React.ReactElement {
     setEntries((prev) => {
       switch (inner.type) {
         case 'tool-started':
-          return [...prev, { kind: 'tool', id: nextId(), name: inner.name }];
+          return [...prev, { kind: 'tool', id: nextId(), name: inner.name, label: inner.label }];
         case 'assistant-text-delta': {
           const last = prev[prev.length - 1];
           if (last?.kind === 'assistant' && !last.final) {
@@ -145,7 +145,7 @@ function renderEntry(entry: FeedEntry): React.ReactElement {
       return (
         <div className="text-xs text-neutral-500">
           <span className="mr-1">⎿</span>
-          tool: <span className="text-neutral-300">{entry.name}</span>
+          <span className="text-neutral-300">{entry.label ?? entry.name}</span>
         </div>
       );
   }

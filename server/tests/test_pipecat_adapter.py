@@ -12,6 +12,7 @@ plumbing.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import httpx
@@ -277,6 +278,7 @@ async def test_tool_start_emits_checkpoint_speak(session: OpencodeSession) -> No
             tool_status="running",
         )
     )
+    await asyncio.sleep(0)  # let narration background task run
 
     speak_frames = [f for f in pushed if isinstance(f, TTSSpeakFrame)]
     assert len(speak_frames) == 1
@@ -299,6 +301,7 @@ async def test_tool_status_updates_dont_double_announce(session: OpencodeSession
                 tool_status=status,
             )
         )
+    await asyncio.sleep(0)  # let narration background task run
 
     assert sum(isinstance(f, TTSSpeakFrame) for f in pushed) == 1
 
@@ -317,6 +320,7 @@ async def test_unknown_tool_emits_no_checkpoint(session: OpencodeSession) -> Non
             tool_status="running",
         )
     )
+    await asyncio.sleep(0)  # let narration background task run
 
     assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
 
@@ -369,10 +373,11 @@ async def test_tool_start_emits_rtvi_for_unknown_tool_too(session: OpencodeSessi
             tool_status="running",
         )
     )
+    await asyncio.sleep(0)  # let narration background task run
 
     rtvi_tools = _rtvi_messages_of_type(pushed, RTVI_TOOL_STARTED)
     assert rtvi_tools == [{"type": RTVI_TOOL_STARTED, "name": "some_made_up_tool"}]
-    # And no spoken phrase was emitted for the unknown tool.
+    # No spoken phrase — unknown tool, no OpenRouter key in test env.
     assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
 
 

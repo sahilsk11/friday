@@ -39,7 +39,7 @@ EventHandler = Callable[[OpencodeEvent], Awaitable[None]]
 TextDeltaHandler = Callable[[str], Awaitable[None]]
 TextFinalHandler = Callable[[str], Awaitable[None]]
 StateHandler = Callable[[AgentState], Awaitable[None]]
-ToolStartHandler = Callable[[str], Awaitable[None]]
+ToolStartHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 class OpencodeClient:
@@ -222,16 +222,17 @@ class OpencodeSession:
             await handler(event.delta)
 
     async def _handle_part_updated(self, event: MessagePartUpdated) -> None:
-        # We only narrate tool *starts*. ``part_id`` is stable across the
-        # multiple status updates a tool receives ("running" → "completed"),
-        # so dedupe on it.
+        # Announce on "running" (not "pending") — the input args aren't
+        # populated until the tool actually starts executing.
         if event.part_type != "tool" or not event.tool_name:
+            return
+        if event.tool_status != "running":
             return
         if event.part_id in self._announced_tools:
             return
         self._announced_tools.add(event.part_id)
         for handler in self._tool_start_handlers:
-            await handler(event.tool_name)
+            await handler(event.tool_name, event.tool_input)
 
     async def _handle_message_updated(self, event: MessageUpdated) -> None:
         if event.role != "assistant" or event.time_end is None:
