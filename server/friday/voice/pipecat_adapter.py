@@ -32,7 +32,9 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from loguru import logger
 
+from friday.core.narration_policy import StreamingFilter, checkpoint_for_tool
 from friday.core.opencode_session import OpencodeSession
 from friday.core.state import AgentState
 
@@ -57,16 +59,22 @@ class OpencodeProcessor(FrameProcessor):
         # Bracketing prevents unmatched End frames if a session emits a
         # final-without-deltas (shouldn't happen, but cheap insurance).
         self._in_response = False
+        # Strips ``` ... ``` blocks from streaming deltas. Reset between
+        # responses so a turn that opens a fence and never closes (model
+        # interrupted) doesn't poison the next turn.
+        self._narration = StreamingFilter()
 
         session.on_text_delta(self._on_delta)
         session.on_text_final(self._on_final)
         session.on_state(self._on_state)
+        session.on_tool_start(self._on_tool_start)
 
     @override
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame) and frame.finalized:
+            logger.info("opencode_processor: transcription -> {!r}", frame.text)
             await self._session.send_turn(frame.text)
             self._awaiting_response = True
             self._acked = False
@@ -80,16 +88,29 @@ class OpencodeProcessor(FrameProcessor):
             await self.push_frame(TTSSpeakFrame(self._ack_text))
 
     async def _on_delta(self, text: str) -> None:
-        # Real assistant text is starting — suppress any not-yet-fired ack
-        # and open the response bracket if needed.
+        speakable = self._narration.feed(text)
+        if not speakable:
+            # Inside a code fence (or held pending a fence delimiter). Don't
+            # clear ack state yet — we want the immediate ack to keep firing
+            # if the *visible* response is still empty.
+            return
+        # Real assistant text is reaching the user — suppress any not-yet-fired
+        # ack and open the response bracket if needed.
         self._awaiting_response = False
         self._acked = True
         if not self._in_response:
             self._in_response = True
             await self.push_frame(LLMFullResponseStartFrame())
-        await self.push_frame(LLMTextFrame(text))
+        await self.push_frame(LLMTextFrame(speakable))
 
     async def _on_final(self, _text: str) -> None:
+        self._narration.reset()
         if self._in_response:
             self._in_response = False
             await self.push_frame(LLMFullResponseEndFrame())
+
+    async def _on_tool_start(self, tool_name: str) -> None:
+        phrase = checkpoint_for_tool(tool_name)
+        if phrase is None:
+            return
+        await self.push_frame(TTSSpeakFrame(phrase))
