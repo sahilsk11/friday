@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import override
 
+from loguru import logger
 from pipecat.frames.frames import (
     Frame,
     LLMFullResponseEndFrame,
@@ -32,7 +33,6 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from loguru import logger
 
 from friday.core.narration_policy import StreamingFilter, checkpoint_for_tool
 from friday.core.opencode_session import OpencodeSession

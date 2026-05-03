@@ -1,7 +1,7 @@
 """FastAPI app composition.
 
 Owns the ``OpencodeClient`` lifecycle and a process-wide ``SessionManager``,
-mounts the framework-neutral session API, and the WebRTC signaling router.
+mounts the framework-neutral session API, and the WebSocket voice router.
 
 CORS: allows ``localhost``/``127.0.0.1`` on common Vite/Next dev ports so a
 frontend dev server (default Vite is :5173) can hit the API directly. In
