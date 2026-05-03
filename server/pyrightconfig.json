@@ -1,0 +1,21 @@
+{
+  "include": ["friday", "tests"],
+  "exclude": ["**/__pycache__", ".venv"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "strict",
+
+  "reportMissingTypeStubs": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownParameterType": "warning",
+
+  "reportUnusedImport": "error",
+  "reportUnusedVariable": "error",
+  "reportUnusedClass": "error",
+  "reportUnusedFunction": "error",
+  "reportUnusedExpression": "error",
+
+  "reportMissingImports": "error",
+  "reportImplicitOverride": "error"
+}
