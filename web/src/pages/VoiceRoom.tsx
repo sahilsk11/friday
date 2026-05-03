@@ -3,30 +3,37 @@ import {
   PipecatClientProvider,
   usePipecatClient,
   usePipecatClientMicControl,
-  usePipecatClientTransportState,
 } from '@pipecat-ai/client-react';
+import {
+  ClientStatus,
+  ConnectButton,
+  TranscriptOverlay,
+  VoiceVisualizer,
+} from '@pipecat-ai/voice-ui-kit';
 import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router';
 
+import { ActivityFeed } from '@/components/ActivityFeed';
 import { fridayBaseUrl } from '@/lib/env';
 
 // THE ONLY PAGE THAT IMPORTS @pipecat-ai/*.
 //
 // Per jarvis.md FE/BE separation rules:
-//   - pipecat types stay in this file.
-//   - App data flows through REST/SSE on other pages — never RTVI here.
+//   - pipecat types stay on this page.
+//   - App data flows through REST/SSE on the transcript page — never
+//     RTVI there. The voice room itself bends that rule for tool /
+//     assistant-text events (see TRANSPORT.md).
 //
-// We construct PipecatClient with WebSocketTransport directly. We don't
-// use voice-ui-kit's <PipecatAppBase> (only supports `smallwebrtc` /
-// `daily`) and we don't use its UI components either — they call camera
-// APIs (`selectedCam`) unconditionally and WebSocketTransport throws on
-// those. The minimal UI below is built straight on the React hooks.
+// Layout has two columns: voice controls on the left (visualizer,
+// status, mic toggle, connect, live partial transcript) and the live
+// activity feed on the right (your finals, the agent's replies, tool
+// activity). Both halves consume the same WebSocket — see TRANSPORT.md.
 //
-// Why WebSocket and not WebRTC: friday is one user per machine, browser
-// and server share localhost in dev / origin in prod. WebRTC's NAT-
-// traversal handshake added 8-15s of connect latency for nothing.
-// WebSocket connects in ~50ms.
+// Why we don't use voice-ui-kit's <PipecatAppBase>: that shell hardcodes
+// transportType to 'smallwebrtc' | 'daily' (WebRTC-only). The component
+// pieces we use here are transport-agnostic — they just consume RTVI
+// events from the provider.
 
 function buildWsUrl(sessionId: string): string {
   const base = fridayBaseUrl.replace(/^http/, 'ws');
@@ -34,17 +41,17 @@ function buildWsUrl(sessionId: string): string {
   return `${base}/api/voice?${sp.toString()}`;
 }
 
-export default function VoiceRoom() {
+export default function VoiceRoom(): React.ReactElement {
   const { id } = useParams<{ id: string }>();
   const [client, setClient] = useState<PipecatClient | null>(null);
 
   useEffect(() => {
     if (!id) return;
-    // Use WavMediaManager (Web Audio API) instead of the default
-    // DailyMediaManager. The Daily one pulls in @daily-co/daily-js which
-    // spins up its own WebRTC call object purely for mic capture — heavy,
-    // and broken in headless Chromium where it queries video devices that
-    // don't exist. WavMediaManager just calls getUserMedia + a recorder.
+    // WavMediaManager (Web Audio API) over the default DailyMediaManager
+    // — the Daily one pulls in @daily-co/daily-js, which spins up its
+    // own WebRTC call object purely for mic capture. That's heavy and
+    // breaks in headless Chromium. WavMediaManager just calls
+    // getUserMedia + a recorder.
     const transport = new WebSocketTransport({
       wsUrl: buildWsUrl(id),
       mediaManager: new WavMediaManager(undefined, 16_000),
@@ -55,9 +62,9 @@ export default function VoiceRoom() {
       transport,
     });
     // Resolve mic device + getUserMedia ahead of connect. Without this,
-    // PipecatClient.connect() opens the WS but never starts pushing audio
-    // frames — STT sits idle. PipecatAppBase does this via
-    // `initDevicesOnMount`; we have to do it explicitly.
+    // PipecatClient.connect() opens the WS but never starts pushing
+    // audio frames — STT sits idle. <PipecatAppBase> handles this via
+    // initDevicesOnMount; we have to do it explicitly.
     void pcClient.initDevices().catch((err: unknown) => {
       console.error('initDevices failed', err);
     });
@@ -79,9 +86,9 @@ export default function VoiceRoom() {
   );
 }
 
-function VoiceRoomShell({ sessionId }: { sessionId: string }) {
+function VoiceRoomShell({ sessionId }: { sessionId: string }): React.ReactElement {
   return (
-    <div className="mx-auto flex h-screen max-w-2xl flex-col px-6 py-6">
+    <div className="mx-auto flex h-screen max-w-5xl flex-col px-6 py-6">
       <header className="mb-6 flex items-baseline justify-between">
         <Link to="/" className="text-sm text-neutral-400 hover:text-neutral-200">
           ← sessions
@@ -94,36 +101,91 @@ function VoiceRoomShell({ sessionId }: { sessionId: string }) {
         </Link>
       </header>
 
-      <div className="flex flex-1 items-center justify-center">
-        <div className="flex w-full max-w-sm flex-col gap-4 rounded-2xl border border-neutral-800 bg-neutral-950 p-6 shadow-xl">
-          <TransportStatePill />
-          <MicToggle />
-          <ConnectControl />
-        </div>
+      <div className="grid flex-1 gap-6 overflow-hidden md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
+        <section className="flex flex-col items-stretch gap-4 rounded-2xl border border-neutral-800 bg-neutral-950 p-5">
+          <div className="flex items-center justify-center text-xs text-neutral-400">
+            <ClientStatus />
+          </div>
+
+          {/* Local mic visualizer — proves we're hearing you. */}
+          <div className="flex h-32 items-center justify-center rounded-xl border border-neutral-800 bg-black/40">
+            <VoiceVisualizer
+              participantType="local"
+              barColor="#10b981"
+              barCount={48}
+              barGap={2}
+              barWidth={4}
+            />
+          </div>
+
+          {/* Bot visualizer — pulses while TTS plays. */}
+          <div className="flex h-16 items-center justify-center rounded-xl border border-neutral-800 bg-black/40">
+            <VoiceVisualizer
+              participantType="bot"
+              barColor="#a3a3a3"
+              barCount={32}
+              barGap={2}
+              barWidth={3}
+            />
+          </div>
+
+          {/* Live partial transcript — words appear as you speak. */}
+          <div className="min-h-[3rem] rounded-xl border border-neutral-800 bg-black/40 px-3 py-2 text-sm text-neutral-300">
+            <TranscriptOverlay participant="local" size="sm" />
+          </div>
+
+          {/* Tap-to-end-turn. ElevenLabs realtime STT is in MANUAL commit
+              mode (see TRANSPORT.md) — it only finalizes a transcript when
+              we explicitly say so. Without this button, you'd talk forever
+              and the agent would never get a turn. We don't currently have
+              hands-free auto-end-of-turn detection. */}
+          <SendTurnButton />
+
+          <div className="mt-auto flex items-center justify-between gap-3">
+            <MicToggle />
+            <ConnectControl />
+          </div>
+        </section>
+
+        {/* Activity feed: live conversation + tool starts. */}
+        <section className="flex min-h-0 flex-col rounded-2xl border border-neutral-800 bg-neutral-950">
+          <header className="flex items-center justify-between border-b border-neutral-800 px-4 py-2.5">
+            <span className="text-xs uppercase tracking-wider text-neutral-500">activity</span>
+          </header>
+          <div className="flex-1 overflow-y-auto">
+            <ActivityFeed />
+          </div>
+        </section>
       </div>
     </div>
   );
 }
 
-function TransportStatePill() {
-  const state = usePipecatClientTransportState();
-  const color =
-    state === 'ready' || state === 'connected'
-      ? 'bg-emerald-600'
-      : state === 'connecting' || state === 'authenticating' || state === 'initializing'
-        ? 'bg-amber-600'
-        : state === 'error'
-          ? 'bg-red-600'
-          : 'bg-neutral-700';
+// "Send" button — tells the server we're done speaking, force-commits the
+// in-progress transcript on the ElevenLabs side. Server-side handler
+// pushes a synthetic VADUserStoppedSpeakingFrame upstream. Disabled
+// while disconnected.
+function SendTurnButton(): React.ReactElement {
+  const client = usePipecatClient();
   return (
-    <div className="flex items-center justify-center gap-2 text-xs text-neutral-400">
-      <span className={`h-2 w-2 rounded-full ${color}`} />
-      {state}
-    </div>
+    <button
+      type="button"
+      disabled={!client}
+      onClick={() => {
+        if (!client) return;
+        client.sendClientMessage('end-turn');
+      }}
+      className="rounded-md bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+    >
+      Send turn ⏎
+    </button>
   );
 }
 
-function MicToggle() {
+// Hand-rolled mic toggle. The kit's <UserAudioControl> reads
+// `client.selectedCam` via usePipecatClientMediaDevices, which throws on
+// WebSocketTransport. usePipecatClientMicControl is the camera-free hook.
+function MicToggle(): React.ReactElement {
   const { enableMic, isMicEnabled } = usePipecatClientMicControl();
   return (
     <button
@@ -138,29 +200,24 @@ function MicToggle() {
   );
 }
 
-function ConnectControl() {
+// The kit's <ConnectButton> is a state-aware *display* — it doesn't call
+// client.connect()/disconnect() itself; we wire the callbacks here.
+function ConnectControl(): React.ReactElement {
   const client = usePipecatClient();
-  const state = usePipecatClientTransportState();
-  const [busy, setBusy] = useState(false);
-  const isConnected =
-    state === 'ready' || state === 'connected' || state === 'authenticated';
-  const label = busy ? '…' : isConnected ? 'Disconnect' : 'Connect';
-
   return (
-    <button
-      type="button"
-      disabled={busy || !client}
-      onClick={() => {
+    <ConnectButton
+      onConnect={() => {
         if (!client) return;
-        setBusy(true);
-        const action = isConnected ? client.disconnect() : client.connect();
-        void action.finally(() => {
-          setBusy(false);
+        void client.connect().catch((err: unknown) => {
+          console.error('connect failed', err);
         });
       }}
-      className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
-    >
-      {label}
-    </button>
+      onDisconnect={() => {
+        if (!client) return;
+        void client.disconnect().catch(() => {
+          // Already disconnected — ignore.
+        });
+      }}
+    />
   );
 }

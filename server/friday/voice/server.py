@@ -45,10 +45,13 @@ import os
 
 from fastapi import APIRouter, WebSocket
 from loguru import logger
+from pipecat.frames.frames import VADUserStoppedSpeakingFrame
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frameworks.rtvi.models import ClientMessage
 from pipecat.processors.frameworks.rtvi.observer import RTVIObserver
 from pipecat.processors.frameworks.rtvi.processor import RTVIProcessor
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
@@ -123,14 +126,52 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     opencode = OpencodeProcessor(opencode_session)
     rtvi = RTVIProcessor(transport=transport)
 
+    # Echo client-ready back as bot-ready. Pipecat's RTVIProcessor only
+    # sends bot-ready when the app explicitly signals it — the convention
+    # in WebRTC apps is to wait for a separate bot worker to load models /
+    # connect to the LLM. friday's pipeline is ready the moment the WS
+    # accepts the connection (STT/TTS WebSockets are dialled inside the
+    # PipelineRunner before ``StartFrame`` propagates), so we ack as soon
+    # as the client says hello. Without this, voice-ui-kit's ClientStatus
+    # pill reads "Agent connecting" forever even though everything works.
+    async def _on_client_ready(processor: RTVIProcessor) -> None:
+        await processor.set_bot_ready()
+
+    rtvi.event_handler("on_client_ready")(_on_client_ready)
+
+    # Tap-to-end-turn: client sends {type: "end-turn"} when the user is
+    # done speaking; we forge a VADUserStoppedSpeakingFrame upstream so
+    # the STT processor sends {commit: True} to ElevenLabs and locks in
+    # the in-progress transcript. Pipecat's ElevenLabs realtime STT is
+    # in MANUAL commit mode by default, but we have no upstream VAD —
+    # this handler is the only thing that triggers commits.
+    #
+    # If we ever add hands-free conversational mode, swap this for a
+    # real VAD (Silero) tuned to long pauses, or use ElevenLabs's own
+    # VAD via ``commit_strategy=CommitStrategy.VAD`` with a generous
+    # ``vad_silence_threshold_secs``.
+    async def _on_client_message(processor: RTVIProcessor, msg: ClientMessage) -> None:
+        if msg.type == "end-turn":
+            logger.info("voice: end-turn received | session={}", opencode_session.id)
+            await processor.push_frame(VADUserStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
+
+    rtvi.event_handler("on_client_message")(_on_client_message)
+
+    # RTVI sits BEFORE transport.output() because RTVI emits its control
+    # messages (bot-ready, our custom server messages, transcripts, …) by
+    # pushing OutputTransportMessageUrgentFrames DOWNSTREAM. If RTVI is at
+    # the end of the pipeline those frames fall off the back; the WS
+    # client never sees them and ClientStatus's "Agent" half stays
+    # "connecting" forever. Audio frames from TTS pass through RTVI
+    # unchanged on their way to transport.output().
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
             opencode,
             tts,
-            transport.output(),
             rtvi,
+            transport.output(),
         ]
     )
 
