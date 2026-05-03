@@ -86,7 +86,7 @@ Quirk captured in [opencode_session.py:_fan_out_state](server/friday/core/openco
 
 ---
 
-## Step 2 — SessionManager (opencode is the SoT)
+## Step 2 — SessionManager (opencode is the SoT)  ✅ done
 
 No sqlite, no friday-side persistence. Opencode already stores every session and transcript at `~/.local/share/opencode/`. Friday-server holds an in-memory cache of *live* `OpencodeSession` objects (so observers can attach) and delegates everything else to opencode's HTTP API.
 
@@ -125,39 +125,31 @@ Files: `friday/core/session_manager.py`, `tests/test_session_manager.py`, `scrip
 
 ---
 
-## Step 3 — REST + SSE API
+## Step 3 — REST + SSE API  ✅ done
 
 The HTTP surface that both the CLI and the voice layer use.
 
-- FastAPI app composed in `friday/main.py`. Mounts:
-  - `GET    /sessions` — list
-  - `POST   /sessions` — create
+- FastAPI app composed in [`friday/main.py`](server/friday/main.py). Lifespan owns the `OpencodeClient` and exposes a `SessionManager` via `app.state`. Mounts:
+  - `GET    /sessions[?directory=…]` — list (optional directory filter)
+  - `POST   /sessions` — create (returns full `SessionRow` after a follow-up `GET`)
   - `GET    /sessions/:id` — metadata + transcript
-  - `GET    /sessions/:id/events` — SSE stream
-  - `POST   /sessions/:id/turn` — text turn (the voice layer also POSTs here after STT, so there's one code path for "a turn arrived")
-- All framework-neutral. No pipecat imports.
-- Tests: `httpx.AsyncClient` against the FastAPI app; verify SSE events flow when `OpencodeClient` emits.
+  - `GET    /sessions/:id/events` — SSE stream of `text.delta` / `text.final` / `state` frames, with 15s `: keep-alive` ping
+  - `POST   /sessions/:id/turn` — text turn (voice layer POSTs here after STT)
+- Framework-neutral: no pipecat imports.
+- Tests: 7 cases in [`tests/test_api_sessions.py`](server/tests/test_api_sessions.py) — pytest-httpx canned responses for the opencode side, ASGITransport for HTTP routes, direct route invocation + `body_iterator` for the SSE path (ASGITransport buffers streaming responses, which deadlocks an in-process SSE consumer; the live verification covers the wire side).
+- Verified live against opencode 1.14: `uvicorn friday.main:app` → create session → `POST /turn` → SSE stream emitted `state:thinking → text.delta:"DEL" → text.delta:"TA" → text.final:"DELTA" → state:idle`.
 
-Files: `friday/api/sessions.py`, `friday/main.py`, `tests/test_api_sessions.py`.
-
----
-
-## Step 4 — CLI harness
-
-`friday attach <id>` lets us test the whole stack without voice.
-
-- `click`-based CLI in `friday/cli.py`.
-- `friday list` — list sessions.
-- `friday new --title T` — create.
-- `friday attach <id>` — connect to `/sessions/:id/events` and print text deltas to stdout. Read stdin and POST to `/turn`.
-- Doubles as smoke tests for Steps 2 + 3.
-- Critically: lets us iterate on the voice layer without needing a working browser.
-
-Files: `friday/cli.py`, `tests/test_cli.py`.
+Files: [`friday/api/sessions.py`](server/friday/api/sessions.py), [`friday/main.py`](server/friday/main.py), [`tests/test_api_sessions.py`](server/tests/test_api_sessions.py).
 
 ---
 
-## Step 5 — Voice pipeline (pipecat)
+## Step 4 — CLI harness  ⏭ skipped
+
+Skipped: a long-lived `click` CLI is dead weight when ad-hoc Python scripts against `/sessions/...` already exercise the same surface and get thrown away after use. If we ever need an interactive testbed before voice ships, write a one-off script — don't grow a CLI.
+
+---
+
+## Step 4 — Voice pipeline (pipecat)
 
 Speak in, hear out, end-to-end.
 
@@ -189,7 +181,7 @@ Files: `friday/voice/pipecat_adapter.py`, `friday/voice/server.py`, `tests/test_
 
 ---
 
-## Step 6 — Narration policy + chunking
+## Step 5 — Narration policy + chunking
 
 Make the voice say the right things at the right granularity.
 
@@ -201,7 +193,7 @@ Files: `friday/core/narration_policy.py`, `friday/core/speech_chunker.py` (maybe
 
 ---
 
-## Step 7 — Configuration + auth
+## Step 6 — Configuration + auth
 
 Ready to deploy.
 
