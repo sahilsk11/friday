@@ -1,37 +1,48 @@
 """WebRTC signaling + per-connection pipeline assembly.
 
-Mounts ``POST /voice/api/offer`` and ``PATCH /voice/api/offer`` onto the same
-FastAPI app as the REST/SSE session router. The browser exchanges SDP with
-those endpoints; ``SmallWebRTCRequestHandler`` keeps track of peer
-connections and invokes our callback when a new one is established.
+Mounts ``POST /api/offer`` and ``PATCH /api/offer`` onto the same FastAPI app
+as the REST/SSE session router. The browser exchanges SDP with those
+endpoints; ``SmallWebRTCRequestHandler`` keeps track of peer connections and
+invokes our callback when a new one is established.
+
+URL choice: we use ``/api/offer`` (no prefix) to match the default
+``connectParams.webrtcUrl`` that voice-ui-kit ships with — see
+[voice-ui-kit/examples/04-vite/src/main.tsx]. A frontend serving from a
+different origin can override the URL on its side; we don't need to.
+
+Body handling: pipecat's ``SmallWebRTCRequest`` / ``SmallWebRTCPatchRequest``
+are plain ``@dataclass`` types — FastAPI's pydantic validator can't introspect
+them and 422s on every request if we annotate route bodies with these types.
+We accept raw JSON and construct the dataclasses manually.
 
 Pipeline shape per connection::
 
     transport.input()
-        → STT (Deepgram)
+        → VAD (Silero)
+        → STT (ElevenLabs realtime, or Deepgram)
         → OpencodeProcessor       # replaces the LLM slot
-        → TTS (Cartesia)
+        → TTS (ElevenLabs, or Cartesia)
         → transport.output()
-        → RTVIObserver            # surfaces voice-UI state to voice-ui-kit
+        → RTVIProcessor           # surfaces voice-UI state to voice-ui-kit
 
 Notes:
 
 - App data (sessions, transcripts, agent state) flows through REST/SSE in
-  ``friday.api.sessions`` — **not** via RTVI custom messages. RTVI here is
-  read-only voice-UI state.
+  ``friday.api.sessions`` — **not** via RTVI custom messages. RTVI is read-only
+  voice-UI state.
 - Auth lives in Step 6 (config). For now the offer endpoint is open and
   expects to be reachable on localhost.
-- We accept ``request.request_data["session_id"]`` to attach to an existing
-  opencode session; if absent, we create a new one. The browser is expected
-  to call ``GET /sessions`` first and pass the chosen id here.
+- ``request.request_data["session_id"]`` attaches to an existing opencode
+  session; if absent, we create a new one. The browser is expected to call
+  ``GET /sessions`` first and pass the chosen id here.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.observers.base_observer import BaseObserver
@@ -50,45 +61,69 @@ from pipecat.services.tts_service import TTSService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.request_handler import (
+    IceCandidate,
     SmallWebRTCPatchRequest,
     SmallWebRTCRequest,
     SmallWebRTCRequestHandler,
 )
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
+from friday.api.sessions import get_manager
 from friday.core.session_manager import SessionManager
 from friday.voice.pipecat_adapter import OpencodeProcessor
 
-router = APIRouter(prefix="/voice", tags=["voice"])
+router = APIRouter(tags=["voice"])
 
-# Shared across the process. Lifespan hooks tear it down via ``close()``.
+# Shared across the process. Lifespan tears it down via ``shutdown()``.
 _handler = SmallWebRTCRequestHandler()
 
-
-def _require_manager(request: Request) -> SessionManager:
-    manager: SessionManager | None = getattr(request.app.state, "manager", None)
-    if manager is None:
-        raise HTTPException(status_code=503, detail="session manager not ready")
-    return manager
+ManagerDep = Annotated[SessionManager, Depends(get_manager)]
 
 
 @router.post("/api/offer")
 async def offer(
-    request: Request,
-    body: SmallWebRTCRequest,
-    background_tasks: BackgroundTasks,
+    request: Request, manager: ManagerDep, background_tasks: BackgroundTasks
 ) -> dict[str, str] | None:
-    manager = _require_manager(request)
+    body = await request.json()
+    try:
+        webrtc_request = SmallWebRTCRequest(
+            sdp=body["sdp"],
+            type=body["type"],
+            pc_id=body.get("pc_id"),
+            restart_pc=body.get("restart_pc"),
+            request_data=body.get("request_data"),
+        )
+    except KeyError as err:
+        raise HTTPException(status_code=400, detail=f"missing field: {err.args[0]}") from err
+
+    request_data: dict[str, Any] = webrtc_request.request_data or {}
 
     async def on_connection(connection: SmallWebRTCConnection) -> None:
-        background_tasks.add_task(_run_pipeline, connection, manager, body.request_data or {})
+        background_tasks.add_task(_run_pipeline, connection, manager, request_data)
 
-    return await _handler.handle_web_request(request=body, webrtc_connection_callback=on_connection)
+    return await _handler.handle_web_request(
+        request=webrtc_request, webrtc_connection_callback=on_connection
+    )
 
 
 @router.patch("/api/offer")
-async def offer_patch(body: SmallWebRTCPatchRequest) -> dict[str, str]:
-    await _handler.handle_patch_request(body)
+async def offer_patch(request: Request) -> dict[str, str]:
+    body = await request.json()
+    try:
+        candidates_raw = body.get("candidates") or []
+        candidates = [
+            IceCandidate(
+                candidate=c["candidate"],
+                sdp_mid=c.get("sdpMid") or c.get("sdp_mid") or "",
+                sdp_mline_index=c.get("sdpMLineIndex") or c.get("sdp_mline_index") or 0,
+            )
+            for c in candidates_raw
+        ]
+        patch = SmallWebRTCPatchRequest(pc_id=body["pc_id"], candidates=candidates)
+    except KeyError as err:
+        raise HTTPException(status_code=400, detail=f"missing field: {err.args[0]}") from err
+
+    await _handler.handle_patch_request(patch)
     return {"status": "ok"}
 
 
@@ -182,14 +217,17 @@ def _select_tts() -> TTSService:
     cartesia_key = os.environ.get("CARTESIA_API_KEY")
     voice_id = os.environ.get("FRIDAY_TTS_VOICE_ID")
 
-    use_elevenlabs = (
-        forced == "elevenlabs"
-        or (forced == "" and elevenlabs_key is not None)
-    )
+    use_elevenlabs = forced == "elevenlabs" or (forced == "" and elevenlabs_key is not None)
     if use_elevenlabs:
         if not elevenlabs_key:
             raise RuntimeError("ELEVENLABS_API_KEY not set")
-        return ElevenLabsTTSService(api_key=elevenlabs_key, voice_id=voice_id)
+        # Rachel — ElevenLabs' classic stock voice. ElevenLabs requires
+        # a real voice_id; passing None makes the websocket reject with
+        # 1008 policy violation and the pipeline dies before audio.
+        return ElevenLabsTTSService(
+            api_key=elevenlabs_key,
+            voice_id=voice_id or "21m00Tcm4TlvDq8ikWAM",
+        )
     if not cartesia_key:
         raise RuntimeError("set ELEVENLABS_API_KEY or CARTESIA_API_KEY")
     return CartesiaTTSService(

@@ -162,15 +162,19 @@ Files: [`friday/voice/pipecat_adapter.py`](server/friday/voice/pipecat_adapter.p
 
 ---
 
-## Step 5 — Narration policy + chunking
+## Step 5 — Narration policy + chunking  ✅ done
 
-Make the voice say the right things at the right granularity.
+- [`core/narration_policy.py`](server/friday/core/narration_policy.py) — three things in one module:
+  - `should_speak(text)` / `filter_for_speaking(text)` — pure rules: skip empty, log-prefix lines (`[tool:`, `[error:`, …), shell-command lines, fenced code blocks.
+  - `StreamingFilter` — stateful per-message fence stripper. Holds short tail buffers across deltas so a fence delimiter split into ``"``"`` + ``"`text"`` is still recognized.
+  - `checkpoint_for_tool(name)` — friendly verb map (`read → "looking at a file"`, `bash → "running a command"`, …). Returns `None` for unknown tools so we stay silent rather than guess.
+- Chunker skipped — pipecat's `TTSService` already does sentence aggregation (`TextAggregationMode.SENTENCE`, NLTK-based) and flushes on the `LLMFullResponseEndFrame` we emit at turn end.
+- [`OpencodeSession`](server/friday/core/opencode_session.py) gained `on_tool_start(name)` observer and `MessagePartUpdated` dispatch. Dedupe by `part_id` since opencode emits repeat events as tool status advances.
+- [`OpencodeProcessor`](server/friday/voice/pipecat_adapter.py) runs every text delta through `StreamingFilter` before pushing `LLMTextFrame`, and pushes a `TTSSpeakFrame(checkpoint_phrase)` on tool-start.
+- Tests: 23 cases in [`tests/test_narration_policy.py`](server/tests/test_narration_policy.py) (rules + streaming + checkpoint), 4 new cases in [`tests/test_pipecat_adapter.py`](server/tests/test_pipecat_adapter.py) (fence stripping, tool checkpoint, dedupe, unknown-tool silence). Total 60 tests, all green.
+- Live behavior probe — [`scripts/probe_narration.py`](server/scripts/probe_narration.py) drives a real opencode session through a prompt designed to produce mixed prose + code fence + a `read` tool call, captures the actual frames `OpencodeProcessor` would push, asserts code never leaks into spoken text, and synthesizes the result via ElevenLabs to `/tmp/friday_narration_probe.mp3`. Verified end-to-end: ack fires, tool checkpoint fires (`"looking at a file"`), code-block bodies stripped, prose intact.
 
-- `core/narration_policy.py` — pure functions: `should_speak(text)`, `filter_for_speaking(text)`. Rules: skip empty / code fences / shell prompts / `[tool:`-style log prefixes. Port from friday v1's `pipelines/speakingPolicy.ts`.
-- `core/speech_chunker.py` — buffer + flush at sentence boundary / max chars / max delay. **Only port if pipecat's `sentence` aggregator is insufficient.** Verify first.
-- **Checkpoint narration** — when `MessagePartUpdated` with `part_type == "tool"` arrives, generate a short TTS summary ("looking at auth.py", "running the tests"). Same TTS path as regular text.
-
-Files: `friday/core/narration_policy.py`, `friday/core/speech_chunker.py` (maybe), `tests/test_narration_policy.py`.
+Files: [`friday/core/narration_policy.py`](server/friday/core/narration_policy.py), [`tests/test_narration_policy.py`](server/tests/test_narration_policy.py), [`scripts/probe_narration.py`](server/scripts/probe_narration.py).
 
 ---
 

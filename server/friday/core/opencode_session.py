@@ -26,6 +26,7 @@ from loguru import logger
 
 from friday.core.events import (
     MessagePartDelta,
+    MessagePartUpdated,
     MessageUpdated,
     OpencodeEvent,
     SessionIdle,
@@ -38,6 +39,7 @@ EventHandler = Callable[[OpencodeEvent], Awaitable[None]]
 TextDeltaHandler = Callable[[str], Awaitable[None]]
 TextFinalHandler = Callable[[str], Awaitable[None]]
 StateHandler = Callable[[AgentState], Awaitable[None]]
+ToolStartHandler = Callable[[str], Awaitable[None]]
 
 
 class OpencodeClient:
@@ -162,10 +164,14 @@ class OpencodeSession:
         self._delta_handlers: list[TextDeltaHandler] = []
         self._final_handlers: list[TextFinalHandler] = []
         self._state_handlers: list[StateHandler] = []
+        self._tool_start_handlers: list[ToolStartHandler] = []
         # Accumulated text per (sessionID, messageID) for on_text_final.
         self._accumulated: dict[str, str] = {}
         # Track which assistant messages we've already finalized.
         self._completed: set[str] = set()
+        # Track tool parts we've already announced to avoid replays — opencode
+        # emits MessagePartUpdated repeatedly as tool state advances.
+        self._announced_tools: set[str] = set()
 
     # ── Observer registration ───────────────────────────────────────────────
 
@@ -177,6 +183,10 @@ class OpencodeSession:
 
     def on_state(self, handler: StateHandler) -> None:
         self._state_handlers.append(handler)
+
+    def on_tool_start(self, handler: ToolStartHandler) -> None:
+        """Fires once per tool invocation, with the tool name."""
+        self._tool_start_handlers.append(handler)
 
     # ── Outbound ────────────────────────────────────────────────────────────
 
@@ -196,6 +206,8 @@ class OpencodeSession:
             await self._handle_delta(event)
         elif isinstance(event, MessageUpdated):
             await self._handle_message_updated(event)
+        elif isinstance(event, MessagePartUpdated):
+            await self._handle_part_updated(event)
         elif isinstance(event, SessionStatus):
             await self._fan_out_state(_state_from_status(event.status))
         elif isinstance(event, SessionIdle):
@@ -208,6 +220,18 @@ class OpencodeSession:
         self._accumulated[key] = self._accumulated.get(key, "") + event.delta
         for handler in self._delta_handlers:
             await handler(event.delta)
+
+    async def _handle_part_updated(self, event: MessagePartUpdated) -> None:
+        # We only narrate tool *starts*. ``part_id`` is stable across the
+        # multiple status updates a tool receives ("running" → "completed"),
+        # so dedupe on it.
+        if event.part_type != "tool" or not event.tool_name:
+            return
+        if event.part_id in self._announced_tools:
+            return
+        self._announced_tools.add(event.part_id)
+        for handler in self._tool_start_handlers:
+            await handler(event.tool_name)
 
     async def _handle_message_updated(self, event: MessageUpdated) -> None:
         if event.role != "assistant" or event.time_end is None:

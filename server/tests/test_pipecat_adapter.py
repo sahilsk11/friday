@@ -27,7 +27,12 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection
 from pytest_httpx import HTTPXMock
 
-from friday.core.events import MessagePartDelta, MessageUpdated, SessionStatus
+from friday.core.events import (
+    MessagePartDelta,
+    MessagePartUpdated,
+    MessageUpdated,
+    SessionStatus,
+)
 from friday.core.opencode_session import OpencodeClient, OpencodeSession
 from friday.voice.pipecat_adapter import DEFAULT_ACK_TEXT, OpencodeProcessor
 
@@ -196,6 +201,92 @@ async def test_final_without_deltas_emits_no_end_frame(session: OpencodeSession)
     )
 
     assert pushed == []
+
+
+async def test_fenced_code_blocks_are_not_pushed_as_text(session: OpencodeSession) -> None:
+    """Deltas inside ``` ... ``` should never become LLMTextFrames."""
+    _, pushed = _make_processor(session)
+    deltas = [
+        "Here it is:\n",
+        "```python\n",
+        "def hi():\n",
+        "    pass\n",
+        "```\nDone.",
+    ]
+    for d in deltas:
+        await session.dispatch(
+            MessagePartDelta(
+                session_id=SESSION_ID, message_id="m1", part_id="p1", field="text", delta=d
+            )
+        )
+    await session.dispatch(
+        MessageUpdated(session_id=SESSION_ID, message_id="m1", role="assistant", time_end=1)
+    )
+
+    text_frames = [f.text for f in pushed if isinstance(f, LLMTextFrame)]
+    spoken = "".join(text_frames)
+    assert "def hi" not in spoken
+    assert "pass" not in spoken
+    assert "Here it is:" in spoken
+    assert "Done." in spoken
+
+
+async def test_tool_start_emits_checkpoint_speak(session: OpencodeSession) -> None:
+    _, pushed = _make_processor(session)
+
+    await session.dispatch(
+        MessagePartUpdated(
+            session_id=SESSION_ID,
+            message_id="m1",
+            part_id="tp1",
+            part_type="tool",
+            text=None,
+            tool_name="read",
+            tool_status="running",
+        )
+    )
+
+    speak_frames = [f for f in pushed if isinstance(f, TTSSpeakFrame)]
+    assert len(speak_frames) == 1
+    assert speak_frames[0].text == "looking at a file"
+
+
+async def test_tool_status_updates_dont_double_announce(session: OpencodeSession) -> None:
+    """Opencode emits MessagePartUpdated repeatedly per tool — only narrate once."""
+    _, pushed = _make_processor(session)
+
+    for status in ("pending", "running", "completed"):
+        await session.dispatch(
+            MessagePartUpdated(
+                session_id=SESSION_ID,
+                message_id="m1",
+                part_id="tp1",
+                part_type="tool",
+                text=None,
+                tool_name="read",
+                tool_status=status,
+            )
+        )
+
+    assert sum(isinstance(f, TTSSpeakFrame) for f in pushed) == 1
+
+
+async def test_unknown_tool_emits_no_checkpoint(session: OpencodeSession) -> None:
+    _, pushed = _make_processor(session)
+
+    await session.dispatch(
+        MessagePartUpdated(
+            session_id=SESSION_ID,
+            message_id="m1",
+            part_id="tp1",
+            part_type="tool",
+            text=None,
+            tool_name="some_made_up_tool",
+            tool_status="running",
+        )
+    )
+
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
 
 
 async def test_two_back_to_back_turns_both_forwarded(
