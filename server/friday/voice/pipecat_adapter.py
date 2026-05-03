@@ -33,12 +33,21 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from friday.core.narration_policy import StreamingFilter, checkpoint_for_tool
 from friday.core.opencode_session import OpencodeSession
 from friday.core.state import AgentState
 
 DEFAULT_ACK_TEXT = "on it"
+
+# RTVI server-message types this processor emits. The voice room subscribes
+# to these to render the live activity feed and streaming assistant text.
+# See TRANSPORT.md ("How opencode events come back").
+RTVI_TOOL_STARTED = "tool-started"
+RTVI_ASSISTANT_TEXT_DELTA = "assistant-text-delta"
+RTVI_ASSISTANT_TEXT_FINAL = "assistant-text-final"
+RTVI_AGENT_STATE = "agent-state"
 
 
 class OpencodeProcessor(FrameProcessor):
@@ -83,11 +92,24 @@ class OpencodeProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
     async def _on_state(self, state: AgentState) -> None:
+        # Surface the agent state to the voice-room UI on every change.
+        # The pill in the activity feed reads this.
+        await self.push_frame(
+            RTVIServerMessageFrame(data={"type": RTVI_AGENT_STATE, "state": state.value})
+        )
         if state is AgentState.THINKING and self._awaiting_response and not self._acked:
             self._acked = True
             await self.push_frame(TTSSpeakFrame(self._ack_text))
 
     async def _on_delta(self, text: str) -> None:
+        # Stream the *raw* delta to the UI regardless of whether it's
+        # speakable text or inside a fenced code block. The UI wants to
+        # render markdown faithfully; only TTS needs the StreamingFilter
+        # treatment.
+        await self.push_frame(
+            RTVIServerMessageFrame(data={"type": RTVI_ASSISTANT_TEXT_DELTA, "text": text})
+        )
+
         speakable = self._narration.feed(text)
         if not speakable:
             # Inside a code fence (or held pending a fence delimiter). Don't
@@ -103,13 +125,26 @@ class OpencodeProcessor(FrameProcessor):
             await self.push_frame(LLMFullResponseStartFrame())
         await self.push_frame(LLMTextFrame(speakable))
 
-    async def _on_final(self, _text: str) -> None:
+    async def _on_final(self, text: str) -> None:
         self._narration.reset()
         if self._in_response:
             self._in_response = False
             await self.push_frame(LLMFullResponseEndFrame())
+        # Always emit a final to the UI, even if no deltas streamed (some
+        # opencode replies arrive only via MessageUpdated). The voice room
+        # uses this to lock in the assistant turn in the activity feed.
+        await self.push_frame(
+            RTVIServerMessageFrame(data={"type": RTVI_ASSISTANT_TEXT_FINAL, "text": text})
+        )
 
     async def _on_tool_start(self, tool_name: str) -> None:
+        # Always surface the tool start in the activity feed, even for tools
+        # that have no narration phrase. The user wants to see "running grep"
+        # while opencode works; the spoken narration is a separate (TTS)
+        # concern with a deliberately limited vocabulary.
+        await self.push_frame(
+            RTVIServerMessageFrame(data={"type": RTVI_TOOL_STARTED, "name": tool_name})
+        )
         phrase = checkpoint_for_tool(tool_name)
         if phrase is None:
             return

@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pytest_httpx import HTTPXMock
 
 from friday.core.events import (
@@ -34,7 +35,26 @@ from friday.core.events import (
     SessionStatus,
 )
 from friday.core.opencode_session import OpencodeClient, OpencodeSession
-from friday.voice.pipecat_adapter import DEFAULT_ACK_TEXT, OpencodeProcessor
+from friday.voice.pipecat_adapter import (
+    DEFAULT_ACK_TEXT,
+    RTVI_AGENT_STATE,
+    RTVI_ASSISTANT_TEXT_DELTA,
+    RTVI_ASSISTANT_TEXT_FINAL,
+    RTVI_TOOL_STARTED,
+    OpencodeProcessor,
+)
+
+
+def _rtvi_messages_of_type(pushed: list[Frame], type_name: str) -> list[dict[str, object]]:
+    """Helper: extract RTVI server messages of a given ``type`` from pushed."""
+    out: list[dict[str, object]] = []
+    for f in pushed:
+        if not isinstance(f, RTVIServerMessageFrame):
+            continue
+        data = f.data
+        if isinstance(data, dict) and data.get("type") == type_name:
+            out.append(data)
+    return out
 
 OPENCODE_URL = "http://opencode.test"
 SESSION_ID = "ses_a"
@@ -118,10 +138,9 @@ async def test_immediate_ack_fires_on_busy_before_deltas(
     await proc.process_frame(_transcription("hi"), FrameDirection.DOWNSTREAM)
     await session.dispatch(SessionStatus(session_id=SESSION_ID, status="busy"))
 
-    assert len(pushed) == 1
-    ack = pushed[0]
-    assert isinstance(ack, TTSSpeakFrame)
-    assert ack.text == DEFAULT_ACK_TEXT
+    speak_frames = [f for f in pushed if isinstance(f, TTSSpeakFrame)]
+    assert len(speak_frames) == 1
+    assert speak_frames[0].text == DEFAULT_ACK_TEXT
 
 
 async def test_duplicate_busy_does_not_double_ack(
@@ -180,8 +199,15 @@ async def test_text_deltas_emit_bracketed_llm_frames(session: OpencodeSession) -
         MessageUpdated(session_id=SESSION_ID, message_id="m1", role="assistant", time_end=1_000)
     )
 
-    types = [type(f).__name__ for f in pushed]
-    assert types == [
+    # The LLM-frame subsequence must be exactly start → text → text → end,
+    # in that order. RTVI server messages may interleave (delta + final +
+    # agent-state) and are checked separately below.
+    llm_types = [
+        type(f).__name__
+        for f in pushed
+        if isinstance(f, (LLMFullResponseStartFrame, LLMTextFrame, LLMFullResponseEndFrame))
+    ]
+    assert llm_types == [
         "LLMFullResponseStartFrame",
         "LLMTextFrame",
         "LLMTextFrame",
@@ -189,18 +215,24 @@ async def test_text_deltas_emit_bracketed_llm_frames(session: OpencodeSession) -
     ]
     text_frames = [f for f in pushed if isinstance(f, LLMTextFrame)]
     assert [f.text for f in text_frames] == ["He", "llo"]
-    assert isinstance(pushed[0], LLMFullResponseStartFrame)
-    assert isinstance(pushed[-1], LLMFullResponseEndFrame)
 
 
-async def test_final_without_deltas_emits_no_end_frame(session: OpencodeSession) -> None:
+async def test_final_without_deltas_emits_no_llm_end_frame(session: OpencodeSession) -> None:
     _, pushed = _make_processor(session)
 
     await session.dispatch(
         MessageUpdated(session_id=SESSION_ID, message_id="m1", role="assistant", time_end=1_000)
     )
 
-    assert pushed == []
+    # No LLM frames — without a preceding delta there's nothing to bracket.
+    assert not any(
+        isinstance(f, (LLMFullResponseStartFrame, LLMFullResponseEndFrame, LLMTextFrame))
+        for f in pushed
+    )
+    # MessageUpdated still drives the session to IDLE; the agent-state RTVI
+    # message lets the UI clear its "thinking" indicator.
+    state_msgs = _rtvi_messages_of_type(pushed, RTVI_AGENT_STATE)
+    assert state_msgs == [{"type": RTVI_AGENT_STATE, "state": "idle"}]
 
 
 async def test_fenced_code_blocks_are_not_pushed_as_text(session: OpencodeSession) -> None:
@@ -287,6 +319,71 @@ async def test_unknown_tool_emits_no_checkpoint(session: OpencodeSession) -> Non
     )
 
     assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
+
+
+async def test_text_deltas_emit_rtvi_assistant_text_delta(session: OpencodeSession) -> None:
+    """Every raw delta — fenced or not — surfaces to the UI as an RTVI message."""
+    _, pushed = _make_processor(session)
+
+    deltas = ["Here it is:\n", "```python\n", "x=1\n", "```\nDone."]
+    for d in deltas:
+        await session.dispatch(
+            MessagePartDelta(
+                session_id=SESSION_ID, message_id="m1", part_id="p1", field="text", delta=d
+            )
+        )
+
+    rtvi_deltas = _rtvi_messages_of_type(pushed, RTVI_ASSISTANT_TEXT_DELTA)
+    assert [m["text"] for m in rtvi_deltas] == deltas
+
+
+async def test_message_finalized_emits_rtvi_assistant_text_final(session: OpencodeSession) -> None:
+    _, pushed = _make_processor(session)
+
+    await session.dispatch(
+        MessagePartDelta(
+            session_id=SESSION_ID, message_id="m1", part_id="p1", field="text", delta="hi there"
+        )
+    )
+    await session.dispatch(
+        MessageUpdated(session_id=SESSION_ID, message_id="m1", role="assistant", time_end=1)
+    )
+
+    finals = _rtvi_messages_of_type(pushed, RTVI_ASSISTANT_TEXT_FINAL)
+    assert finals == [{"type": RTVI_ASSISTANT_TEXT_FINAL, "text": "hi there"}]
+
+
+async def test_tool_start_emits_rtvi_for_unknown_tool_too(session: OpencodeSession) -> None:
+    """Unknown tools still appear in the activity feed even when there's no
+    spoken narration phrase."""
+    _, pushed = _make_processor(session)
+
+    await session.dispatch(
+        MessagePartUpdated(
+            session_id=SESSION_ID,
+            message_id="m1",
+            part_id="tp1",
+            part_type="tool",
+            text=None,
+            tool_name="some_made_up_tool",
+            tool_status="running",
+        )
+    )
+
+    rtvi_tools = _rtvi_messages_of_type(pushed, RTVI_TOOL_STARTED)
+    assert rtvi_tools == [{"type": RTVI_TOOL_STARTED, "name": "some_made_up_tool"}]
+    # And no spoken phrase was emitted for the unknown tool.
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
+
+
+async def test_state_changes_emit_rtvi_agent_state(session: OpencodeSession) -> None:
+    _, pushed = _make_processor(session)
+
+    await session.dispatch(SessionStatus(session_id=SESSION_ID, status="busy"))
+    await session.dispatch(SessionStatus(session_id=SESSION_ID, status="idle"))
+
+    states = _rtvi_messages_of_type(pushed, RTVI_AGENT_STATE)
+    assert [s["state"] for s in states] == ["thinking", "idle"]
 
 
 async def test_two_back_to_back_turns_both_forwarded(
