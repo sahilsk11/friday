@@ -12,7 +12,7 @@ import {
 } from '@pipecat-ai/voice-ui-kit';
 import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
 import { useQuery } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router';
 
 import { ActivityFeed } from '@/components/ActivityFeed';
@@ -48,6 +48,18 @@ function buildWsUrl(sessionId: string): string {
 export default function VoiceRoom(): React.ReactElement {
   const { id } = useParams<{ id: string }>();
   const [client, setClient] = useState<PipecatClient | null>(null);
+  // Tracks which session id this VoiceRoom has already started initializing
+  // a transport for. Without this, React 18 StrictMode runs the setup effect
+  // twice in dev (mount → cleanup → mount), and the first WavRecorder's
+  // begin() is mid-flight when the second mount creates another one. The
+  // websocket-transport SDK silently swallows begin() errors inside
+  // WavMediaManager.initialize() and still sets _initialized=true, so
+  // pcClient.initDevices() resolves successfully even though processor is
+  // null. The next click of Connect then throws "Session ended: please call
+  // .begin() first" from inside _wavRecorder.getStatus(). Gating on the id
+  // here means cleanup runs harmlessly (no-ops while _initialized=false)
+  // and the first init completes uninterrupted.
+  const initStartedFor = useRef<string | null>(null);
 
   // Pre-load the persisted transcript so the activity feed shows past
   // turns immediately when reopening an existing session. Once mounted,
@@ -63,6 +75,8 @@ export default function VoiceRoom(): React.ReactElement {
 
   useEffect(() => {
     if (!id) return;
+    if (initStartedFor.current === id) return;
+    initStartedFor.current = id;
     // WavMediaManager (Web Audio API) over the default DailyMediaManager
     // — the Daily one pulls in @daily-co/daily-js, which spins up its
     // own WebRTC call object purely for mic capture. That's heavy and
@@ -176,6 +190,11 @@ function VoiceRoomShell({
               and the agent would never get a turn. We don't currently have
               hands-free auto-end-of-turn detection. */}
           <SendTurnButton />
+          {/* Manual barge-in. Stops TTS mid-sentence and aborts the in-flight
+              opencode turn. Send and Interrupt are independent — interrupt
+              just shuts the bot up; you tap Send when you've got a new turn
+              ready. No VAD yet, so this is the only way to barge in. */}
+          <InterruptButton />
 
           <div className="mt-auto flex items-center justify-between gap-3">
             <MicToggle />
@@ -214,6 +233,27 @@ function SendTurnButton(): React.ReactElement {
       className="rounded-md bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
     >
       Send turn ⏎
+    </button>
+  );
+}
+
+// Tells the server to stop TTS and abort the running opencode turn. The
+// server pushes InterruptionTaskFrame upstream — pipecat clears TTS and
+// STT buffers automatically; OpencodeProcessor also calls /abort. After
+// tapping this, the user speaks fresh and taps Send when ready.
+function InterruptButton(): React.ReactElement {
+  const client = usePipecatClient();
+  return (
+    <button
+      type="button"
+      disabled={!client}
+      onClick={() => {
+        if (!client) return;
+        client.sendClientMessage('interrupt');
+      }}
+      className="rounded-md border border-red-700 bg-red-950 px-4 py-2 text-sm font-medium text-red-200 hover:bg-red-900 disabled:opacity-50"
+    >
+      Interrupt
     </button>
   );
 }

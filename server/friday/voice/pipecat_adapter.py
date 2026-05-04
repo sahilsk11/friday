@@ -5,8 +5,11 @@ Replaces the LLM slot in a standard pipecat voice stack:
 - Consumes ``TranscriptionFrame(finalized=True)`` → ``POST /sessions/:id/turn``
   (forwarded to opencode immediately; opencode queues if a turn is in-flight).
   In parallel, kicks off a contextual ack via OpenRouter → ``TTSSpeakFrame``.
-- Consumes ``InterruptionFrame`` → ignored. v1 lets opencode drain its queue
-  rather than calling ``/abort`` on every barge-in.
+- Consumes ``InterruptionFrame`` → aborts the in-flight opencode turn and
+  resets local streaming state. The frame itself is also pushed downstream
+  by the base class so TTS/STT clear their own buffers. The user triggers
+  this via the explicit Interrupt button (``client_message: "interrupt"``);
+  there's no upstream VAD, so coughs and background noise can't fire it.
 - Emits ``LLMFullResponseStartFrame`` → ``LLMTextFrame*`` → ``LLMFullResponseEndFrame``
   for each opencode response, matching the contract the assistant aggregator
   and TTS service expect.
@@ -33,6 +36,7 @@ from typing import Any, override
 from loguru import logger
 from pipecat.frames.frames import (
     Frame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
@@ -92,6 +96,11 @@ class OpencodeProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
+        if isinstance(frame, InterruptionFrame):
+            await self._handle_interruption()
+            await self.push_frame(frame, direction)
+            return
+
         if isinstance(frame, TranscriptionFrame) and frame.finalized:
             logger.info("opencode_processor: transcription -> {!r}", frame.text)
             self._acked = False
@@ -109,6 +118,26 @@ class OpencodeProcessor(FrameProcessor):
             return
 
         await self.push_frame(frame, direction)
+
+    async def _handle_interruption(self) -> None:
+        """User barged in via the Interrupt button. Abort opencode and reset.
+
+        Opencode's ``/abort`` stops the in-flight turn; the SSE stream may
+        still emit one or two trailing events for it, but ``cancel()`` clears
+        the per-turn accumulator so they can't surface as a final. We also
+        cancel any pending ack and clear streaming bracket state so the next
+        ``send_turn`` starts fresh.
+        """
+        logger.info("opencode_processor: interruption — aborting opencode")
+        if self._ack_task is not None and not self._ack_task.done():
+            self._ack_task.cancel()
+        self._acked = False
+        self._in_response = False
+        self._narration.reset()
+        try:
+            await self._session.cancel()
+        except Exception:
+            logger.exception("opencode_processor: cancel failed")
 
     async def _on_state(self, state: AgentState) -> None:
         # Surface the agent state to the voice-room UI on every change.

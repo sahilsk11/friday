@@ -223,6 +223,10 @@ class OpencodeSession:
     async def cancel(self) -> None:
         resp = await self._http.post(f"/session/{self.id}/abort", json={})
         resp.raise_for_status()
+        # Drop in-flight accumulators so a late MessageUpdated for the aborted
+        # turn doesn't fire on_text_final / on_state(IDLE) into a fresh turn.
+        self._accumulated.clear()
+        self._reasoning_parts.clear()
 
     # ── Inbound (called by OpencodeClient._dispatch) ────────────────────────
 
