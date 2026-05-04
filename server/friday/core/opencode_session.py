@@ -35,6 +35,13 @@ from friday.core.events import (
 )
 from friday.core.state import AgentState
 
+SYSTEM_PROMPT_VOICE = (
+    "You are being used via a voice interface with TTS (text-to-speech). "
+    "Keep responses concise and natural for speech. "
+    "Avoid formatting like markdown, code blocks, or long lists when possible. "
+    "Use short paragraphs and speak in a conversational tone."
+)
+
 EventHandler = Callable[[OpencodeEvent], Awaitable[None]]
 TextDeltaHandler = Callable[[str], Awaitable[None]]
 TextFinalHandler = Callable[[str], Awaitable[None]]
@@ -88,8 +95,12 @@ class OpencodeClient:
 
     # ── HTTP API ────────────────────────────────────────────────────────────
 
-    async def new_session(self, title: str | None = None) -> OpencodeSession:
+    async def new_session(
+        self, title: str | None = None, system_prompt: str | None = None
+    ) -> OpencodeSession:
         body: dict[str, Any] = {"title": title} if title else {}
+        if system_prompt:
+            body["systemPrompt"] = system_prompt
         resp = await self._http.post("/session", json=body)
         resp.raise_for_status()
         session_id: str = resp.json()["id"]
