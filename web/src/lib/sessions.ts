@@ -1,5 +1,5 @@
 import { apiClient } from './api';
-import type { SessionDetail, SessionRow } from '@/types/api';
+import type { ModelRef, ModelsResponse, SessionDetail, SessionRow } from '@/types/api';
 
 // Thin typed wrappers around the REST surface. Pages call these
 // directly via TanStack Query — no extra abstraction layer.
@@ -12,10 +12,12 @@ export function listSessions(directory?: string): Promise<SessionRow[]> {
 export function createSession(
   title?: string,
   directory?: string,
+  model?: ModelRef,
 ): Promise<SessionRow> {
-  const body: { title?: string; directory?: string } = {};
+  const body: { title?: string; directory?: string; model?: ModelRef } = {};
   if (title) body.title = title;
   if (directory) body.directory = directory;
+  if (model) body.model = model;
   return apiClient.post<SessionRow>('/sessions', body);
 }
 
@@ -23,6 +25,16 @@ export function getSession(id: string): Promise<SessionDetail> {
   return apiClient.get<SessionDetail>(`/sessions/${id}`);
 }
 
-export function postTurn(id: string, text: string): Promise<{ session_id: string }> {
-  return apiClient.post<{ session_id: string }>(`/sessions/${id}/turn`, { text });
+export function postTurn(
+  id: string,
+  text: string,
+  model?: ModelRef,
+): Promise<{ session_id: string }> {
+  const body: { text: string; model?: ModelRef } = { text };
+  if (model) body.model = model;
+  return apiClient.post<{ session_id: string }>(`/sessions/${id}/turn`, body);
+}
+
+export function listModels(): Promise<ModelsResponse> {
+  return apiClient.get<ModelsResponse>('/models');
 }

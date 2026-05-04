@@ -16,10 +16,11 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router';
 
 import { ActivityFeed } from '@/components/ActivityFeed';
+import { ModelChip } from '@/components/ModelChip';
 import { ThinkingIndicator } from '@/components/ThinkingIndicator';
 import { fridayBaseUrl } from '@/lib/env';
 import { getSession } from '@/lib/sessions';
-import type { TranscriptEntry } from '@/types/api';
+import type { ModelRef, TranscriptEntry } from '@/types/api';
 
 // THE ONLY PAGE THAT IMPORTS @pipecat-ai/*.
 //
@@ -119,6 +120,7 @@ export default function VoiceRoom(): React.ReactElement {
       <VoiceRoomShell
         sessionId={id}
         initialTranscript={sessionQuery.data?.transcript ?? []}
+        currentModel={sessionQuery.data?.current_model ?? null}
       />
     </PipecatClientProvider>
   );
@@ -127,22 +129,27 @@ export default function VoiceRoom(): React.ReactElement {
 function VoiceRoomShell({
   sessionId,
   initialTranscript,
+  currentModel,
 }: {
   sessionId: string;
   initialTranscript: TranscriptEntry[];
+  currentModel: ModelRef | null;
 }): React.ReactElement {
   return (
     <div className="mx-auto flex h-screen max-w-5xl flex-col px-6 py-6">
-      <header className="mb-6 flex items-baseline justify-between">
+      <header className="mb-6 flex items-center justify-between">
         <Link to="/" className="text-sm text-neutral-400 hover:text-neutral-200">
           ← sessions
         </Link>
-        <Link
-          to={`/s/${sessionId}/transcript`}
-          className="rounded-md border border-neutral-700 px-3 py-1.5 text-xs hover:border-neutral-500"
-        >
-          transcript
-        </Link>
+        <div className="flex items-center gap-3">
+          <ModelChip sessionId={sessionId} active={currentModel} />
+          <Link
+            to={`/s/${sessionId}/transcript`}
+            className="rounded-md border border-neutral-700 px-3 py-1.5 text-xs hover:border-neutral-500"
+          >
+            transcript
+          </Link>
+        </div>
       </header>
 
       <div className="grid flex-1 gap-6 overflow-hidden md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">

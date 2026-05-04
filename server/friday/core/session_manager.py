@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from friday.core.opencode_session import OpencodeClient, OpencodeSession
+from friday.core.opencode_session import ModelChoice, OpencodeClient, OpencodeSession
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,12 +36,17 @@ class Message:
     ``text`` concatenates all ``type == "text"`` parts in order — that's what
     ends up rendered to the user. ``parts`` keeps the raw list so callers that
     care about tool invocations or step boundaries can inspect them.
+
+    ``model`` is set on assistant messages — opencode records which model
+    actually ran the turn. ``None`` for user messages or rows without a
+    persisted model (very early opencode versions).
     """
 
     role: str
     text: str
     completed_at: datetime | None
     parts: list[dict[str, Any]] = field(default_factory=list)
+    model: ModelChoice | None = None
 
 
 class SessionManager:
@@ -49,6 +54,13 @@ class SessionManager:
 
     def __init__(self, client: OpencodeClient) -> None:
         self._client = client
+
+    @property
+    def http(self) -> Any:
+        """The underlying opencode HTTP client. Used by handlers that need to
+        proxy requests opencode doesn't surface through the typed API
+        (e.g. ``GET /config/providers`` for the model picker)."""
+        return self._client.http
 
     async def list_sessions(self, *, directory: str | None = None) -> list[SessionInfo]:
         """List all sessions, optionally filtered to one working directory."""
@@ -79,9 +91,18 @@ class SessionManager:
         system_prompt: str | None = None,
         *,
         directory: str | None = None,
+        model: ModelChoice | None = None,
     ) -> OpencodeSession:
-        """Create a new session and return its live wrapper."""
-        return await self._client.new_session(title, system_prompt, directory=directory)
+        """Create a new session and return its live wrapper.
+
+        ``model``, if given, is parked on the live session as ``next_model``
+        and consumed by the first ``send_turn``. After that, opencode itself
+        is source of truth via ``info.modelID`` on each assistant message.
+        """
+        session = await self._client.new_session(title, system_prompt, directory=directory)
+        if model is not None:
+            session.next_model = model
+        return session
 
     def attach(self, session_id: str) -> OpencodeSession:
         """Return a live wrapper for an existing session (cached)."""
@@ -105,11 +126,19 @@ def _parse_message(row: dict[str, Any]) -> Message:
     text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
     time = info.get("time") or {}
     completed_ms = time.get("completed") or time.get("end")
+    model_id = info.get("modelID")
+    provider_id = info.get("providerID")
+    model = (
+        ModelChoice(provider_id=provider_id, model_id=model_id)
+        if model_id and provider_id
+        else None
+    )
     return Message(
         role=info.get("role", ""),
         text=text,
         completed_at=_ms_to_datetime(completed_ms) if completed_ms else None,
         parts=parts,
+        model=model,
     )
 
 
