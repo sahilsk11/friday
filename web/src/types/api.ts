@@ -15,9 +15,25 @@ export interface TranscriptEntry {
   completed_at: string | null;
 }
 
+export interface ModelRef {
+  providerID: string;
+  modelID: string;
+}
+
+export interface ModelInfo extends ModelRef {
+  providerName: string;
+  modelName: string;
+}
+
+export interface ModelsResponse {
+  models: ModelInfo[];
+  default: ModelRef | null;
+}
+
 export interface SessionDetail {
   session: SessionRow;
   transcript: TranscriptEntry[];
+  current_model: ModelRef | null;
 }
 
 export type AgentState = 'idle' | 'listening' | 'thinking' | 'speaking';
@@ -26,4 +42,5 @@ export type AgentState = 'idle' | 'listening' | 'thinking' | 'speaking';
 export type SessionEvent =
   | { type: 'state'; state: AgentState }
   | { type: 'text.delta'; text: string }
-  | { type: 'text.final'; text: string };
+  | { type: 'text.final'; text: string }
+  | { type: 'model'; providerID: string; modelID: string };

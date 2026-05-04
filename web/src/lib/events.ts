@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 
 import { apiUrl } from './api';
-import type { AgentState, SessionEvent } from '@/types/api';
+import type { AgentState, ModelRef, SessionEvent } from '@/types/api';
 
 // Live transcript + state via SSE. EventSource (not fetch) so the
 // no-restricted-syntax fetch rule doesn't apply here.
@@ -16,6 +16,8 @@ export interface LiveTranscript {
   finals: string[];
   /** Currently streaming assistant text — empty between turns. */
   pending: string;
+  /** Last model opencode reported running an assistant turn. */
+  model: ModelRef | null;
   /** Wire-level connection state. */
   connection: 'connecting' | 'open' | 'closed';
 }
@@ -24,6 +26,7 @@ const initial: LiveTranscript = {
   state: 'idle',
   finals: [],
   pending: '',
+  model: null,
   connection: 'connecting',
 };
 
@@ -57,6 +60,11 @@ export function useSessionEvents(sessionId: string | undefined): LiveTranscript 
             return { ...prev, pending: prev.pending + evt.text };
           case 'text.final':
             return { ...prev, finals: [...prev.finals, evt.text], pending: '' };
+          case 'model':
+            return {
+              ...prev,
+              model: { providerID: evt.providerID, modelID: evt.modelID },
+            };
         }
       });
     };
