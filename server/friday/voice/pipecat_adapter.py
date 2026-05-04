@@ -187,11 +187,15 @@ class OpencodeProcessor(FrameProcessor):
         )
 
     async def _narrate_tool(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+        # Label drives the UI activity chip only — we used to also speak it via
+        # TTSSpeakFrame, but for any non-trivial turn the per-tool narration
+        # backed up the synth queue and ran long after opencode finished. We
+        # now rely on opencode itself to verbally narrate progress (see the
+        # narration block in SYSTEM_PROMPT_VOICE), which produces text deltas
+        # that flow through the normal TTS path with model-controlled timing.
         label = await describe_tool(tool_name, tool_input)
         logger.debug("opencode_processor: narrate_tool | tool={} label={!r}", tool_name, label)
         rtvi_data: dict[str, object] = {"type": RTVI_TOOL_STARTED, "name": tool_name}
         if label:
             rtvi_data["label"] = label
         await self.push_frame(RTVIServerMessageFrame(data=rtvi_data))
-        if label:
-            await self.push_frame(TTSSpeakFrame(label))

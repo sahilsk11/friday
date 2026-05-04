@@ -334,7 +334,13 @@ async def test_fenced_code_blocks_are_not_pushed_as_text(session: OpencodeSessio
     assert "Done." in spoken
 
 
-async def test_tool_start_emits_checkpoint_speak(session: OpencodeSession) -> None:
+async def test_tool_start_emits_rtvi_message_no_tts(session: OpencodeSession) -> None:
+    """Tool start emits an RTVI message for the UI chip but never a TTSSpeakFrame.
+
+    Per-tool TTS narration was removed — opencode itself narrates progress in
+    text, which flows through the normal TTS path. Tool calls themselves are
+    silent on the audio side; the UI chip is the only signal.
+    """
     _, pushed = _make_processor(session)
 
     await session.dispatch(
@@ -350,13 +356,15 @@ async def test_tool_start_emits_checkpoint_speak(session: OpencodeSession) -> No
     )
     await asyncio.sleep(0)  # let narration background task run
 
-    speak_frames = [f for f in pushed if isinstance(f, TTSSpeakFrame)]
-    assert len(speak_frames) == 1
-    assert speak_frames[0].text == "looking at a file"
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
+    rtvi_messages = _rtvi_messages_of_type(pushed, RTVI_TOOL_STARTED)
+    assert len(rtvi_messages) == 1
+    assert rtvi_messages[0]["name"] == "read"
+    assert rtvi_messages[0]["label"] == "looking at a file"
 
 
 async def test_tool_status_updates_dont_double_announce(session: OpencodeSession) -> None:
-    """Opencode emits MessagePartUpdated repeatedly per tool — only narrate once."""
+    """Opencode emits MessagePartUpdated repeatedly per tool — only one RTVI message fires."""
     _, pushed = _make_processor(session)
 
     for status in ("pending", "running", "completed"):
@@ -373,10 +381,12 @@ async def test_tool_status_updates_dont_double_announce(session: OpencodeSession
         )
     await asyncio.sleep(0)  # let narration background task run
 
-    assert sum(isinstance(f, TTSSpeakFrame) for f in pushed) == 1
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
+    assert len(_rtvi_messages_of_type(pushed, RTVI_TOOL_STARTED)) == 1
 
 
-async def test_unknown_tool_emits_no_checkpoint(session: OpencodeSession) -> None:
+async def test_unknown_tool_emits_rtvi_message_without_label(session: OpencodeSession) -> None:
+    """Unknown tools still surface in the UI chip — just without a friendly label."""
     _, pushed = _make_processor(session)
 
     await session.dispatch(
@@ -393,6 +403,10 @@ async def test_unknown_tool_emits_no_checkpoint(session: OpencodeSession) -> Non
     await asyncio.sleep(0)  # let narration background task run
 
     assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
+    rtvi_messages = _rtvi_messages_of_type(pushed, RTVI_TOOL_STARTED)
+    assert len(rtvi_messages) == 1
+    assert rtvi_messages[0]["name"] == "some_made_up_tool"
+    assert "label" not in rtvi_messages[0]
 
 
 async def test_text_deltas_emit_rtvi_assistant_text_delta(session: OpencodeSession) -> None:

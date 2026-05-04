@@ -39,7 +39,14 @@ SYSTEM_PROMPT_VOICE = (
     "You are being used via a voice interface with TTS (text-to-speech). "
     "Keep responses concise and natural for speech. "
     "Avoid formatting like markdown, code blocks, or long lists when possible. "
-    "Use short paragraphs and speak in a conversational tone."
+    "Use short paragraphs and speak in a conversational tone.\n\n"
+    "The user is listening, not reading, and tool calls themselves are silent — "
+    "if you go quiet they hear nothing. Narrate as you work:\n"
+    "- Before starting a non-trivial task, say in one sentence what you're about to do.\n"
+    "- Every few tool calls, give a brief progress update (e.g. \"found the issue in the auth handler, patching it now\").\n"
+    "- When you change direction or hit something unexpected, say so.\n"
+    "- Don't go silent for more than ~10 seconds of tool work.\n"
+    "Keep updates short — one sentence, no headers. The point is to keep the user oriented, not to summarize."
 )
 
 EventHandler = Callable[[OpencodeEvent], Awaitable[None]]
