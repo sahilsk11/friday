@@ -16,10 +16,13 @@ function formatTimestamp(iso: string): string {
   }
 }
 
+const DEFAULT_DIRECTORY = '/root/projects';
+
 export default function SessionsList() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [title, setTitle] = useState('');
+  const [directory, setDirectory] = useState(DEFAULT_DIRECTORY);
 
   const sessionsQuery = useQuery({
     queryKey: ['sessions'],
@@ -28,10 +31,12 @@ export default function SessionsList() {
   });
 
   const createMutation = useMutation({
-    mutationFn: (t: string) => createSession(t || undefined),
+    mutationFn: ({ t, d }: { t: string; d: string }) =>
+      createSession(t || undefined, d || undefined),
     onSuccess: async (row) => {
       await queryClient.invalidateQueries({ queryKey: ['sessions'] });
       setTitle('');
+      setDirectory(DEFAULT_DIRECTORY);
       void navigate(`/s/${row.id}`);
     },
   });
@@ -44,10 +49,10 @@ export default function SessionsList() {
       </header>
 
       <form
-        className="mb-8 flex gap-2"
+        className="mb-8 flex flex-col gap-2"
         onSubmit={(e) => {
           e.preventDefault();
-          createMutation.mutate(title.trim());
+          createMutation.mutate({ t: title.trim(), d: directory.trim() });
         }}
       >
         <input
@@ -55,16 +60,27 @@ export default function SessionsList() {
           placeholder="new session title (optional)"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
-          className="flex-1 rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm placeholder:text-neutral-500 focus:border-neutral-500 focus:outline-none"
+          className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm placeholder:text-neutral-500 focus:border-neutral-500 focus:outline-none"
           disabled={createMutation.isPending}
         />
-        <button
-          type="submit"
-          disabled={createMutation.isPending}
-          className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-white disabled:opacity-50"
-        >
-          {createMutation.isPending ? 'creating…' : 'new session'}
-        </button>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            placeholder="working directory"
+            value={directory}
+            onChange={(e) => setDirectory(e.target.value)}
+            required
+            className="flex-1 rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 font-mono text-sm placeholder:text-neutral-500 focus:border-neutral-500 focus:outline-none"
+            disabled={createMutation.isPending}
+          />
+          <button
+            type="submit"
+            disabled={createMutation.isPending || !directory.trim()}
+            className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-white disabled:opacity-50"
+          >
+            {createMutation.isPending ? 'creating…' : 'new session'}
+          </button>
+        </div>
       </form>
 
       {createMutation.error ? (
