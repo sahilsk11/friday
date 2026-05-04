@@ -38,6 +38,7 @@ _SSE_QUEUE_LIMIT = 256
 
 class CreateSessionBody(BaseModel):
     title: str | None = None
+    directory: str | None = None
 
 
 class TurnBody(BaseModel):
@@ -103,7 +104,7 @@ async def list_sessions(
 
 @router.post("", response_model=SessionRow, status_code=201)
 async def create_session(body: CreateSessionBody, manager: ManagerDep) -> SessionRow:
-    session = await manager.create(title=body.title)
+    session = await manager.create(title=body.title, directory=body.directory)
     info = await manager.get(session.id)
     return SessionRow.from_info(info)
 
