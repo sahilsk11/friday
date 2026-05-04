@@ -12,7 +12,7 @@ import {
 } from '@pipecat-ai/voice-ui-kit';
 import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
 import { useQuery } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router';
 
 import { ActivityFeed } from '@/components/ActivityFeed';
@@ -48,6 +48,18 @@ function buildWsUrl(sessionId: string): string {
 export default function VoiceRoom(): React.ReactElement {
   const { id } = useParams<{ id: string }>();
   const [client, setClient] = useState<PipecatClient | null>(null);
+  // Tracks which session id this VoiceRoom has already started initializing
+  // a transport for. Without this, React 18 StrictMode runs the setup effect
+  // twice in dev (mount → cleanup → mount), and the first WavRecorder's
+  // begin() is mid-flight when the second mount creates another one. The
+  // websocket-transport SDK silently swallows begin() errors inside
+  // WavMediaManager.initialize() and still sets _initialized=true, so
+  // pcClient.initDevices() resolves successfully even though processor is
+  // null. The next click of Connect then throws "Session ended: please call
+  // .begin() first" from inside _wavRecorder.getStatus(). Gating on the id
+  // here means cleanup runs harmlessly (no-ops while _initialized=false)
+  // and the first init completes uninterrupted.
+  const initStartedFor = useRef<string | null>(null);
 
   // Pre-load the persisted transcript so the activity feed shows past
   // turns immediately when reopening an existing session. Once mounted,
@@ -63,6 +75,8 @@ export default function VoiceRoom(): React.ReactElement {
 
   useEffect(() => {
     if (!id) return;
+    if (initStartedFor.current === id) return;
+    initStartedFor.current = id;
     // WavMediaManager (Web Audio API) over the default DailyMediaManager
     // — the Daily one pulls in @daily-co/daily-js, which spins up its
     // own WebRTC call object purely for mic capture. That's heavy and
