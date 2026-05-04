@@ -4,19 +4,25 @@ Replaces the LLM slot in a standard pipecat voice stack:
 
 - Consumes ``TranscriptionFrame(finalized=True)`` → ``POST /sessions/:id/turn``
   (forwarded to opencode immediately; opencode queues if a turn is in-flight).
+  In parallel, kicks off a contextual ack via OpenRouter → ``TTSSpeakFrame``.
 - Consumes ``InterruptionFrame`` → ignored. v1 lets opencode drain its queue
   rather than calling ``/abort`` on every barge-in.
 - Emits ``LLMFullResponseStartFrame`` → ``LLMTextFrame*`` → ``LLMFullResponseEndFrame``
   for each opencode response, matching the contract the assistant aggregator
   and TTS service expect.
-- Emits ``TTSSpeakFrame("on it")`` once per turn — the immediate ack — when
-  opencode goes ``busy`` before any text deltas arrive. Suppressed if real
-  text has already started streaming.
+
+Ack timing: fires from ``TranscriptionFrame(finalized=True)`` — the input-side
+boundary where we know the user's intent — rather than from ``session.status:
+busy``. The old hook required opencode to receive + dequeue + emit "busy"
+before we'd say anything, which broke when opencode was already busy with
+a queued turn (no fresh "busy" event ever arrives). Now: the ack races the
+prompt round-trip and is suppressed by ``_acked`` if real text starts first.
 
 Concurrency note: observer callbacks fire from the SSE loop's task and can
 race with ``process_frame``. We always go out via ``self.push_frame()`` which
-is queue-safe inside pipecat. We use ``self.create_task()`` for any async
-work spawned from observer paths so pipecat's ``TaskManager`` cleans up.
+is queue-safe inside pipecat. Background work (ack generation, tool narration)
+runs as ``asyncio.create_task`` so the LLM round-trip never blocks the frame
+loop or the SSE consumer.
 """
 
 from __future__ import annotations
@@ -36,12 +42,11 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
+from friday.core.ack_generator import generate_ack
 from friday.core.narration_policy import StreamingFilter
 from friday.core.opencode_session import OpencodeSession
 from friday.core.state import AgentState
 from friday.core.tool_narrator import describe_tool
-
-DEFAULT_ACK_TEXT = "on it"
 
 # RTVI server-message types this processor emits. The voice room subscribes
 # to these to render the live activity feed and streaming assistant text.
@@ -55,16 +60,13 @@ RTVI_AGENT_STATE = "agent-state"
 class OpencodeProcessor(FrameProcessor):
     """Pipecat FrameProcessor wrapping a single OpencodeSession."""
 
-    def __init__(self, session: OpencodeSession, *, ack_text: str = DEFAULT_ACK_TEXT) -> None:
+    def __init__(self, session: OpencodeSession) -> None:
         super().__init__()
         self._session = session
-        self._ack_text = ack_text
-        # _awaiting_response: a turn was sent and we haven't seen its first
-        # delta or final yet. Cleared on first delta of the response.
-        self._awaiting_response = False
-        # _acked: ack already fired for the current pending turn. Reset on
-        # send_turn. Independent of _awaiting_response so duplicate
-        # ``session.status:busy`` events don't double-ack.
+        # _acked: an ack has already been spoken (or pre-empted by real text)
+        # for the current turn. Set when the ack TTS frame is pushed, or in
+        # ``_on_delta`` to suppress a still-in-flight ack from talking over
+        # the assistant. Reset on each finalized transcription.
         self._acked = False
         # _in_response: between LLMFullResponseStartFrame and ...EndFrame.
         # Bracketing prevents unmatched End frames if a session emits a
@@ -74,9 +76,12 @@ class OpencodeProcessor(FrameProcessor):
         # responses so a turn that opens a fence and never closes (model
         # interrupted) doesn't poison the next turn.
         self._narration = StreamingFilter()
-        # Strong references to background narration tasks — prevents GC before
-        # the event loop runs them (loop only keeps weak refs to tasks).
-        self._bg_tasks: set[asyncio.Task] = set()
+        # Strong references to background tasks — prevents GC before the
+        # event loop runs them (loop only keeps weak refs to tasks).
+        self._bg_tasks: set[asyncio.Task[None]] = set()
+        # Current in-flight ack task. Cancelled on a fresh transcription so
+        # an ack from a stale turn can't speak over the new one.
+        self._ack_task: asyncio.Task[None] | None = None
 
         session.on_text_delta(self._on_delta)
         session.on_text_final(self._on_final)
@@ -89,22 +94,47 @@ class OpencodeProcessor(FrameProcessor):
 
         if isinstance(frame, TranscriptionFrame) and frame.finalized:
             logger.info("opencode_processor: transcription -> {!r}", frame.text)
-            await self._session.send_turn(frame.text)
-            self._awaiting_response = True
             self._acked = False
+            # Cancel any pending ack from the previous turn — its phrase is
+            # stale now and would talk over the new turn if it landed late.
+            if self._ack_task is not None and not self._ack_task.done():
+                self._ack_task.cancel()
+            # Spawn ack generation BEFORE awaiting send_turn so the OpenRouter
+            # round-trip overlaps the prompt POST. Both run concurrently with
+            # everything downstream; neither blocks the frame loop.
+            self._ack_task = asyncio.create_task(self._generate_and_speak_ack(frame.text))
+            self._bg_tasks.add(self._ack_task)
+            self._ack_task.add_done_callback(self._bg_tasks.discard)
+            await self._session.send_turn(frame.text)
             return
 
         await self.push_frame(frame, direction)
 
     async def _on_state(self, state: AgentState) -> None:
         # Surface the agent state to the voice-room UI on every change.
-        # The pill in the activity feed reads this.
+        # The pill in the activity feed reads this. The ack itself fires from
+        # ``process_frame`` on the user's transcript — not from here — so the
+        # state update is purely a UI signal.
         await self.push_frame(
             RTVIServerMessageFrame(data={"type": RTVI_AGENT_STATE, "state": state.value})
         )
-        if state is AgentState.THINKING and self._awaiting_response and not self._acked:
-            self._acked = True
-            await self.push_frame(TTSSpeakFrame(self._ack_text))
+
+    async def _generate_and_speak_ack(self, transcript: str) -> None:
+        """Generate a contextual ack and speak it, unless suppressed.
+
+        Suppression: if real assistant text has already started streaming by
+        the time the OpenRouter call returns, ``_on_delta`` will have set
+        ``_acked = True`` and we drop the phrase rather than talk over the
+        actual response. ``CancelledError`` propagates naturally — the next
+        transcript's ack replaces this one.
+        """
+        phrase = await generate_ack(transcript)
+        if self._acked:
+            logger.debug("opencode_processor: ack suppressed | phrase={!r}", phrase)
+            return
+        self._acked = True
+        logger.info("opencode_processor: speaking ack | phrase={!r}", phrase)
+        await self.push_frame(TTSSpeakFrame(phrase))
 
     async def _on_delta(self, text: str) -> None:
         # Stream the *raw* delta to the UI regardless of whether it's
@@ -118,12 +148,11 @@ class OpencodeProcessor(FrameProcessor):
         speakable = self._narration.feed(text)
         if not speakable:
             # Inside a code fence (or held pending a fence delimiter). Don't
-            # clear ack state yet — we want the immediate ack to keep firing
-            # if the *visible* response is still empty.
+            # set _acked yet — we want a still-in-flight ack to fire if the
+            # *visible* response so far is still empty.
             return
-        # Real assistant text is reaching the user — suppress any not-yet-fired
+        # Real assistant text is reaching the user — suppress any in-flight
         # ack and open the response bracket if needed.
-        self._awaiting_response = False
         self._acked = True
         if not self._in_response:
             self._in_response = True
