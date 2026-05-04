@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncIterator
 from typing import Annotated
 
@@ -104,6 +105,19 @@ async def list_sessions(
 
 @router.post("", response_model=SessionRow, status_code=201)
 async def create_session(body: CreateSessionBody, manager: ManagerDep) -> SessionRow:
+    if body.directory is not None:
+        # Validate up-front: opencode launches tools that resolve paths
+        # against this cwd, so a bogus directory means every tool call
+        # fails downstream with a confusing error. We share a filesystem
+        # with opencode (same process box), so a local stat is correct.
+        if not os.path.isabs(body.directory):
+            raise HTTPException(
+                status_code=400, detail="directory must be an absolute path"
+            )
+        if not await asyncio.to_thread(os.path.isdir, body.directory):
+            raise HTTPException(
+                status_code=400, detail=f"directory does not exist: {body.directory}"
+            )
     session = await manager.create(title=body.title, directory=body.directory)
     info = await manager.get(session.id)
     return SessionRow.from_info(info)
