@@ -11,11 +11,14 @@ import {
   VoiceVisualizer,
 } from '@pipecat-ai/voice-ui-kit';
 import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
+import { useQuery } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router';
 
 import { ActivityFeed } from '@/components/ActivityFeed';
 import { fridayBaseUrl } from '@/lib/env';
+import { getSession } from '@/lib/sessions';
+import type { TranscriptEntry } from '@/types/api';
 
 // THE ONLY PAGE THAT IMPORTS @pipecat-ai/*.
 //
@@ -44,6 +47,18 @@ function buildWsUrl(sessionId: string): string {
 export default function VoiceRoom(): React.ReactElement {
   const { id } = useParams<{ id: string }>();
   const [client, setClient] = useState<PipecatClient | null>(null);
+
+  // Pre-load the persisted transcript so the activity feed shows past
+  // turns immediately when reopening an existing session. Once mounted,
+  // ActivityFeed only consumes live RTVI events.
+  const sessionQuery = useQuery({
+    queryKey: ['session', id],
+    queryFn: () => {
+      if (!id) throw new Error('missing session id');
+      return getSession(id);
+    },
+    enabled: Boolean(id),
+  });
 
   useEffect(() => {
     if (!id) return;
@@ -78,15 +93,29 @@ export default function VoiceRoom(): React.ReactElement {
 
   if (!id) return <p className="p-6 text-sm text-red-300">missing session id</p>;
   if (!client) return <p className="p-6 text-sm text-neutral-400">initializing client…</p>;
+  // Wait for the transcript fetch so ActivityFeed can seed in one shot —
+  // its initial entries are read on mount and never reconciled later.
+  if (sessionQuery.isLoading) {
+    return <p className="p-6 text-sm text-neutral-400">loading session…</p>;
+  }
 
   return (
     <PipecatClientProvider client={client}>
-      <VoiceRoomShell sessionId={id} />
+      <VoiceRoomShell
+        sessionId={id}
+        initialTranscript={sessionQuery.data?.transcript ?? []}
+      />
     </PipecatClientProvider>
   );
 }
 
-function VoiceRoomShell({ sessionId }: { sessionId: string }): React.ReactElement {
+function VoiceRoomShell({
+  sessionId,
+  initialTranscript,
+}: {
+  sessionId: string;
+  initialTranscript: TranscriptEntry[];
+}): React.ReactElement {
   return (
     <div className="mx-auto flex h-screen max-w-5xl flex-col px-6 py-6">
       <header className="mb-6 flex items-baseline justify-between">
@@ -153,7 +182,7 @@ function VoiceRoomShell({ sessionId }: { sessionId: string }): React.ReactElemen
             <span className="text-xs uppercase tracking-wider text-neutral-500">activity</span>
           </header>
           <div className="flex-1 overflow-y-auto">
-            <ActivityFeed />
+            <ActivityFeed initialTranscript={initialTranscript} />
           </div>
         </section>
       </div>

@@ -1,6 +1,8 @@
 import { RTVIEvent, type TranscriptData } from '@pipecat-ai/client-js';
 import { useRTVIClientEvent } from '@pipecat-ai/client-react';
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
+
+import type { TranscriptEntry } from '@/types/api';
 
 // Chronological feed of user finals, assistant turns, and tool starts.
 //
@@ -48,8 +50,32 @@ function isServerMessage(value: unknown): value is ServerMessageData {
 let entrySeq = 0;
 const nextId = (): string => `e${(++entrySeq).toString()}`;
 
-export function ActivityFeed(): React.ReactElement {
-  const [entries, setEntries] = useState<FeedEntry[]>([]);
+function transcriptToEntries(transcript: TranscriptEntry[]): FeedEntry[] {
+  return transcript
+    .filter((e) => e.text.trim().length > 0)
+    .map((e) =>
+      e.role === 'user'
+        ? { kind: 'user', id: nextId(), text: e.text }
+        : { kind: 'assistant', id: nextId(), text: e.text, final: true },
+    );
+}
+
+export function ActivityFeed({
+  initialTranscript,
+}: {
+  initialTranscript?: TranscriptEntry[];
+} = {}): React.ReactElement {
+  // Seed the feed with persisted history on mount. Live RTVI events
+  // append on top — opencode replays nothing on reconnect, so any new
+  // turns will simply add to whatever was already there.
+  const initial = useMemo(
+    () => (initialTranscript ? transcriptToEntries(initialTranscript) : []),
+    // We intentionally only read this once; subsequent prop changes
+    // would clobber live deltas.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+  const [entries, setEntries] = useState<FeedEntry[]>(initial);
 
   const onUserTranscript = useCallback((data: TranscriptData) => {
     if (!data.final) return;

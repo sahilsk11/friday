@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 
 import { isApiError } from '@/lib/api';
@@ -16,24 +16,15 @@ function formatTimestamp(iso: string): string {
   }
 }
 
+const DEFAULT_DIRECTORY = '/root/projects';
+
 export default function SessionsList() {
-  const queryClient = useQueryClient();
-  const navigate = useNavigate();
-  const [title, setTitle] = useState('');
+  const [modalOpen, setModalOpen] = useState(false);
 
   const sessionsQuery = useQuery({
     queryKey: ['sessions'],
     queryFn: () => listSessions(),
     refetchOnMount: 'always',
-  });
-
-  const createMutation = useMutation({
-    mutationFn: (t: string) => createSession(t || undefined),
-    onSuccess: async (row) => {
-      await queryClient.invalidateQueries({ queryKey: ['sessions'] });
-      setTitle('');
-      void navigate(`/s/${row.id}`);
-    },
   });
 
   return (
@@ -43,39 +34,17 @@ export default function SessionsList() {
         <span className="text-sm text-neutral-400">opencode sessions</span>
       </header>
 
-      <form
-        className="mb-8 flex gap-2"
-        onSubmit={(e) => {
-          e.preventDefault();
-          createMutation.mutate(title.trim());
-        }}
-      >
-        <input
-          type="text"
-          placeholder="new session title (optional)"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          className="flex-1 rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm placeholder:text-neutral-500 focus:border-neutral-500 focus:outline-none"
-          disabled={createMutation.isPending}
-        />
+      <div className="mb-8 flex justify-end">
         <button
-          type="submit"
-          disabled={createMutation.isPending}
-          className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-white disabled:opacity-50"
+          type="button"
+          onClick={() => {
+            setModalOpen(true);
+          }}
+          className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-white"
         >
-          {createMutation.isPending ? 'creating…' : 'new session'}
+          new session
         </button>
-      </form>
-
-      {createMutation.error ? (
-        <ErrorBanner
-          message={
-            isApiError(createMutation.error)
-              ? createMutation.error.message
-              : 'failed to create session'
-          }
-        />
-      ) : null}
+      </div>
 
       {sessionsQuery.isLoading ? (
         <p className="text-sm text-neutral-400">loading…</p>
@@ -121,6 +90,138 @@ export default function SessionsList() {
           )}
         </ul>
       )}
+
+      {modalOpen ? (
+        <NewSessionModal
+          onClose={() => {
+            setModalOpen(false);
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function NewSessionModal({ onClose }: { onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const [title, setTitle] = useState('');
+  const [directory, setDirectory] = useState(DEFAULT_DIRECTORY);
+  const directoryRef = useRef<HTMLInputElement>(null);
+
+  const createMutation = useMutation({
+    mutationFn: ({ t, d }: { t: string; d: string }) =>
+      createSession(t || undefined, d || undefined),
+    onSuccess: async (row) => {
+      await queryClient.invalidateQueries({ queryKey: ['sessions'] });
+      void navigate(`/s/${row.id}`);
+    },
+  });
+
+  // Esc to close. Don't close while a request is in flight — the user
+  // either gets a session back (we navigate) or an error to read.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !createMutation.isPending) {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [onClose, createMutation.isPending]);
+
+  const errorMessage = createMutation.error
+    ? isApiError(createMutation.error)
+      ? createMutation.error.message
+      : 'failed to create session'
+    : null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
+      onClick={() => {
+        if (!createMutation.isPending) onClose();
+      }}
+    >
+      <div
+        className="w-full max-w-md rounded-lg border border-neutral-800 bg-neutral-950 p-6 shadow-xl"
+        onClick={(e) => {
+          e.stopPropagation();
+        }}
+      >
+        <h2 className="mb-4 text-lg font-semibold">new session</h2>
+
+        <form
+          className="flex flex-col gap-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const d = directory.trim();
+            if (!d) {
+              directoryRef.current?.focus();
+              return;
+            }
+            createMutation.mutate({ t: title.trim(), d });
+          }}
+        >
+          <label className="flex flex-col gap-1">
+            <span className="text-xs uppercase tracking-wide text-neutral-500">title</span>
+            <input
+              type="text"
+              placeholder="optional"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm placeholder:text-neutral-500 focus:border-neutral-500 focus:outline-none"
+              disabled={createMutation.isPending}
+              autoFocus
+            />
+          </label>
+
+          <label className="flex flex-col gap-1">
+            <span className="text-xs uppercase tracking-wide text-neutral-500">
+              working directory
+            </span>
+            <input
+              ref={directoryRef}
+              type="text"
+              placeholder="/absolute/path"
+              value={directory}
+              onChange={(e) => setDirectory(e.target.value)}
+              required
+              className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 font-mono text-sm placeholder:text-neutral-500 focus:border-neutral-500 focus:outline-none"
+              disabled={createMutation.isPending}
+            />
+            <span className="text-xs text-neutral-500">
+              must be an absolute path that exists on the friday host.
+            </span>
+          </label>
+
+          {errorMessage ? (
+            <div className="rounded-md border border-red-800 bg-red-950/40 px-3 py-2 text-sm text-red-200">
+              {errorMessage}
+            </div>
+          ) : null}
+
+          <div className="mt-2 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={createMutation.isPending}
+              className="rounded-md border border-neutral-700 px-4 py-2 text-sm hover:border-neutral-500 disabled:opacity-50"
+            >
+              cancel
+            </button>
+            <button
+              type="submit"
+              disabled={createMutation.isPending || !directory.trim()}
+              className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-white disabled:opacity-50"
+            >
+              {createMutation.isPending ? 'creating…' : 'create'}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }
