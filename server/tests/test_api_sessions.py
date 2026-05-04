@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -123,6 +124,48 @@ async def test_create_session_posts_and_returns_metadata(
     assert resp.status_code == 201
     assert resp.json()["id"] == "ses_new"
     assert resp.json()["title"] == "fresh"
+
+
+async def test_create_session_with_valid_directory_forwards_query_param(
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session?directory={tmp_path}",
+        json={"id": "ses_new", "title": ""},
+    )
+    httpx_mock.add_response(
+        url=f"{OPENCODE_URL}/session/ses_new",
+        json={
+            "id": "ses_new",
+            "title": "",
+            "directory": str(tmp_path),
+            "time": {"created": 1, "updated": 1},
+        },
+    )
+
+    async with client:
+        resp = await client.post("/sessions", json={"directory": str(tmp_path)})
+
+    assert resp.status_code == 201
+
+
+async def test_create_session_rejects_relative_directory(client: httpx.AsyncClient) -> None:
+    async with client:
+        resp = await client.post("/sessions", json={"directory": "relative/path"})
+
+    assert resp.status_code == 400
+    assert "absolute" in resp.json()["detail"]
+
+
+async def test_create_session_rejects_nonexistent_directory(client: httpx.AsyncClient) -> None:
+    async with client:
+        resp = await client.post(
+            "/sessions", json={"directory": "/this/path/should/not/exist/xyz"}
+        )
+
+    assert resp.status_code == 400
+    assert "does not exist" in resp.json()["detail"]
 
 
 async def test_get_session_returns_metadata_and_transcript(
