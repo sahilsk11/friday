@@ -172,6 +172,11 @@ class OpencodeSession:
         # Track tool parts we've already announced to avoid replays — opencode
         # emits MessagePartUpdated repeatedly as tool state advances.
         self._announced_tools: set[str] = set()
+        # ReasoningPart (thinking) deltas arrive as field="text" on the wire,
+        # indistinguishable from real text deltas unless we track the part type.
+        # We register part IDs here when we first see them as type="reasoning"
+        # so _handle_delta can skip them entirely.
+        self._reasoning_parts: set[str] = set()
 
     # ── Observer registration ───────────────────────────────────────────────
 
@@ -216,12 +221,18 @@ class OpencodeSession:
     async def _handle_delta(self, event: MessagePartDelta) -> None:
         if event.field != "text":
             return
+        if event.part_id in self._reasoning_parts:
+            return
         key = f"{event.session_id}:{event.message_id}"
         self._accumulated[key] = self._accumulated.get(key, "") + event.delta
         for handler in self._delta_handlers:
             await handler(event.delta)
 
     async def _handle_part_updated(self, event: MessagePartUpdated) -> None:
+        if event.part_type == "reasoning":
+            self._reasoning_parts.add(event.part_id)
+            return
+
         # Announce on "running" (not "pending") — the input args aren't
         # populated until the tool actually starts executing.
         if event.part_type != "tool" or not event.tool_name:
