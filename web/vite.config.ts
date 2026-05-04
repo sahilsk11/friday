@@ -15,7 +15,15 @@ const port = Number(process.env.PORT ?? 5173);
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss(), tsconfigPaths()],
-  server: { port, strictPort: true, host: true },
+  server: {
+    port,
+    strictPort: true,
+    host: true,
+    proxy: {
+      '/sessions': 'http://localhost:8000',
+      '/api': { target: 'http://localhost:8000', ws: true },
+    },
+  },
   preview: { port, strictPort: true, host: true },
   // voice-ui-kit lazy-loads transports via dynamic string imports
   // (`import("@pipecat-ai/small-webrtc-transport")`) so vite's static
