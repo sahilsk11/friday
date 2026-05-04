@@ -29,6 +29,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pytest_httpx import HTTPXMock
 
+from friday.core.ack_generator import FALLBACK
 from friday.core.events import (
     MessagePartDelta,
     MessagePartUpdated,
@@ -37,13 +38,25 @@ from friday.core.events import (
 )
 from friday.core.opencode_session import OpencodeClient, OpencodeSession
 from friday.voice.pipecat_adapter import (
-    DEFAULT_ACK_TEXT,
     RTVI_AGENT_STATE,
     RTVI_ASSISTANT_TEXT_DELTA,
     RTVI_ASSISTANT_TEXT_FINAL,
     RTVI_TOOL_STARTED,
     OpencodeProcessor,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_openrouter(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
+    """Clear OPENROUTER_API_KEY for every test in this module.
+
+    The adapter spawns LLM calls (ack_generator, tool_narrator) when this is
+    set; with the key, tests pick up the developer's real key from .env and
+    either hit the network or — under httpx_mock — register unexpected POSTs
+    that fail teardown. Tests that exercise the LLM-on path patch the call
+    sites directly.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
 
 def _rtvi_messages_of_type(pushed: list[Frame], type_name: str) -> list[dict[str, object]]:
@@ -108,8 +121,10 @@ async def test_finalized_transcription_posts_turn_to_opencode(
     sent = httpx_mock.get_requests()
     assert len(sent) == 1
     assert sent[0].url.path == f"/session/{SESSION_ID}/prompt_async"
-    # Finalized transcription is consumed (it was the user turn) — not pushed downstream.
-    assert pushed == []
+    # Finalized transcription is consumed (it was the user turn) — not pushed
+    # downstream as a frame. The ack is a separate TTSSpeakFrame, asserted in
+    # ``test_ack_fires_on_finalized_transcription``.
+    assert not any(isinstance(f, TranscriptionFrame) for f in pushed)
 
 
 async def test_non_finalized_transcription_passes_through(
@@ -126,9 +141,12 @@ async def test_non_finalized_transcription_passes_through(
     assert pushed == [interim]
 
 
-async def test_immediate_ack_fires_on_busy_before_deltas(
+async def test_ack_fires_on_finalized_transcription(
     httpx_mock: HTTPXMock, session: OpencodeSession
 ) -> None:
+    """Without OPENROUTER_API_KEY the ack is the static fallback, but it
+    still fires the moment the user's transcript finalizes — well before
+    opencode would have emitted ``session.status:busy``."""
     httpx_mock.add_response(
         method="POST",
         url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
@@ -137,50 +155,102 @@ async def test_immediate_ack_fires_on_busy_before_deltas(
     proc, pushed = _make_processor(session)
 
     await proc.process_frame(_transcription("hi"), FrameDirection.DOWNSTREAM)
-    await session.dispatch(SessionStatus(session_id=SESSION_ID, status="busy"))
+    # Let the spawned ack task run.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
 
     speak_frames = [f for f in pushed if isinstance(f, TTSSpeakFrame)]
     assert len(speak_frames) == 1
-    assert speak_frames[0].text == DEFAULT_ACK_TEXT
+    assert speak_frames[0].text == FALLBACK
 
 
-async def test_duplicate_busy_does_not_double_ack(
-    httpx_mock: HTTPXMock, session: OpencodeSession
-) -> None:
-    httpx_mock.add_response(
-        method="POST",
-        url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
-        status_code=204,
-    )
-    proc, pushed = _make_processor(session)
+async def test_busy_state_does_not_emit_ack(session: OpencodeSession) -> None:
+    """``session.status:busy`` is now a UI signal only — no TTSSpeakFrame from it.
 
-    await proc.process_frame(_transcription("hi"), FrameDirection.DOWNSTREAM)
+    (Catches regressions where ack logic creeps back into ``_on_state``.)"""
+    _, pushed = _make_processor(session)
+
+    # No transcription yet, so no ack should fire from raw state changes.
     await session.dispatch(SessionStatus(session_id=SESSION_ID, status="busy"))
     await session.dispatch(SessionStatus(session_id=SESSION_ID, status="busy"))
 
-    assert sum(isinstance(f, TTSSpeakFrame) for f in pushed) == 1
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
 
 
 async def test_ack_suppressed_when_deltas_arrive_first(
-    httpx_mock: HTTPXMock, session: OpencodeSession
+    httpx_mock: HTTPXMock, session: OpencodeSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Race: assistant text starts streaming before the ack task gets a turn.
+
+    Patch ``generate_ack`` to a slow path so the delta wins. The ack task
+    must drop its phrase rather than talk over the assistant.
+    """
     httpx_mock.add_response(
         method="POST",
         url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
         status_code=204,
     )
+
+    async def slow_ack(_transcript: str) -> str:
+        await asyncio.sleep(0.05)
+        return "should not be spoken"
+
+    monkeypatch.setattr("friday.voice.pipecat_adapter.generate_ack", slow_ack)
     proc, pushed = _make_processor(session)
 
     await proc.process_frame(_transcription("hi"), FrameDirection.DOWNSTREAM)
-    # Race: the first delta arrives before opencode emits status:busy.
+    # Real text reaches the user before the slow ack returns.
     await session.dispatch(
         MessagePartDelta(
             session_id=SESSION_ID, message_id="m1", part_id="p1", field="text", delta="Hi"
         )
     )
-    await session.dispatch(SessionStatus(session_id=SESSION_ID, status="busy"))
+    # Wait long enough for the slow ack to resolve.
+    await asyncio.sleep(0.1)
 
     assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
+
+
+async def test_rapid_second_turn_cancels_pending_ack(
+    httpx_mock: HTTPXMock, session: OpencodeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two transcripts in quick succession: the first ack must be cancelled
+    so its phrase can't speak over the second turn's ack."""
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
+        status_code=204,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
+        status_code=204,
+    )
+
+    call_count = 0
+
+    async def slow_ack(transcript: str) -> str:
+        nonlocal call_count
+        call_count += 1
+        # First call sleeps long enough that the second transcript arrives
+        # mid-flight; second call returns instantly.
+        if call_count == 1:
+            await asyncio.sleep(0.2)
+            return f"stale: {transcript}"
+        return f"fresh: {transcript}"
+
+    monkeypatch.setattr("friday.voice.pipecat_adapter.generate_ack", slow_ack)
+    proc, pushed = _make_processor(session)
+
+    await proc.process_frame(_transcription("alpha"), FrameDirection.DOWNSTREAM)
+    # Fire the second turn before the first ack returns.
+    await asyncio.sleep(0.01)
+    await proc.process_frame(_transcription("beta"), FrameDirection.DOWNSTREAM)
+    await asyncio.sleep(0.3)
+
+    speak_frames = [f for f in pushed if isinstance(f, TTSSpeakFrame)]
+    assert len(speak_frames) == 1
+    assert speak_frames[0].text == "fresh: beta"
 
 
 async def test_text_deltas_emit_bracketed_llm_frames(session: OpencodeSession) -> None:
