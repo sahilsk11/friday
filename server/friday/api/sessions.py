@@ -163,11 +163,12 @@ async def get_session(session_id: str, manager: ManagerDep) -> SessionDetail:
     info = await manager.get(session_id)
     transcript = await manager.get_transcript(session_id)
     # Prefer the real model from the last assistant message; fall back to
-    # the modal's pre-first-turn cache. After the first turn this collapses
-    # to "read from opencode."
+    # whatever the user has staged for the next turn. After the first turn
+    # this collapses to "read from opencode."
+    session = manager.attach(session_id)
     current = next(
         (m.model for m in reversed(transcript) if m.role == "assistant" and m.model is not None),
-        manager.peek_pending_model(session_id),
+        session.next_model,
     )
     return SessionDetail(
         session=SessionRow.from_info(info),
@@ -179,12 +180,22 @@ async def get_session(session_id: str, manager: ManagerDep) -> SessionDetail:
 @router.post("/{session_id}/turn", status_code=202)
 async def post_turn(session_id: str, body: TurnBody, manager: ManagerDep) -> dict[str, str]:
     session = manager.attach(session_id)
-    # Per-turn override wins; otherwise consume the pre-first-turn cache
-    # (set when the modal carried a model on create). After this turn lands,
-    # opencode itself becomes the source of truth via on_model events.
-    choice = body.model.to_choice() if body.model else manager.consume_pending_model(session_id)
-    await session.send_turn(body.text, model=choice)
+    # Per-call override wins; otherwise ``send_turn`` falls back to whatever
+    # the UI staged via PATCH /sessions/:id/model.
+    await session.send_turn(body.text, model=body.model.to_choice() if body.model else None)
     return {"session_id": session_id}
+
+
+@router.patch("/{session_id}/model", status_code=204)
+async def set_session_model(session_id: str, body: ModelRef, manager: ManagerDep) -> None:
+    """Stage a model for the next turn.
+
+    Voice and REST share this — both pull from ``session.next_model`` when
+    no per-call ``model`` is supplied. Cleared automatically once the next
+    ``send_turn`` fires.
+    """
+    session = manager.attach(session_id)
+    session.next_model = body.to_choice()
 
 
 @router.get("/{session_id}/events")

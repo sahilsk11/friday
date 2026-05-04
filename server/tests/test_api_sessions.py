@@ -359,6 +359,34 @@ async def test_pre_first_turn_model_is_consumed_on_first_prompt(
     }
 
 
+async def test_patch_model_stages_for_next_turn(
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient
+) -> None:
+    """Voice + REST share session.next_model — PATCH stages it, the next
+    ``send_turn`` (from either path) carries it through."""
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/ses_a/prompt_async",
+        status_code=204,
+    )
+
+    async with client:
+        resp = await client.patch(
+            "/sessions/ses_a/model",
+            json={"providerID": "opencode", "modelID": "gpt-5-nano"},
+        )
+        assert resp.status_code == 204
+        # Subsequent turn carries the staged model without a per-call override.
+        resp = await client.post("/sessions/ses_a/turn", json={"text": "hi"})
+        assert resp.status_code == 202
+
+    prompt_req = next(r for r in httpx_mock.get_requests() if r.url.path.endswith("/prompt_async"))
+    assert json.loads(prompt_req.content) == {
+        "parts": [{"type": "text", "text": "hi"}],
+        "model": {"providerID": "opencode", "modelID": "gpt-5-nano"},
+    }
+
+
 async def test_get_session_surfaces_current_model(
     httpx_mock: HTTPXMock, client: httpx.AsyncClient
 ) -> None:

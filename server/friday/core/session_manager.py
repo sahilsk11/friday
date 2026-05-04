@@ -54,12 +54,6 @@ class SessionManager:
 
     def __init__(self, client: OpencodeClient) -> None:
         self._client = client
-        # Pre-first-turn model cache. Populated when a session is created with
-        # an explicit model and consumed once the first assistant message
-        # lands (at which point opencode itself becomes source of truth via
-        # ``info.modelID``). Consulted by ``current_model`` and forwarded by
-        # ``post_turn`` so the first prompt actually carries the choice.
-        self._pending_model: dict[str, ModelChoice] = {}
 
     @property
     def http(self) -> Any:
@@ -101,47 +95,18 @@ class SessionManager:
     ) -> OpencodeSession:
         """Create a new session and return its live wrapper.
 
-        ``model``, if given, is stashed and used on the first prompt. After
-        that, the model recorded by opencode on each assistant message takes
-        over as ground truth.
+        ``model``, if given, is parked on the live session as ``next_model``
+        and consumed by the first ``send_turn``. After that, opencode itself
+        is source of truth via ``info.modelID`` on each assistant message.
         """
         session = await self._client.new_session(title, system_prompt, directory=directory)
         if model is not None:
-            self._pending_model[session.id] = model
+            session.next_model = model
         return session
 
     def attach(self, session_id: str) -> OpencodeSession:
         """Return a live wrapper for an existing session (cached)."""
         return self._client.session(session_id)
-
-    def consume_pending_model(self, session_id: str) -> ModelChoice | None:
-        """Pop the pre-first-turn model cached at create time, if any.
-
-        Called by the API layer when forwarding a turn so the first prompt
-        carries the user's modal selection.
-        """
-        return self._pending_model.pop(session_id, None)
-
-    def peek_pending_model(self, session_id: str) -> ModelChoice | None:
-        """Read the pre-first-turn cached model without consuming it.
-
-        Used by ``GET /sessions/:id`` to surface the user's modal selection
-        before any assistant turn has run.
-        """
-        return self._pending_model.get(session_id)
-
-    async def current_model(self, session_id: str) -> ModelChoice | None:
-        """Best-effort "what model is this session running on?".
-
-        Returns the model from the most recent assistant message; falls back
-        to the pre-first-turn cache (if no assistant has spoken yet); else
-        ``None`` (let the UI render blank).
-        """
-        transcript = await self.get_transcript(session_id)
-        for msg in reversed(transcript):
-            if msg.role == "assistant" and msg.model is not None:
-                return msg.model
-        return self._pending_model.get(session_id)
 
 
 def _parse_session_info(row: dict[str, Any]) -> SessionInfo:

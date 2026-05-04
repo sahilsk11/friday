@@ -213,6 +213,11 @@ class OpencodeSession:
         # We register part IDs here when we first see them as type="reasoning"
         # so _handle_delta can skip them entirely.
         self._reasoning_parts: set[str] = set()
+        # Sticky model for the next ``send_turn`` that doesn't pass an explicit
+        # one. Set by the API layer when the user picks a model from the UI;
+        # cleared after the next turn fires. Lets voice and REST share the same
+        # selection without each path needing its own bookkeeping.
+        self.next_model: ModelChoice | None = None
 
     # ── Observer registration ───────────────────────────────────────────────
 
@@ -242,8 +247,14 @@ class OpencodeSession:
 
     async def send_turn(self, text: str, model: ModelChoice | None = None) -> None:
         body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
-        if model is not None:
-            body["model"] = model.to_wire()
+        # Explicit per-call ``model`` wins; otherwise fall back to whatever the
+        # UI most recently set as sticky. Either way, clear ``next_model`` so a
+        # follow-up turn defaults back to opencode's global default unless the
+        # user picks again.
+        choice = model or self.next_model
+        if choice is not None:
+            body["model"] = choice.to_wire()
+        self.next_model = None
         resp = await self._http.post(f"/session/{self.id}/prompt_async", json=body)
         resp.raise_for_status()
 
