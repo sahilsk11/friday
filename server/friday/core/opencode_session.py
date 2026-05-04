@@ -96,12 +96,21 @@ class OpencodeClient:
     # ── HTTP API ────────────────────────────────────────────────────────────
 
     async def new_session(
-        self, title: str | None = None, system_prompt: str | None = None
+        self,
+        title: str | None = None,
+        system_prompt: str | None = None,
+        *,
+        directory: str | None = None,
     ) -> OpencodeSession:
         body: dict[str, Any] = {"title": title} if title else {}
         if system_prompt:
             body["systemPrompt"] = system_prompt
-        resp = await self._http.post("/session", json=body)
+        # Opencode takes the working directory as a query param (see the
+        # SDK's SessionCreateData.query.directory). Without it, opencode
+        # defaults to whichever cwd the `opencode serve` process was
+        # launched from — usually wrong for our use case.
+        params: dict[str, str] = {"directory": directory} if directory else {}
+        resp = await self._http.post("/session", json=body, params=params)
         resp.raise_for_status()
         session_id: str = resp.json()["id"]
         return self.session(session_id)
