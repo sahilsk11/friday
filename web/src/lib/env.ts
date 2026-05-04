@@ -1,13 +1,19 @@
-// Single source of truth for runtime config. Always-absolute base URL:
-// the same code path runs in `vite dev`, `vite preview`, production
-// builds, and any test harness. No dev proxy, no NODE_ENV branching.
+// Resolve the absolute base URL friday's REST/SSE/WS endpoints live at.
 //
-// Resolution order:
-//   1. import.meta.env.VITE_FRIDAY_BASE_URL — inlined at build time,
-//      also readable in dev. Set via .env, .env.local, or per-process
-//      env (e.g. `VITE_FRIDAY_BASE_URL=... npm run dev`).
-//   2. http://localhost:8765 — friday's default port (see PLAN.md).
-const raw = (import.meta.env.VITE_FRIDAY_BASE_URL as string | undefined) ?? '';
-const trimmed = raw.replace(/\/$/, '');
+// In dev the FE (vite :5173) and BE (uvicorn :8765) are on different
+// origins, so VITE_FRIDAY_BASE_URL is required. In prod they share an
+// origin (FastAPI mounts web/dist) — derive from window.location so the
+// same bundle works at any host without rebuild.
 
-export const fridayBaseUrl = trimmed || 'http://localhost:8765';
+function resolveBaseUrl(): string {
+  const override = (import.meta.env.VITE_FRIDAY_BASE_URL as string | undefined) ?? '';
+  const trimmed = override.replace(/\/$/, '');
+  if (trimmed) return trimmed;
+  if (typeof window !== 'undefined') {
+    return `${window.location.protocol}//${window.location.host}`;
+  }
+  // SSR / node test env without a window — bare default.
+  return 'http://localhost:8765';
+}
+
+export const fridayBaseUrl = resolveBaseUrl();
