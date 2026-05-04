@@ -16,6 +16,7 @@ import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router';
 
 import { ActivityFeed } from '@/components/ActivityFeed';
+import { ThinkingIndicator } from '@/components/ThinkingIndicator';
 import { fridayBaseUrl } from '@/lib/env';
 import { getSession } from '@/lib/sessions';
 import type { TranscriptEntry } from '@/types/api';
@@ -157,6 +158,12 @@ function VoiceRoomShell({
               barWidth={3}
             />
           </div>
+
+          {/* "Thinking…" indicator — visible only while opencode is busy.
+              Bridges the long silent window (probe measured 11–40s) between
+              prompt accepted and first content event. Tied to opencode's
+              session state, not a dumb timer. */}
+          <ThinkingIndicator />
 
           {/* Live partial transcript — words appear as you speak. */}
           <div className="min-h-[3rem] rounded-xl border border-neutral-800 bg-black/40 px-3 py-2 text-sm text-neutral-300">
