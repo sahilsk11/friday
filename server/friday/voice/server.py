@@ -45,7 +45,7 @@ import os
 
 from fastapi import APIRouter, WebSocket
 from loguru import logger
-from pipecat.frames.frames import VADUserStoppedSpeakingFrame
+from pipecat.frames.frames import InterruptionTaskFrame, VADUserStoppedSpeakingFrame
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -155,6 +155,16 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
         if msg.type == "end-turn":
             logger.info("voice: end-turn received | session={}", opencode_session.id)
             await processor.push_frame(VADUserStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
+        elif msg.type == "interrupt":
+            # User tapped the Interrupt button. Push InterruptionTaskFrame
+            # upstream — the pipeline task converts it to a downstream
+            # InterruptionFrame, which clears TTS audio + STT audio buffers
+            # along the way. OpencodeProcessor handles the same frame to
+            # abort the in-flight opencode turn (see pipecat_adapter.py).
+            # Send and Interrupt stay separate: interrupt = "shut up", and
+            # the next turn only goes out when the user taps Send again.
+            logger.info("voice: interrupt received | session={}", opencode_session.id)
+            await processor.push_frame(InterruptionTaskFrame(), FrameDirection.UPSTREAM)
 
     rtvi.event_handler("on_client_message")(_on_client_message)
 

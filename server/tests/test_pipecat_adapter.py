@@ -19,6 +19,7 @@ import httpx
 import pytest
 from pipecat.frames.frames import (
     Frame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
@@ -459,6 +460,58 @@ async def test_state_changes_emit_rtvi_agent_state(session: OpencodeSession) -> 
 
     states = _rtvi_messages_of_type(pushed, RTVI_AGENT_STATE)
     assert [s["state"] for s in states] == ["thinking", "idle"]
+
+
+async def test_interruption_aborts_opencode_and_passes_frame_through(
+    httpx_mock: HTTPXMock, session: OpencodeSession
+) -> None:
+    """The user tapped Interrupt: /abort fires and the frame keeps flowing.
+
+    Pipecat's TTS/STT services react to InterruptionFrame downstream, so we
+    must continue propagating it after we run our own cleanup.
+    """
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/abort",
+        status_code=204,
+    )
+    proc, pushed = _make_processor(session)
+
+    await proc.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+
+    aborts = [r for r in httpx_mock.get_requests() if r.url.path.endswith("/abort")]
+    assert len(aborts) == 1
+    assert any(isinstance(f, InterruptionFrame) for f in pushed)
+
+
+async def test_interruption_cancels_pending_ack(
+    httpx_mock: HTTPXMock, session: OpencodeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A still-in-flight ack from the previous turn must not speak after interrupt."""
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
+        status_code=204,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/abort",
+        status_code=204,
+    )
+
+    async def slow_ack(transcript: str) -> str:
+        await asyncio.sleep(0.2)
+        return f"stale: {transcript}"
+
+    monkeypatch.setattr("friday.voice.pipecat_adapter.generate_ack", slow_ack)
+    proc, pushed = _make_processor(session)
+
+    await proc.process_frame(_transcription("hi"), FrameDirection.DOWNSTREAM)
+    await asyncio.sleep(0.01)
+    await proc.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+    await asyncio.sleep(0.3)
+
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
 
 
 async def test_two_back_to_back_turns_both_forwarded(

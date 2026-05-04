@@ -176,6 +176,11 @@ function VoiceRoomShell({
               and the agent would never get a turn. We don't currently have
               hands-free auto-end-of-turn detection. */}
           <SendTurnButton />
+          {/* Manual barge-in. Stops TTS mid-sentence and aborts the in-flight
+              opencode turn. Send and Interrupt are independent — interrupt
+              just shuts the bot up; you tap Send when you've got a new turn
+              ready. No VAD yet, so this is the only way to barge in. */}
+          <InterruptButton />
 
           <div className="mt-auto flex items-center justify-between gap-3">
             <MicToggle />
@@ -214,6 +219,27 @@ function SendTurnButton(): React.ReactElement {
       className="rounded-md bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
     >
       Send turn ⏎
+    </button>
+  );
+}
+
+// Tells the server to stop TTS and abort the running opencode turn. The
+// server pushes InterruptionTaskFrame upstream — pipecat clears TTS and
+// STT buffers automatically; OpencodeProcessor also calls /abort. After
+// tapping this, the user speaks fresh and taps Send when ready.
+function InterruptButton(): React.ReactElement {
+  const client = usePipecatClient();
+  return (
+    <button
+      type="button"
+      disabled={!client}
+      onClick={() => {
+        if (!client) return;
+        client.sendClientMessage('interrupt');
+      }}
+      className="rounded-md border border-red-700 bg-red-950 px-4 py-2 text-sm font-medium text-red-200 hover:bg-red-900 disabled:opacity-50"
+    >
+      Interrupt
     </button>
   );
 }
