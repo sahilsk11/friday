@@ -42,5 +42,4 @@ export type AgentState = 'idle' | 'listening' | 'thinking' | 'speaking';
 export type SessionEvent =
   | { type: 'state'; state: AgentState }
   | { type: 'text.delta'; text: string }
-  | { type: 'text.final'; text: string }
-  | { type: 'model'; providerID: string; modelID: string };
+  | { type: 'text.final'; text: string };

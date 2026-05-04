@@ -70,7 +70,6 @@ class ModelsResponse(BaseModel):
 class CreateSessionBody(BaseModel):
     title: str | None = None
     directory: str | None = None
-    model: ModelRef | None = None
 
 
 class TurnBody(BaseModel):
@@ -149,11 +148,7 @@ async def create_session(body: CreateSessionBody, manager: ManagerDep) -> Sessio
             raise HTTPException(
                 status_code=400, detail=f"directory does not exist: {body.directory}"
             )
-    session = await manager.create(
-        title=body.title,
-        directory=body.directory,
-        model=body.model.to_choice() if body.model else None,
-    )
+    session = await manager.create(title=body.title, directory=body.directory)
     info = await manager.get(session.id)
     return SessionRow.from_info(info)
 
@@ -162,41 +157,25 @@ async def create_session(body: CreateSessionBody, manager: ManagerDep) -> Sessio
 async def get_session(session_id: str, manager: ManagerDep) -> SessionDetail:
     info = await manager.get(session_id)
     transcript = await manager.get_transcript(session_id)
-    # Show the staged ``next_model`` if set — the user just picked it and the
-    # chip should reflect that immediately. Otherwise, fall back to whatever
-    # opencode actually ran most recently. ``next_model`` is cleared after the
-    # next ``send_turn`` fires, so this collapses back to "read from opencode."
-    session = manager.attach(session_id)
-    current = session.next_model or next(
+    # ``current_model`` reports what opencode actually ran most recently —
+    # ground truth, not intent. The user's pending selection lives in client
+    # state and rides along on the next turn body.
+    last_model = next(
         (m.model for m in reversed(transcript) if m.role == "assistant" and m.model is not None),
         None,
     )
     return SessionDetail(
         session=SessionRow.from_info(info),
         transcript=[MessageRow.from_message(m) for m in transcript],
-        current_model=ModelRef.from_choice(current) if current else None,
+        current_model=ModelRef.from_choice(last_model) if last_model else None,
     )
 
 
 @router.post("/{session_id}/turn", status_code=202)
 async def post_turn(session_id: str, body: TurnBody, manager: ManagerDep) -> dict[str, str]:
     session = manager.attach(session_id)
-    # Per-call override wins; otherwise ``send_turn`` falls back to whatever
-    # the UI staged via PATCH /sessions/:id/model.
     await session.send_turn(body.text, model=body.model.to_choice() if body.model else None)
     return {"session_id": session_id}
-
-
-@router.patch("/{session_id}/model", status_code=204)
-async def set_session_model(session_id: str, body: ModelRef, manager: ManagerDep) -> None:
-    """Stage a model for the next turn.
-
-    Voice and REST share this — both pull from ``session.next_model`` when
-    no per-call ``model`` is supplied. Cleared automatically once the next
-    ``send_turn`` fires.
-    """
-    session = manager.attach(session_id)
-    session.next_model = body.to_choice()
 
 
 @router.get("/{session_id}/events")
@@ -216,18 +195,12 @@ async def stream_events(
     async def on_state(state: AgentState) -> None:
         await queue.put(_pack("state", {"state": state.value}))
 
-    async def on_model(choice: ModelChoice) -> None:
-        await queue.put(
-            _pack("model", {"providerID": choice.provider_id, "modelID": choice.model_id})
-        )
-
     # NOTE: observers stay registered for the lifetime of the OpencodeSession.
-    # Each new SSE connection adds 4 handlers; for v1 with a single client per
+    # Each new SSE connection adds 3 handlers; for v1 with a single client per
     # session that's fine. Step 7 (auth + multi-client) revisits this.
     session.on_text_delta(on_delta)
     session.on_text_final(on_final)
     session.on_state(on_state)
-    session.on_model(on_model)
 
     return StreamingResponse(_sse_stream(queue), media_type="text/event-stream")
 
