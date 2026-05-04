@@ -50,12 +50,18 @@ class MessageUpdated:
 
     ``role`` is ``"user"`` or ``"assistant"``. ``time_end`` is set once the
     message is complete; that's how we detect "assistant turn done".
+
+    ``model_id`` / ``provider_id`` come from ``info.modelID`` / ``info.providerID``
+    on assistant messages. They're authoritative ground truth for "what model
+    actually ran this turn" — used to drive the model chip in the UI.
     """
 
     session_id: str
     message_id: str
     role: str
     time_end: int | None
+    model_id: str | None = None
+    provider_id: str | None = None
     type: Literal["message.updated"] = "message.updated"
 
 
@@ -148,6 +154,8 @@ def _parse_message_updated(props: dict[str, Any]) -> OpencodeEvent:
         message_id=info.get("id", ""),
         role=info.get("role", ""),
         time_end=time.get("completed") or time.get("end"),
+        model_id=info.get("modelID"),
+        provider_id=info.get("providerID"),
     )
 
 

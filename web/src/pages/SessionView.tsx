@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router';
 
+import { ModelChip } from '@/components/ModelChip';
 import { isApiError } from '@/lib/api';
 import { useSessionEvents } from '@/lib/events';
 import { getSession, postTurn } from '@/lib/sessions';
@@ -39,6 +40,10 @@ export default function SessionView() {
   });
 
   const live = useSessionEvents(id);
+
+  // Ground truth: prefer live SSE-reported model (always reality after the
+  // first turn lands), fall back to the snapshot from GET /sessions/:id.
+  const activeModel = live.model ?? sessionQuery.data?.current_model ?? null;
 
   const turnMutation = useMutation({
     mutationFn: (text: string) => {
@@ -83,6 +88,7 @@ export default function SessionView() {
           </h1>
         </div>
         <div className="flex items-center gap-3">
+          {id ? <ModelChip sessionId={id} active={activeModel} /> : null}
           <StatePill state={live.state} />
           <Link
             to={`/s/${id}`}

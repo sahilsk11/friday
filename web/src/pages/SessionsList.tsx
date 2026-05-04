@@ -1,9 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 
 import { isApiError } from '@/lib/api';
-import { createSession, listSessions } from '@/lib/sessions';
+import { createSession, listModels, listSessions } from '@/lib/sessions';
+import type { ModelInfo, ModelRef } from '@/types/api';
 
 // Plain REST. No voice-ui-kit imports here — per jarvis.md, only the
 // voice room page touches the voice stack.
@@ -17,6 +18,34 @@ function formatTimestamp(iso: string): string {
 }
 
 const DEFAULT_DIRECTORY = '/root/projects';
+const LAST_MODEL_KEY = 'friday.lastModel';
+
+function modelKey(m: ModelRef): string {
+  return `${m.providerID}/${m.modelID}`;
+}
+
+function parseModelKey(key: string): ModelRef | null {
+  const idx = key.indexOf('/');
+  if (idx < 0) return null;
+  return { providerID: key.slice(0, idx), modelID: key.slice(idx + 1) };
+}
+
+function loadLastModel(): ModelRef | null {
+  try {
+    const raw = localStorage.getItem(LAST_MODEL_KEY);
+    return raw ? parseModelKey(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveLastModel(m: ModelRef): void {
+  try {
+    localStorage.setItem(LAST_MODEL_KEY, modelKey(m));
+  } catch {
+    // localStorage disabled — fine, modal just won't remember next time.
+  }
+}
 
 export default function SessionsList() {
   const [modalOpen, setModalOpen] = useState(false);
@@ -107,11 +136,49 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate();
   const [title, setTitle] = useState('');
   const [directory, setDirectory] = useState(DEFAULT_DIRECTORY);
+  const [modelKeyValue, setModelKeyValue] = useState<string>('');
   const directoryRef = useRef<HTMLInputElement>(null);
 
+  const modelsQuery = useQuery({
+    queryKey: ['models'],
+    queryFn: listModels,
+    // Models are static-ish per opencode boot; no need to refetch on focus.
+    staleTime: 5 * 60 * 1000,
+  });
+
+  // Once models load, pick the last-used (localStorage) → opencode default →
+  // first available. Only seed once: don't fight the user if they've changed it.
+  useEffect(() => {
+    if (modelKeyValue) return;
+    if (!modelsQuery.data) return;
+    const { models, default: dflt } = modelsQuery.data;
+    if (models.length === 0) return;
+    const valid = new Set(models.map(modelKey));
+    const last = loadLastModel();
+    const seed =
+      (last && valid.has(modelKey(last)) && modelKey(last)) ||
+      (dflt && valid.has(modelKey(dflt)) && modelKey(dflt)) ||
+      modelKey(models[0]);
+    setModelKeyValue(seed);
+  }, [modelsQuery.data, modelKeyValue]);
+
+  const groupedModels = useMemo<[string, { providerName: string; items: ModelInfo[] }][]>(() => {
+    if (!modelsQuery.data) return [];
+    const out = new Map<string, { providerName: string; items: ModelInfo[] }>();
+    for (const m of modelsQuery.data.models) {
+      let bucket = out.get(m.providerID);
+      if (!bucket) {
+        bucket = { providerName: m.providerName, items: [] };
+        out.set(m.providerID, bucket);
+      }
+      bucket.items.push(m);
+    }
+    return [...out.entries()];
+  }, [modelsQuery.data]);
+
   const createMutation = useMutation({
-    mutationFn: ({ t, d }: { t: string; d: string }) =>
-      createSession(t || undefined, d || undefined),
+    mutationFn: ({ t, d, m }: { t: string; d: string; m: ModelRef | undefined }) =>
+      createSession(t || undefined, d || undefined, m),
     onSuccess: async (row) => {
       await queryClient.invalidateQueries({ queryKey: ['sessions'] });
       void navigate(`/s/${row.id}`);
@@ -162,7 +229,9 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
               directoryRef.current?.focus();
               return;
             }
-            createMutation.mutate({ t: title.trim(), d });
+            const model = modelKeyValue ? parseModelKey(modelKeyValue) : null;
+            if (model) saveLastModel(model);
+            createMutation.mutate({ t: title.trim(), d, m: model ?? undefined });
           }}
         >
           <label className="flex flex-col gap-1">
@@ -195,6 +264,36 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
             <span className="text-xs text-neutral-500">
               must be an absolute path that exists on the friday host.
             </span>
+          </label>
+
+          <label className="flex flex-col gap-1">
+            <span className="text-xs uppercase tracking-wide text-neutral-500">model</span>
+            <select
+              value={modelKeyValue}
+              onChange={(e) => setModelKeyValue(e.target.value)}
+              disabled={
+                createMutation.isPending || modelsQuery.isLoading || groupedModels.length === 0
+              }
+              className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm focus:border-neutral-500 focus:outline-none disabled:opacity-50"
+            >
+              {modelsQuery.isLoading ? (
+                <option value="">loading…</option>
+              ) : modelsQuery.error ? (
+                <option value="">failed to load models</option>
+              ) : groupedModels.length === 0 ? (
+                <option value="">no tool-capable models available</option>
+              ) : (
+                groupedModels.map(([providerID, group]) => (
+                  <optgroup key={providerID} label={group.providerName}>
+                    {group.items.map((m) => (
+                      <option key={modelKey(m)} value={modelKey(m)}>
+                        {m.modelName}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))
+              )}
+            </select>
           </label>
 
           {errorMessage ? (

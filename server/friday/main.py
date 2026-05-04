@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from friday.api.sessions import router as sessions_router
+from friday.api.sessions import models_router, router as sessions_router
 from friday.core.opencode_session import OpencodeClient
 from friday.core.session_manager import SessionManager
 from friday.voice.server import router as voice_router
@@ -81,6 +81,7 @@ def create_app(*, with_lifespan: bool = True) -> FastAPI:
         allow_credentials=True,
     )
     app.include_router(sessions_router)
+    app.include_router(models_router)
     app.include_router(voice_router)
     _mount_spa(app)
     return app

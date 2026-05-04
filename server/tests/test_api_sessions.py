@@ -160,9 +160,7 @@ async def test_create_session_rejects_relative_directory(client: httpx.AsyncClie
 
 async def test_create_session_rejects_nonexistent_directory(client: httpx.AsyncClient) -> None:
     async with client:
-        resp = await client.post(
-            "/sessions", json={"directory": "/this/path/should/not/exist/xyz"}
-        )
+        resp = await client.post("/sessions", json={"directory": "/this/path/should/not/exist/xyz"})
 
     assert resp.status_code == 400
     assert "does not exist" in resp.json()["detail"]
@@ -288,3 +286,253 @@ async def test_get_manager_503_when_unset() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://friday.test") as c:
         resp = await c.get("/sessions")
     assert resp.status_code == 503
+
+
+# ── model selection ─────────────────────────────────────────────────────────
+
+
+async def test_post_turn_with_explicit_model_forwards_choice(
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient
+) -> None:
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/ses_a/prompt_async",
+        status_code=204,
+    )
+
+    async with client:
+        resp = await client.post(
+            "/sessions/ses_a/turn",
+            json={"text": "hi", "model": {"providerID": "opencode", "modelID": "gpt-5-nano"}},
+        )
+
+    assert resp.status_code == 202
+    sent = httpx_mock.get_requests()[0]
+    assert json.loads(sent.content) == {
+        "parts": [{"type": "text", "text": "hi"}],
+        "model": {"providerID": "opencode", "modelID": "gpt-5-nano"},
+    }
+
+
+async def test_pre_first_turn_model_is_consumed_on_first_prompt(
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """Modal-supplied model on create flows through to opencode on the next turn."""
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session?directory={tmp_path}",
+        json={"id": "ses_new", "title": ""},
+    )
+    httpx_mock.add_response(
+        url=f"{OPENCODE_URL}/session/ses_new",
+        json={
+            "id": "ses_new",
+            "title": "",
+            "directory": str(tmp_path),
+            "time": {"created": 1, "updated": 1},
+        },
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/ses_new/prompt_async",
+        status_code=204,
+    )
+
+    async with client:
+        resp = await client.post(
+            "/sessions",
+            json={
+                "directory": str(tmp_path),
+                "model": {"providerID": "opencode", "modelID": "gpt-5-nano"},
+            },
+        )
+        assert resp.status_code == 201
+        # First turn — body has no `model`, but the cached choice should be
+        # forwarded to opencode automatically.
+        resp = await client.post("/sessions/ses_new/turn", json={"text": "hi"})
+        assert resp.status_code == 202
+
+    prompt_req = next(r for r in httpx_mock.get_requests() if r.url.path.endswith("/prompt_async"))
+    assert json.loads(prompt_req.content) == {
+        "parts": [{"type": "text", "text": "hi"}],
+        "model": {"providerID": "opencode", "modelID": "gpt-5-nano"},
+    }
+
+
+async def test_patch_model_stages_for_next_turn(
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient
+) -> None:
+    """Voice + REST share session.next_model — PATCH stages it, the next
+    ``send_turn`` (from either path) carries it through."""
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/ses_a/prompt_async",
+        status_code=204,
+    )
+
+    async with client:
+        resp = await client.patch(
+            "/sessions/ses_a/model",
+            json={"providerID": "opencode", "modelID": "gpt-5-nano"},
+        )
+        assert resp.status_code == 204
+        # Subsequent turn carries the staged model without a per-call override.
+        resp = await client.post("/sessions/ses_a/turn", json={"text": "hi"})
+        assert resp.status_code == 202
+
+    prompt_req = next(r for r in httpx_mock.get_requests() if r.url.path.endswith("/prompt_async"))
+    assert json.loads(prompt_req.content) == {
+        "parts": [{"type": "text", "text": "hi"}],
+        "model": {"providerID": "opencode", "modelID": "gpt-5-nano"},
+    }
+
+
+async def test_current_model_prefers_staged_over_last_assistant(
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient
+) -> None:
+    """After a fresh PATCH, the chip should show the staged model — not the
+    one the *last* assistant message ran on. Otherwise the chip looks stuck."""
+    httpx_mock.add_response(
+        url=f"{OPENCODE_URL}/session/ses_a",
+        json={
+            "id": "ses_a",
+            "title": "",
+            "directory": "/x",
+            "time": {"created": 1, "updated": 1},
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{OPENCODE_URL}/session/ses_a/message",
+        json=[
+            {
+                "info": {
+                    "role": "assistant",
+                    "time": {"completed": 1},
+                    "id": "msg_1",
+                    "modelID": "gpt-5-nano",
+                    "providerID": "opencode",
+                },
+                "parts": [{"type": "text", "text": "hi"}],
+            },
+        ],
+    )
+
+    async with client:
+        resp = await client.patch(
+            "/sessions/ses_a/model",
+            json={"providerID": "opencode", "modelID": "big-pickle"},
+        )
+        assert resp.status_code == 204
+        resp = await client.get("/sessions/ses_a")
+
+    assert resp.json()["current_model"] == {"providerID": "opencode", "modelID": "big-pickle"}
+
+
+async def test_get_session_surfaces_current_model(
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient
+) -> None:
+    httpx_mock.add_response(
+        url=f"{OPENCODE_URL}/session/ses_a",
+        json={
+            "id": "ses_a",
+            "title": "",
+            "directory": "/x",
+            "time": {"created": 1, "updated": 1},
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{OPENCODE_URL}/session/ses_a/message",
+        json=[
+            {
+                "info": {
+                    "role": "assistant",
+                    "time": {"completed": 2_000},
+                    "id": "msg_1",
+                    "modelID": "z-ai/glm5",
+                    "providerID": "nvidia",
+                },
+                "parts": [{"type": "text", "text": "Hi"}],
+            },
+        ],
+    )
+
+    async with client:
+        resp = await client.get("/sessions/ses_a")
+
+    assert resp.json()["current_model"] == {"providerID": "nvidia", "modelID": "z-ai/glm5"}
+
+
+async def test_sse_emits_model_frame_on_assistant_completion(
+    manager: SessionManager,
+) -> None:
+    response = await stream_events(session_id="ses_a", manager=manager)
+
+    session = manager.attach("ses_a")
+    await session.dispatch(
+        MessageUpdated(
+            session_id="ses_a",
+            message_id="msg_1",
+            role="assistant",
+            time_end=2_000,
+            model_id="gpt-5-nano",
+            provider_id="opencode",
+        )
+    )
+
+    collected: list[dict[str, str]] = []
+    async for raw in response.body_iterator:
+        chunk = bytes(raw) if isinstance(raw, bytes | memoryview) else raw.encode("utf-8")
+        collected.extend(
+            json.loads(line[len(b"data:") :].strip())
+            for line in chunk.splitlines()
+            if line.startswith(b"data:")
+        )
+        if any(c["type"] == "model" for c in collected):
+            break
+
+    model_frames = [c for c in collected if c["type"] == "model"]
+    assert model_frames == [{"type": "model", "providerID": "opencode", "modelID": "gpt-5-nano"}]
+
+
+async def test_models_endpoint_filters_to_active_toolcall(
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient
+) -> None:
+    httpx_mock.add_response(
+        url=f"{OPENCODE_URL}/config/providers",
+        json={
+            "default": {"opencode": "gpt-5-nano"},
+            "providers": [
+                {
+                    "id": "opencode",
+                    "name": "OpenCode Zen",
+                    "models": {
+                        "gpt-5-nano": {
+                            "name": "GPT-5 Nano",
+                            "status": "active",
+                            "capabilities": {"toolcall": True},
+                        },
+                        "no-tools": {
+                            "name": "No Tools",
+                            "status": "active",
+                            "capabilities": {"toolcall": False},
+                        },
+                        "deprecated": {
+                            "name": "Deprecated",
+                            "status": "deprecated",
+                            "capabilities": {"toolcall": True},
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    async with client:
+        resp = await client.get("/models")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["default"] == {"providerID": "opencode", "modelID": "gpt-5-nano"}
+    assert [m["modelID"] for m in body["models"]] == ["gpt-5-nano"]
+    assert body["models"][0]["providerName"] == "OpenCode Zen"
+    assert body["models"][0]["modelName"] == "GPT-5 Nano"
