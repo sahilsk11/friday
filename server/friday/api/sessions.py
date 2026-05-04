@@ -162,13 +162,14 @@ async def create_session(body: CreateSessionBody, manager: ManagerDep) -> Sessio
 async def get_session(session_id: str, manager: ManagerDep) -> SessionDetail:
     info = await manager.get(session_id)
     transcript = await manager.get_transcript(session_id)
-    # Prefer the real model from the last assistant message; fall back to
-    # whatever the user has staged for the next turn. After the first turn
-    # this collapses to "read from opencode."
+    # Show the staged ``next_model`` if set — the user just picked it and the
+    # chip should reflect that immediately. Otherwise, fall back to whatever
+    # opencode actually ran most recently. ``next_model`` is cleared after the
+    # next ``send_turn`` fires, so this collapses back to "read from opencode."
     session = manager.attach(session_id)
-    current = next(
+    current = session.next_model or next(
         (m.model for m in reversed(transcript) if m.role == "assistant" and m.model is not None),
-        session.next_model,
+        None,
     )
     return SessionDetail(
         session=SessionRow.from_info(info),

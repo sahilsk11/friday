@@ -387,6 +387,47 @@ async def test_patch_model_stages_for_next_turn(
     }
 
 
+async def test_current_model_prefers_staged_over_last_assistant(
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient
+) -> None:
+    """After a fresh PATCH, the chip should show the staged model — not the
+    one the *last* assistant message ran on. Otherwise the chip looks stuck."""
+    httpx_mock.add_response(
+        url=f"{OPENCODE_URL}/session/ses_a",
+        json={
+            "id": "ses_a",
+            "title": "",
+            "directory": "/x",
+            "time": {"created": 1, "updated": 1},
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{OPENCODE_URL}/session/ses_a/message",
+        json=[
+            {
+                "info": {
+                    "role": "assistant",
+                    "time": {"completed": 1},
+                    "id": "msg_1",
+                    "modelID": "gpt-5-nano",
+                    "providerID": "opencode",
+                },
+                "parts": [{"type": "text", "text": "hi"}],
+            },
+        ],
+    )
+
+    async with client:
+        resp = await client.patch(
+            "/sessions/ses_a/model",
+            json={"providerID": "opencode", "modelID": "big-pickle"},
+        )
+        assert resp.status_code == 204
+        resp = await client.get("/sessions/ses_a")
+
+    assert resp.json()["current_model"] == {"providerID": "opencode", "modelID": "big-pickle"}
+
+
 async def test_get_session_surfaces_current_model(
     httpx_mock: HTTPXMock, client: httpx.AsyncClient
 ) -> None:
