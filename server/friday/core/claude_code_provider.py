@@ -120,11 +120,15 @@ class ClaudeCodeSession:
         await self._fan_out_state(AgentState.THINKING)
 
     async def cancel(self) -> None:
+        # No-op when there's nothing to cancel. Lets aclose() iterate over
+        # cached idle sessions cheaply, and makes user-triggered cancel safe
+        # to call from anywhere without needing to know if a turn's running.
+        if self._query_task is None or self._query_task.done():
+            return
         self._cancelled.set()
-        if self._query_task is not None:
-            self._query_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._query_task
+        self._query_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._query_task
         await self._fan_out_state(AgentState.IDLE)
         self._text_accumulated = ""
 
