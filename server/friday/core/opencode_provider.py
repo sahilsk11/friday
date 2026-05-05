@@ -237,7 +237,7 @@ class OpencodeSession:
         # so _handle_delta can skip them entirely.
         self._reasoning_parts: set[str] = set()
         # Latest agent state. Updated on every fan-out so reconnecting
-        # consumers (a fresh OpencodeProcessor, a REST GET) can read the
+        # consumers (a fresh ProviderSessionProcessor, a REST GET) can read the
         # current value without waiting for the next opencode transition.
         self._current_state: AgentState = AgentState.IDLE
 

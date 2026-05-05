@@ -1,23 +1,26 @@
-"""OpencodeProcessor — bridges OpencodeSession events into the pipecat pipeline.
+"""ProviderSessionProcessor — bridges a ProviderSession into pipecat.
 
 Replaces the LLM slot in a standard pipecat voice stack:
 
-- Consumes ``TranscriptionFrame(finalized=True)`` → ``POST /sessions/:id/turn``
-  (forwarded to opencode immediately; opencode queues if a turn is in-flight).
-- Consumes ``InterruptionFrame`` → aborts the in-flight opencode turn and
-  resets local streaming state. The frame itself is also pushed downstream
-  by the base class so TTS/STT clear their own buffers. The user triggers
-  this via the explicit Interrupt button (``client_message: "interrupt"``);
-  there's no upstream VAD, so coughs and background noise can't fire it.
-- Emits ``LLMFullResponseStartFrame`` → ``LLMTextFrame*`` → ``LLMFullResponseEndFrame``
-  for each opencode response, matching the contract the assistant aggregator
-  and TTS service expect.
+- Consumes ``TranscriptionFrame(finalized=True)`` → forwards to the
+  provider via ``session.send_turn``. Whether the provider's send_turn is
+  HTTP, an SDK call, or a queued message is not this processor's concern.
+- Consumes ``InterruptionFrame`` → calls ``session.cancel()`` to abort the
+  in-flight turn and resets local streaming state. The frame is also pushed
+  downstream by the base class so TTS/STT clear their own buffers. The user
+  triggers this via the explicit Interrupt button (``client_message:
+  "interrupt"``); there's no upstream VAD, so coughs and background noise
+  can't fire it.
+- Emits ``LLMFullResponseStartFrame`` → ``LLMTextFrame*`` →
+  ``LLMFullResponseEndFrame`` for each provider response, matching the
+  contract the assistant aggregator and TTS service expect.
 
-Concurrency note: observer callbacks fire from the SSE loop's task and can
-race with ``process_frame``. We always go out via ``self.push_frame()`` which
-is queue-safe inside pipecat. Background work (tool narration) runs as
+Concurrency note: observer callbacks fire from the provider's event loop
+(opencode's SSE task, claude-code's query() generator, …) and can race with
+``process_frame``. We always go out via ``self.push_frame()`` which is
+queue-safe inside pipecat. Background work (tool narration) runs as
 ``asyncio.create_task`` so the OpenRouter call never blocks the frame loop
-or the SSE consumer.
+or the provider's event loop.
 """
 
 from __future__ import annotations
@@ -53,17 +56,19 @@ RTVI_ASSISTANT_TEXT_FINAL = "assistant-text-final"
 RTVI_AGENT_STATE = "agent-state"
 
 
-class OpencodeProcessor(FrameProcessor):
-    """Pipecat FrameProcessor wrapping a single OpencodeSession."""
+class ProviderSessionProcessor(FrameProcessor):
+    """Pipecat FrameProcessor wrapping a single ProviderSession."""
 
     def __init__(
         self, session: ProviderSession, *, system_prompt: str = SYSTEM_PROMPT_VOICE
     ) -> None:
         super().__init__()
         self._session = session
-        # Sent on every send_turn via opencode's per-turn ``system`` field.
-        # Per-turn is the only injection path opencode honors (create-time
-        # systemPrompt is silently dropped).
+        # Sent on every send_turn via the provider's per-turn ``system``
+        # field. (Opencode silently drops a create-time systemPrompt; the
+        # per-turn path is the only one it honors. Other providers map this
+        # onto whatever their SDK exposes — see ClaudeCodeSession for the
+        # SystemPromptPreset(append=...) translation.)
         self._system_prompt = system_prompt
         # _in_response: between LLMFullResponseStartFrame and ...EndFrame.
         # Bracketing prevents unmatched End frames if a session emits a
@@ -93,8 +98,9 @@ class OpencodeProcessor(FrameProcessor):
         self.tts_enabled: bool = False
 
         # Hold the unsubscribe handles so cleanup() can detach this
-        # processor's callbacks from the cached OpencodeSession. Without
-        # this, every reconnect leaks another set of dead handlers that
+        # processor's callbacks from the provider session. Sessions can
+        # outlive a pipeline (opencode caches them; ClaudeCode could too),
+        # so without these, every reconnect would leak dead handlers that
         # keep firing into a torn-down pipeline.
         self._unsubscribes: list[Unsubscribe] = [
             session.on_text_delta(self._on_delta),
@@ -113,7 +119,7 @@ class OpencodeProcessor(FrameProcessor):
             return
 
         if isinstance(frame, TranscriptionFrame) and frame.finalized:
-            logger.info("opencode_processor: transcription -> {!r}", frame.text)
+            logger.info("provider_session_processor: transcription -> {!r}", frame.text)
             # Consume the model the WS handler stamped from end-turn (if any)
             # — opencode's per-session stickiness then carries it across
             # subsequent turns until the user picks again.
@@ -126,11 +132,11 @@ class OpencodeProcessor(FrameProcessor):
 
     @override
     async def cleanup(self) -> None:
-        """Detach observers from the cached OpencodeSession.
+        """Detach observers from the provider session.
 
-        The session lives across pipelines (one global SSE subscription
-        keyed on session id), so handlers we registered in ``__init__``
-        would otherwise outlive this pipeline and keep pushing frames
+        Provider sessions can outlive a pipeline (opencode caches them
+        keyed by id; the SSE loop is shared globally), so handlers we
+        registered in ``__init__`` would otherwise keep pushing frames
         into a torn-down processor.
         """
         for unsubscribe in self._unsubscribes:
@@ -139,20 +145,21 @@ class OpencodeProcessor(FrameProcessor):
         await super().cleanup()
 
     async def _handle_interruption(self) -> None:
-        """User barged in via the Interrupt button. Abort opencode and reset.
+        """User barged in via the Interrupt button. Cancel the turn and reset.
 
-        Opencode's ``/abort`` stops the in-flight turn; the SSE stream may
-        still emit one or two trailing events for it, but ``cancel()`` clears
-        the per-turn accumulator so they can't surface as a final. We also
-        clear streaming bracket state so the next ``send_turn`` starts fresh.
+        ``session.cancel()`` is provider-defined: opencode POSTs ``/abort``
+        and clears its per-turn accumulator so trailing SSE events for the
+        cancelled turn can't surface as a final; ClaudeCode cancels the
+        in-flight ``query()`` task. Either way we also clear streaming
+        bracket state so the next ``send_turn`` starts fresh.
         """
-        logger.info("opencode_processor: interruption — aborting opencode")
+        logger.info("provider_session_processor: interruption — cancelling turn")
         self._in_response = False
         self._narration.reset()
         try:
             await self._session.cancel()
         except Exception:
-            logger.exception("opencode_processor: cancel failed")
+            logger.exception("provider_session_processor: cancel failed")
 
     async def stop_speaking(self) -> None:
         """Silence TTS without aborting opencode.
@@ -170,7 +177,7 @@ class OpencodeProcessor(FrameProcessor):
             still draining its tail. ``InterruptionFrame`` upstream would
             also fire ``cancel()`` on opencode, which we don't want here.
         """
-        logger.info("opencode_processor: stop-speaking")
+        logger.info("provider_session_processor: stop-speaking")
         await self.push_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
 
     async def _on_state(self, state: AgentState) -> None:
@@ -226,7 +233,7 @@ class OpencodeProcessor(FrameProcessor):
         task.add_done_callback(
             lambda t: (
                 logger.error(
-                    "opencode_processor: narrate_tool failed | tool={} err={}",
+                    "provider_session_processor: narrate_tool failed | tool={} err={}",
                     tool_name,
                     t.exception(),
                 )
@@ -243,7 +250,9 @@ class OpencodeProcessor(FrameProcessor):
             await self.push_frame(RTVIServerMessageFrame(data=rtvi_data))
             return
         label = await describe_tool(tool_name, tool_input)
-        logger.debug("opencode_processor: narrate_tool | tool={} label={!r}", tool_name, label)
+        logger.debug(
+            "provider_session_processor: narrate_tool | tool={} label={!r}", tool_name, label
+        )
         if label:
             rtvi_data["label"] = label
         await self.push_frame(RTVIServerMessageFrame(data=rtvi_data))

@@ -16,7 +16,7 @@ Pipeline shape per connection::
     transport.input()
         → STT (ElevenLabs realtime VAD-mode, or Deepgram)
         → TurnAccumulator                           # buffers commits → turns
-        → OpencodeProcessor                         # replaces the LLM slot
+        → ProviderSessionProcessor                         # replaces the LLM slot
         → TTS (ElevenLabs, or Cartesia)
         → transport.output()
         → RTVIProcessor                             # voice-UI state surface
@@ -81,7 +81,7 @@ from pipecat.transports.websocket.fastapi import (
 from friday.core.provider import ModelChoice
 from friday.core.session_manager import SessionManager
 from friday.voice.elevenlabs_force_commit import ElevenLabsRealtimeSTTServiceForceCommit
-from friday.voice.pipecat_adapter import OpencodeProcessor
+from friday.voice.pipecat_adapter import ProviderSessionProcessor
 from friday.voice.turn_accumulator import TurnAccumulator
 
 router = APIRouter(tags=["voice"])
@@ -118,11 +118,11 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     await websocket.accept()
 
     if session_id:
-        opencode_session = manager.attach(session_id)
-        logger.info("voice: attached to opencode session | id={}", opencode_session.id)
+        session = manager.attach(session_id)
+        logger.info("voice: attached to opencode session | id={}", session.id)
     else:
-        opencode_session = await manager.create()
-        logger.info("voice: created new opencode session | id={}", opencode_session.id)
+        session = await manager.create()
+        logger.info("voice: created new opencode session | id={}", session.id)
 
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
@@ -139,7 +139,7 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     stt = _select_stt()
     tts = _select_tts()
     accumulator = TurnAccumulator()
-    opencode = OpencodeProcessor(opencode_session)
+    agent = ProviderSessionProcessor(session)
     rtvi = RTVIProcessor(transport=transport)
 
     # Echo client-ready back as bot-ready. Pipecat's RTVIProcessor only
@@ -161,7 +161,7 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     async def _on_client_ready(processor: RTVIProcessor) -> None:
         await processor.set_bot_ready()
         await processor.send_server_message(
-            {"type": "agent-state", "state": opencode_session.current_state.value}
+            {"type": "agent-state", "state": session.current_state.value}
         )
 
     rtvi.event_handler("on_client_ready")(_on_client_ready)
@@ -180,21 +180,21 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     async def _on_client_message(processor: RTVIProcessor, msg: ClientMessage) -> None:
         if msg.type == "end-turn":
             # Optional ``model`` rides along on end-turn — we stamp it on the
-            # OpencodeProcessor so the next finalized transcription forwards
+            # ProviderSessionProcessor so the next finalized transcription forwards
             # it to opencode. No server-side stickiness; the client owns the
             # selection and re-sends it whenever it changes.
-            opencode.next_turn_model = _parse_model(msg.data)
+            agent.next_turn_model = _parse_model(msg.data)
             # Tool narration toggle also rides along — sticky on the
             # processor (unlike model). Client re-sends it each turn so a
             # toggle flip propagates without its own message type.
             narrate = _parse_narrate_tools(msg.data)
             if narrate is not None:
-                opencode.narrate_tools = narrate
+                agent.narrate_tools = narrate
             logger.info(
                 "voice: end-turn received | session={} model={} narrate_tools={}",
-                opencode_session.id,
-                opencode.next_turn_model,
-                opencode.narrate_tools,
+                session.id,
+                agent.next_turn_model,
+                agent.narrate_tools,
             )
             accumulator.arm_flush()
             await processor.push_frame(VADUserStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
@@ -202,11 +202,11 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
             # User tapped the Interrupt button. Push InterruptionTaskFrame
             # upstream — the pipeline task converts it to a downstream
             # InterruptionFrame, which clears TTS audio + STT audio buffers
-            # along the way. OpencodeProcessor handles the same frame to
+            # along the way. ProviderSessionProcessor handles the same frame to
             # abort the in-flight opencode turn (see pipecat_adapter.py).
             # Send and Interrupt stay separate: interrupt = "shut up", and
             # the next turn only goes out when the user taps Send again.
-            logger.info("voice: interrupt received | session={}", opencode_session.id)
+            logger.info("voice: interrupt received | session={}", session.id)
             await processor.push_frame(InterruptionTaskFrame(), FrameDirection.UPSTREAM)
         elif msg.type == "stop-speaking":
             # Mute TTS without killing opencode. Used by Start (mic on) when
@@ -214,8 +214,8 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
             # and by the speaker toggle when flipped off — both want
             # "shut up now" without aborting the in-flight turn the way
             # `interrupt` does.
-            logger.info("voice: stop-speaking received | session={}", opencode_session.id)
-            await opencode.stop_speaking()
+            logger.info("voice: stop-speaking received | session={}", session.id)
+            await agent.stop_speaking()
         elif msg.type == "set-tts":
             # Speaker toggle. Defaults to off on every fresh page load —
             # the client sends this whenever the user flips the switch
@@ -224,10 +224,10 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
             # we just don't burn TTS synthesis or speak the assistant.
             enabled = _parse_tts_enabled(msg.data)
             if enabled is not None:
-                opencode.tts_enabled = enabled
+                agent.tts_enabled = enabled
                 logger.info(
                     "voice: set-tts | session={} enabled={}",
-                    opencode_session.id,
+                    session.id,
                     enabled,
                 )
 
@@ -245,7 +245,7 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
             transport.input(),
             stt,
             accumulator,
-            opencode,
+            agent,
             tts,
             rtvi,
             transport.output(),
@@ -266,7 +266,7 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     try:
         await runner.run(task)
     except Exception:
-        logger.exception("voice: pipeline run failed | session={}", opencode_session.id)
+        logger.exception("voice: pipeline run failed | session={}", session.id)
 
 
 def _parse_narrate_tools(data: object) -> bool | None:
