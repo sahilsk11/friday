@@ -192,6 +192,14 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
             # the next turn only goes out when the user taps Send again.
             logger.info("voice: interrupt received | session={}", opencode_session.id)
             await processor.push_frame(InterruptionTaskFrame(), FrameDirection.UPSTREAM)
+        elif msg.type == "stop-speaking":
+            # Mute TTS without killing opencode. Used by Start (mic on) when
+            # the agent is past `thinking` but TTS is still draining audio,
+            # and by the speaker toggle when flipped off — both want
+            # "shut up now" without aborting the in-flight turn the way
+            # `interrupt` does.
+            logger.info("voice: stop-speaking received | session={}", opencode_session.id)
+            await opencode.stop_speaking()
         elif msg.type == "set-tts":
             # Speaker toggle. Defaults to off on every fresh page load —
             # the client sends this whenever the user flips the switch

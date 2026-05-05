@@ -193,6 +193,28 @@ class OpencodeProcessor(FrameProcessor):
         except Exception:
             logger.exception("opencode_processor: cancel failed")
 
+    async def stop_speaking(self) -> None:
+        """Silence TTS without aborting opencode.
+
+        Pushes ``InterruptionFrame`` downstream from this processor so TTS
+        cancels in-flight synthesis and ``transport.output()`` drops queued
+        audio. Opencode keeps streaming text to the activity feed; subsequent
+        deltas arriving while ``tts_enabled`` is still True will resume
+        speaking. Caller pairs this with ``set-tts off`` for a permanent mute.
+
+        Used by:
+          - Speaker-off toggle (alongside ``set-tts``) — drains audio that
+            was already synthesized before the flag flipped.
+          - Start (mic on) when opencode is no longer thinking but TTS is
+            still draining its tail. ``InterruptionFrame`` upstream would
+            also fire ``cancel()`` on opencode, which we don't want here.
+        """
+        logger.info("opencode_processor: stop-speaking")
+        if self._ack_task is not None and not self._ack_task.done():
+            self._ack_task.cancel()
+        self._acked = True
+        await self.push_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+
     async def _on_state(self, state: AgentState) -> None:
         # Surface the agent state to the voice-room UI on every change.
         # The pill in the activity feed reads this. The ack itself fires from
