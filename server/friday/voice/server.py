@@ -158,10 +158,17 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
             # it to opencode. No server-side stickiness; the client owns the
             # selection and re-sends it whenever it changes.
             opencode.next_turn_model = _parse_model(msg.data)
+            # Tool narration toggle also rides along — sticky on the
+            # processor (unlike model). Client re-sends it each turn so a
+            # toggle flip propagates without its own message type.
+            narrate = _parse_narrate_tools(msg.data)
+            if narrate is not None:
+                opencode.narrate_tools = narrate
             logger.info(
-                "voice: end-turn received | session={} model={}",
+                "voice: end-turn received | session={} model={} narrate_tools={}",
                 opencode_session.id,
                 opencode.next_turn_model,
+                opencode.narrate_tools,
             )
             await processor.push_frame(VADUserStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
         elif msg.type == "interrupt":
@@ -203,6 +210,16 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
         await runner.run(task)
     except Exception:
         logger.exception("voice: pipeline run failed | session={}", opencode_session.id)
+
+
+def _parse_narrate_tools(data: object) -> bool | None:
+    """Extract the ``narrateTools`` flag from an end-turn payload, if any."""
+    if not isinstance(data, dict):
+        return None
+    val = data.get("narrateTools")
+    if isinstance(val, bool):
+        return val
+    return None
 
 
 def _parse_model(data: object) -> ModelChoice | None:

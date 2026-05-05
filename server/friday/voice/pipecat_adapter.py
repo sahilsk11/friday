@@ -90,6 +90,11 @@ class OpencodeProcessor(FrameProcessor):
         # client message. Consumed (and cleared) by the next finalized
         # transcription. ``None`` means "let opencode use its default."
         self.next_turn_model: ModelChoice | None = None
+        # Speak each tool start out loud as it happens. Off by default —
+        # tool narration is chatty and most users just want it in the
+        # activity feed. The WS handler flips this from the client toggle
+        # carried on ``end-turn``. Sticky across turns until changed.
+        self.narrate_tools: bool = False
 
         session.on_text_delta(self._on_delta)
         session.on_text_final(self._on_final)
@@ -229,9 +234,14 @@ class OpencodeProcessor(FrameProcessor):
         )
 
     async def _narrate_tool(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+        rtvi_data: dict[str, object] = {"type": RTVI_TOOL_STARTED, "name": tool_name}
+        if not self.narrate_tools:
+            # UI still gets the tool start (activity feed falls back to the
+            # raw name); skip the OpenRouter label call and the TTS frame.
+            await self.push_frame(RTVIServerMessageFrame(data=rtvi_data))
+            return
         label = await describe_tool(tool_name, tool_input)
         logger.debug("opencode_processor: narrate_tool | tool={} label={!r}", tool_name, label)
-        rtvi_data: dict[str, object] = {"type": RTVI_TOOL_STARTED, "name": tool_name}
         if label:
             rtvi_data["label"] = label
         await self.push_frame(RTVIServerMessageFrame(data=rtvi_data))
