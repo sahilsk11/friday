@@ -1,4 +1,4 @@
-import { RTVIEvent, type TranscriptData } from '@pipecat-ai/client-js';
+import { RTVIEvent } from '@pipecat-ai/client-js';
 import { useRTVIClientEvent } from '@pipecat-ai/client-react';
 import { useCallback, useMemo, useState } from 'react';
 
@@ -9,13 +9,23 @@ import type { TranscriptEntry } from '@/types/api';
 // Sources, all flowing on the voice-room WebSocket as RTVI events
 // (see TRANSPORT.md):
 //
-//   - userTranscript (built-in pipecat event, final===true) — what we
-//     heard you say.
-//   - serverMessage (custom emissions from OpencodeProcessor):
-//       { type: "tool-started",        name }
-//       { type: "assistant-text-delta", text }
-//       { type: "assistant-text-final", text }
-//       { type: "agent-state",         state }
+//   - serverMessage (custom emissions from server):
+//       From TurnAccumulator (turn_accumulator.py):
+//         { type: "user-transcript-running", text }   # ignored here, see RunningUserTranscript
+//         { type: "user-transcript-final",   text }   # locks a user entry
+//       From OpencodeProcessor (pipecat_adapter.py):
+//         { type: "tool-started",        name }
+//         { type: "assistant-text-delta", text }
+//         { type: "assistant-text-final", text }
+//         { type: "agent-state",         state }
+//
+// Why a custom user-transcript-final instead of pipecat's built-in
+// userTranscript event: ElevenLabs realtime STT in VAD mode commits every
+// ~500ms of silence, and pipecat fans each commit out as a "final=true"
+// userTranscript message. That would fragment one spoken thought across
+// multiple feed entries. The TurnAccumulator on the server consolidates
+// commits into a single per-turn final message; the observer's built-in
+// emit is disabled in server.py.
 //
 // We append deltas onto the trailing assistant entry as they stream so
 // the UI feels alive while opencode generates. ``assistant-text-final``
@@ -34,7 +44,8 @@ type ServerMessageData =
   | { type: 'tool-started'; name: string; label?: string }
   | { type: 'assistant-text-delta'; text: string }
   | { type: 'assistant-text-final'; text: string }
-  | { type: 'agent-state'; state: string };
+  | { type: 'agent-state'; state: string }
+  | { type: 'user-transcript-final'; text: string };
 
 function isServerMessage(value: unknown): value is ServerMessageData {
   if (typeof value !== 'object' || value === null) return false;
@@ -43,7 +54,8 @@ function isServerMessage(value: unknown): value is ServerMessageData {
     t === 'tool-started' ||
     t === 'assistant-text-delta' ||
     t === 'assistant-text-final' ||
-    t === 'agent-state'
+    t === 'agent-state' ||
+    t === 'user-transcript-final'
   );
 }
 
@@ -77,11 +89,6 @@ export function ActivityFeed({
   );
   const [entries, setEntries] = useState<FeedEntry[]>(initial);
 
-  const onUserTranscript = useCallback((data: TranscriptData) => {
-    if (!data.final) return;
-    setEntries((prev) => [...prev, { kind: 'user', id: nextId(), text: data.text }]);
-  }, []);
-
   const onServerMessage = useCallback((raw: unknown) => {
     // Pipecat wraps our pushed dict in `{ data: <dict> }` when it serializes
     // an RTVIServerMessageFrame. The handler argument is the *outer* object;
@@ -91,6 +98,11 @@ export function ActivityFeed({
 
     setEntries((prev) => {
       switch (inner.type) {
+        case 'user-transcript-final': {
+          const text = inner.text.trim();
+          if (!text) return prev;
+          return [...prev, { kind: 'user', id: nextId(), text }];
+        }
         case 'tool-started':
           return [...prev, { kind: 'tool', id: nextId(), name: inner.name, label: inner.label }];
         case 'assistant-text-delta': {
@@ -122,7 +134,6 @@ export function ActivityFeed({
     });
   }, []);
 
-  useRTVIClientEvent(RTVIEvent.UserTranscript, onUserTranscript);
   useRTVIClientEvent(RTVIEvent.ServerMessage, onServerMessage);
 
   if (entries.length === 0) {
