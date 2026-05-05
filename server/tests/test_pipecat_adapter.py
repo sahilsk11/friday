@@ -591,6 +591,52 @@ async def test_interruption_cancels_pending_ack(
     assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
 
 
+async def test_stop_speaking_pushes_interruption_without_aborting_opencode(
+    httpx_mock: HTTPXMock, session: OpencodeSession
+) -> None:
+    """Speaker-off / mid-tail Start: silence TTS, but don't /abort the turn.
+
+    stop_speaking is the lighter cousin of interrupt — it clears the audio
+    queue downstream (InterruptionFrame to TTS + transport output) but does
+    not call session.cancel(), so opencode keeps writing to the activity
+    feed.
+    """
+    proc, pushed = _make_processor(session)
+
+    await proc.stop_speaking()
+
+    # InterruptionFrame went downstream so TTS clears its buffer.
+    assert any(isinstance(f, InterruptionFrame) for f in pushed)
+    # No /abort was issued — opencode keeps running.
+    aborts = [r for r in httpx_mock.get_requests() if r.url.path.endswith("/abort")]
+    assert aborts == []
+
+
+async def test_stop_speaking_cancels_pending_ack(
+    httpx_mock: HTTPXMock, session: OpencodeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A still-in-flight ack must not speak after stop_speaking either."""
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
+        status_code=204,
+    )
+
+    async def slow_ack(transcript: str) -> str:
+        await asyncio.sleep(0.2)
+        return f"stale: {transcript}"
+
+    monkeypatch.setattr("friday.voice.pipecat_adapter.generate_ack", slow_ack)
+    proc, pushed = _make_processor(session)
+
+    await proc.process_frame(_transcription("hi"), FrameDirection.DOWNSTREAM)
+    await asyncio.sleep(0.01)
+    await proc.stop_speaking()
+    await asyncio.sleep(0.3)
+
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
+
+
 async def test_two_back_to_back_turns_both_forwarded(
     httpx_mock: HTTPXMock, session: OpencodeSession
 ) -> None:
