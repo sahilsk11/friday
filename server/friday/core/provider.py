@@ -10,12 +10,11 @@ and observer callbacks for text deltas, text final, state, tool start.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 from abc import abstractmethod
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, TypeVar, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from friday.core.state import AgentState
 
@@ -119,14 +118,12 @@ class ProviderSession(Protocol):
         ...
 
 
-def _subscribe[H](handlers: list[H], handler: H) -> Unsubscribe:
+def subscribe[H](handlers: list[H], handler: H) -> Unsubscribe:
     """Append a handler and return a function that removes it."""
     handlers.append(handler)
 
     def unsubscribe() -> None:
-        try:
+        with contextlib.suppress(ValueError):
             handlers.remove(handler)
-        except ValueError:
-            pass
 
     return unsubscribe

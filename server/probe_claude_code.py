@@ -65,6 +65,7 @@ async def main():
         print("  Task cancelled")
 
     print(f"  Final state: {session.current_state}")
+    print(f"  session.id (post-turn): {session.id!r}")
     print(f"  Text deltas received: {len(text_deltas)}")
     if text_deltas:
         print(f"  First delta: {text_deltas[0][:100]}...")
