@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from friday.core.opencode_session import ModelChoice, OpencodeClient, OpencodeSession
+from friday.core.opencode_session import OpencodeClient
+from friday.core.provider import ModelChoice, ProviderSession
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,11 +91,11 @@ class SessionManager:
         title: str | None = None,
         *,
         directory: str | None = None,
-    ) -> OpencodeSession:
+    ) -> ProviderSession:
         """Create a new session and return its live wrapper."""
         return await self._client.new_session(title, directory=directory)
 
-    def attach(self, session_id: str) -> OpencodeSession:
+    def attach(self, session_id: str) -> ProviderSession:
         """Return a live wrapper for an existing session (cached)."""
         return self._client.session(session_id)
 

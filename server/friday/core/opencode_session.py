@@ -18,7 +18,6 @@ import asyncio
 import contextlib
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any, Self
 
 import httpx
@@ -34,19 +33,31 @@ from friday.core.events import (
     SessionStatus,
     parse_event,
 )
+from friday.core.provider import (
+    ModelChoice,
+    StateHandler,
+    TextDeltaHandler,
+    TextFinalHandler,
+    ToolStartHandler,
+    Unsubscribe,
+    subscribe,
+)
 from friday.core.state import AgentState
 
-
-@dataclass(frozen=True, slots=True)
-class ModelChoice:
-    """One opencode model selection. Wire shape matches the ``model`` field
-    accepted by ``POST /session/{id}/prompt_async``."""
-
-    provider_id: str
-    model_id: str
-
-    def to_wire(self) -> dict[str, str]:
-        return {"providerID": self.provider_id, "modelID": self.model_id}
+# Re-exported for callers that import from opencode_session — kept as a
+# compatibility hop so churn is local. Canonical home is friday.core.provider.
+__all__ = [
+    "SYSTEM_PROMPT_VOICE",
+    "EventHandler",
+    "ModelChoice",
+    "OpencodeClient",
+    "OpencodeSession",
+    "StateHandler",
+    "TextDeltaHandler",
+    "TextFinalHandler",
+    "ToolStartHandler",
+    "Unsubscribe",
+]
 
 
 # Sent on every prompt_async via the per-turn ``system`` field (the only
@@ -75,11 +86,6 @@ SYSTEM_PROMPT_VOICE = (
 )
 
 EventHandler = Callable[[OpencodeEvent], Awaitable[None]]
-TextDeltaHandler = Callable[[str], Awaitable[None]]
-TextFinalHandler = Callable[[str], Awaitable[None]]
-StateHandler = Callable[[AgentState], Awaitable[None]]
-ToolStartHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
-Unsubscribe = Callable[[], None]
 
 
 class OpencodeClient:
@@ -97,6 +103,11 @@ class OpencodeClient:
         self._reconnect_max_delay = reconnect_max_delay
         self._connected = asyncio.Event()
         self._closed = False
+
+    @property
+    def provider_id(self) -> str:
+        """Provider identifier — opencode."""
+        return "opencode"
 
     @property
     def http(self) -> httpx.AsyncClient:
@@ -127,6 +138,11 @@ class OpencodeClient:
         await self._http.aclose()
 
     # ── HTTP API ────────────────────────────────────────────────────────────
+
+    async def create_session(self, title: str | None = None) -> OpencodeSession:
+        """Provider-protocol method. Use :meth:`new_session` for the
+        opencode-specific ``directory`` knob."""
+        return await self.new_session(title)
 
     async def new_session(
         self,
@@ -242,17 +258,17 @@ class OpencodeSession:
     # session and push frames into pipelines that no longer exist.
 
     def on_text_delta(self, handler: TextDeltaHandler) -> Unsubscribe:
-        return _subscribe(self._delta_handlers, handler)
+        return subscribe(self._delta_handlers, handler)
 
     def on_text_final(self, handler: TextFinalHandler) -> Unsubscribe:
-        return _subscribe(self._final_handlers, handler)
+        return subscribe(self._final_handlers, handler)
 
     def on_state(self, handler: StateHandler) -> Unsubscribe:
-        return _subscribe(self._state_handlers, handler)
+        return subscribe(self._state_handlers, handler)
 
     def on_tool_start(self, handler: ToolStartHandler) -> Unsubscribe:
         """Fires once per tool invocation, with the tool name."""
-        return _subscribe(self._tool_start_handlers, handler)
+        return subscribe(self._tool_start_handlers, handler)
 
     @property
     def current_state(self) -> AgentState:
@@ -352,21 +368,3 @@ class OpencodeSession:
 
 def _state_from_status(status: str) -> AgentState:
     return AgentState.THINKING if status == "busy" else AgentState.IDLE
-
-
-def _subscribe[H](handlers: list[H], handler: H) -> Unsubscribe:
-    """Append a handler and return a function that removes it.
-
-    Idempotent: calling the returned function twice is a no-op. Lets a
-    pipeline tear down its observers without leaking dead callbacks onto
-    the cached :class:`OpencodeSession`.
-    """
-    handlers.append(handler)
-
-    def unsubscribe() -> None:
-        try:
-            handlers.remove(handler)
-        except ValueError:
-            pass
-
-    return unsubscribe

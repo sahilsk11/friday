@@ -78,7 +78,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 
-from friday.core.opencode_session import ModelChoice
+from friday.core.provider import ModelChoice
 from friday.core.session_manager import SessionManager
 from friday.voice.elevenlabs_force_commit import ElevenLabsRealtimeSTTServiceForceCommit
 from friday.voice.pipecat_adapter import OpencodeProcessor

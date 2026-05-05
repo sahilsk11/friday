@@ -39,12 +39,8 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from friday.core.narration_policy import StreamingFilter
-from friday.core.opencode_session import (
-    SYSTEM_PROMPT_VOICE,
-    ModelChoice,
-    OpencodeSession,
-    Unsubscribe,
-)
+from friday.core.opencode_session import SYSTEM_PROMPT_VOICE
+from friday.core.provider import ModelChoice, ProviderSession, Unsubscribe
 from friday.core.state import AgentState
 from friday.core.tool_narrator import describe_tool
 
@@ -61,7 +57,7 @@ class OpencodeProcessor(FrameProcessor):
     """Pipecat FrameProcessor wrapping a single OpencodeSession."""
 
     def __init__(
-        self, session: OpencodeSession, *, system_prompt: str = SYSTEM_PROMPT_VOICE
+        self, session: ProviderSession, *, system_prompt: str = SYSTEM_PROMPT_VOICE
     ) -> None:
         super().__init__()
         self._session = session

@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from friday.core.opencode_session import ModelChoice
+from friday.core.provider import ModelChoice
 from friday.core.session_manager import Message, SessionInfo, SessionManager
 from friday.core.state import AgentState
 
