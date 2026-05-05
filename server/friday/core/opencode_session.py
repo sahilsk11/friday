@@ -65,11 +65,13 @@ SYSTEM_PROMPT_VOICE = (
     "user wants only relevant information to the prompt spoken — never say "
     'stuff like "got it, here\'s your voice friendly response" — just jump '
     "into the point.\n\n"
-    "When you use tools — reading files, searching, running commands — "
-    'narrate them aloud. One short sentence before ("checking the voice room '
-    'component"), one after ("found the prompt there"). The user can\'t see '
-    "your tool calls, so your voice is their only signal that work is "
-    "happening."
+    "Before you start work that takes a moment — exploring the codebase, "
+    "running a build, gathering info — say one short sentence about what "
+    "you're about to do. When you're done, say one short sentence about what "
+    "you found. Don't narrate each individual tool call: if you read fifteen "
+    "files to answer one question, that's one sentence before and one "
+    "sentence after, not fifteen. The user can't see your tool calls, so "
+    "your voice is their only signal that work is happening."
 )
 
 EventHandler = Callable[[OpencodeEvent], Awaitable[None]]
