@@ -49,11 +49,27 @@ class ModelChoice:
         return {"providerID": self.provider_id, "modelID": self.model_id}
 
 
+# Sent on every prompt_async via the per-turn ``system`` field (the only
+# mechanism opencode actually honors — its create-time systemPrompt is silently
+# dropped, see scripts/probe_systemprompt_variants.py).
 SYSTEM_PROMPT_VOICE = (
-    "You are being used via a voice interface with TTS (text-to-speech). "
-    "Keep responses concise and natural for speech. "
-    "Avoid formatting like markdown, code blocks, or long lists when possible. "
-    "Use short paragraphs and speak in a conversational tone."
+    "You are speaking out loud through TTS — the user hears you as audio, not "
+    "text on a screen.\n"
+    "Use plain prose. No markdown of any kind: no asterisks, backticks, "
+    "bullets, numbered lists, headers, or code fences.\n"
+    'Say file names, routes, and commands the way a person speaks aloud, not '
+    'the way they\'re written. "VoiceRoom.tsx" → "the voice room component." '
+    '"/api/sessions" → "the sessions endpoint." "npm run dev" → "the dev '
+    'server." Drop slashes, file extensions, and underscores.\n\n'
+    "Keep answers concise and biased towards the next action required. The "
+    "user wants only relevant information to the prompt spoken — never say "
+    'stuff like "got it, here\'s your voice friendly response" — just jump '
+    "into the point.\n\n"
+    "When you use tools — reading files, searching, running commands — "
+    'narrate them aloud. One short sentence before ("checking the voice room '
+    'component"), one after ("found the prompt there"). The user can\'t see '
+    "your tool calls, so your voice is their only signal that work is "
+    "happening."
 )
 
 EventHandler = Callable[[OpencodeEvent], Awaitable[None]]
@@ -112,13 +128,13 @@ class OpencodeClient:
     async def new_session(
         self,
         title: str | None = None,
-        system_prompt: str | None = None,
         *,
         directory: str | None = None,
     ) -> OpencodeSession:
+        # POST /session body only accepts {parentID, title} per the opencode
+        # server docs. There's no create-time system prompt — that goes per-turn
+        # via send_turn(system=...).
         body: dict[str, Any] = {"title": title} if title else {}
-        if system_prompt:
-            body["systemPrompt"] = system_prompt
         # Opencode takes the working directory as a query param (see the
         # SDK's SessionCreateData.query.directory). Without it, opencode
         # defaults to whichever cwd the `opencode serve` process was
@@ -229,10 +245,18 @@ class OpencodeSession:
 
     # ── Outbound ────────────────────────────────────────────────────────────
 
-    async def send_turn(self, text: str, model: ModelChoice | None = None) -> None:
+    async def send_turn(
+        self,
+        text: str,
+        model: ModelChoice | None = None,
+        *,
+        system: str | None = None,
+    ) -> None:
         body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
         if model is not None:
             body["model"] = model.to_wire()
+        if system is not None:
+            body["system"] = system
         resp = await self._http.post(f"/session/{self.id}/prompt_async", json=body)
         resp.raise_for_status()
 

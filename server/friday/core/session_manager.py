@@ -88,12 +88,11 @@ class SessionManager:
     async def create(
         self,
         title: str | None = None,
-        system_prompt: str | None = None,
         *,
         directory: str | None = None,
     ) -> OpencodeSession:
         """Create a new session and return its live wrapper."""
-        return await self._client.new_session(title, system_prompt, directory=directory)
+        return await self._client.new_session(title, directory=directory)
 
     def attach(self, session_id: str) -> OpencodeSession:
         """Return a live wrapper for an existing session (cached)."""

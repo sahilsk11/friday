@@ -85,13 +85,16 @@ async def session() -> AsyncIterator[OpencodeSession]:
     await client.aclose()
 
 
+_TEST_SYSTEM_PROMPT = "TEST_SYS_PROMPT"
+
+
 def _make_processor(session: OpencodeSession) -> tuple[OpencodeProcessor, list[Frame]]:
     """Build the processor and replace ``push_frame`` with a capture list.
 
     Returns the processor and a list that grows as frames are pushed.
     """
     pushed: list[Frame] = []
-    proc = OpencodeProcessor(session)
+    proc = OpencodeProcessor(session, system_prompt=_TEST_SYSTEM_PROMPT)
 
     async def capture(frame: Frame, _direction: FrameDirection = FrameDirection.DOWNSTREAM) -> None:
         pushed.append(frame)
@@ -155,10 +158,16 @@ async def test_next_turn_model_is_forwarded_then_cleared(
     assert json.loads(sent[0].content) == {
         "parts": [{"type": "text", "text": "first"}],
         "model": {"providerID": "opencode", "modelID": "gpt-5-nano"},
+        "system": _TEST_SYSTEM_PROMPT,
     }
     # Second turn has no model — the field was consumed on the first turn,
-    # opencode's per-session stickiness carries the choice forward.
-    assert json.loads(sent[1].content) == {"parts": [{"type": "text", "text": "second"}]}
+    # opencode's per-session stickiness carries the choice forward. The system
+    # prompt rides on every turn though (per-turn is the only injection path
+    # opencode honors).
+    assert json.loads(sent[1].content) == {
+        "parts": [{"type": "text", "text": "second"}],
+        "system": _TEST_SYSTEM_PROMPT,
+    }
     assert proc.next_turn_model is None
 
 
