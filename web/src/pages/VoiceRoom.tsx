@@ -325,7 +325,14 @@ function RecordButton(): React.ReactElement {
       client.sendClientMessage('end-turn', payload);
       enableMic(false);
     } else {
+      // agentBusy reflects opencode's thinking state — it goes idle the
+      // moment opencode finishes, while TTS may still be draining its
+      // audio queue. interrupt aborts opencode + clears TTS; stop-speaking
+      // only clears TTS. Pick the lighter one when there's nothing left
+      // to abort, so a barge-in on the TTS tail doesn't kill a turn the
+      // user is still happy to receive.
       if (agentBusy) client.sendClientMessage('interrupt');
+      else client.sendClientMessage('stop-speaking');
       enableMic(true);
     }
   }, [client, isMicEnabled, enableMic, model, narrateTools, agentBusy]);
@@ -439,6 +446,11 @@ function SpeakerToggle(): React.ReactElement {
     const next = !enabled;
     setEnabled(next);
     client.sendClientMessage('set-tts', { enabled: next });
+    // Toggling off only flips the gate that drops *new* TTS frames —
+    // audio already synthesized and queued in transport.output keeps
+    // playing. Pair the flag flip with stop-speaking so the user gets
+    // immediate silence.
+    if (!next) client.sendClientMessage('stop-speaking');
   }, [client, enabled]);
   return (
     <button
