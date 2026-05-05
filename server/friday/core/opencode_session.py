@@ -79,6 +79,7 @@ TextDeltaHandler = Callable[[str], Awaitable[None]]
 TextFinalHandler = Callable[[str], Awaitable[None]]
 StateHandler = Callable[[AgentState], Awaitable[None]]
 ToolStartHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
+Unsubscribe = Callable[[], None]
 
 
 class OpencodeClient:
@@ -229,21 +230,34 @@ class OpencodeSession:
         # We register part IDs here when we first see them as type="reasoning"
         # so _handle_delta can skip them entirely.
         self._reasoning_parts: set[str] = set()
+        # Latest agent state. Updated on every fan-out so reconnecting
+        # consumers (a fresh OpencodeProcessor, a REST GET) can read the
+        # current value without waiting for the next opencode transition.
+        self._current_state: AgentState = AgentState.IDLE
 
     # ── Observer registration ───────────────────────────────────────────────
+    #
+    # Each subscriber gets back an ``Unsubscribe`` function. Pipelines must
+    # call it on teardown — otherwise dead handlers accumulate on the cached
+    # session and push frames into pipelines that no longer exist.
 
-    def on_text_delta(self, handler: TextDeltaHandler) -> None:
-        self._delta_handlers.append(handler)
+    def on_text_delta(self, handler: TextDeltaHandler) -> Unsubscribe:
+        return _subscribe(self._delta_handlers, handler)
 
-    def on_text_final(self, handler: TextFinalHandler) -> None:
-        self._final_handlers.append(handler)
+    def on_text_final(self, handler: TextFinalHandler) -> Unsubscribe:
+        return _subscribe(self._final_handlers, handler)
 
-    def on_state(self, handler: StateHandler) -> None:
-        self._state_handlers.append(handler)
+    def on_state(self, handler: StateHandler) -> Unsubscribe:
+        return _subscribe(self._state_handlers, handler)
 
-    def on_tool_start(self, handler: ToolStartHandler) -> None:
+    def on_tool_start(self, handler: ToolStartHandler) -> Unsubscribe:
         """Fires once per tool invocation, with the tool name."""
-        self._tool_start_handlers.append(handler)
+        return _subscribe(self._tool_start_handlers, handler)
+
+    @property
+    def current_state(self) -> AgentState:
+        """Latest agent state seen on the SSE stream. Defaults to IDLE."""
+        return self._current_state
 
     # ── Outbound ────────────────────────────────────────────────────────────
 
@@ -291,7 +305,7 @@ class OpencodeSession:
             return
         key = f"{event.session_id}:{event.message_id}"
         self._accumulated[key] = self._accumulated.get(key, "") + event.delta
-        for handler in self._delta_handlers:
+        for handler in tuple(self._delta_handlers):
             await handler(event.delta)
 
     async def _handle_part_updated(self, event: MessagePartUpdated) -> None:
@@ -308,7 +322,7 @@ class OpencodeSession:
         if event.part_id in self._announced_tools:
             return
         self._announced_tools.add(event.part_id)
-        for handler in self._tool_start_handlers:
+        for handler in tuple(self._tool_start_handlers):
             await handler(event.tool_name, event.tool_input)
 
     async def _handle_message_updated(self, event: MessageUpdated) -> None:
@@ -320,7 +334,7 @@ class OpencodeSession:
         self._completed.add(key)
         text = self._accumulated.pop(key, "")
         if text:
-            for handler in self._final_handlers:
+            for handler in tuple(self._final_handlers):
                 await handler(text)
         await self._fan_out_state(AgentState.IDLE)
 
@@ -329,9 +343,30 @@ class OpencodeSession:
         # succession (``session.status:idle`` + ``session.idle`` + a stray
         # busy→idle flip). Consumers must be idempotent on repeat states —
         # don't restart TTS or replay UI transitions on a duplicate.
-        for handler in self._state_handlers:
+        self._current_state = state
+        # Snapshot to a tuple so a handler that unsubscribes itself mid-loop
+        # doesn't mutate the list we're iterating.
+        for handler in tuple(self._state_handlers):
             await handler(state)
 
 
 def _state_from_status(status: str) -> AgentState:
     return AgentState.THINKING if status == "busy" else AgentState.IDLE
+
+
+def _subscribe[H](handlers: list[H], handler: H) -> Unsubscribe:
+    """Append a handler and return a function that removes it.
+
+    Idempotent: calling the returned function twice is a no-op. Lets a
+    pipeline tear down its observers without leaking dead callbacks onto
+    the cached :class:`OpencodeSession`.
+    """
+    handlers.append(handler)
+
+    def unsubscribe() -> None:
+        try:
+            handlers.remove(handler)
+        except ValueError:
+            pass
+
+    return unsubscribe

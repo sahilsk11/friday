@@ -35,8 +35,15 @@ function isAgentStateMessage(value: unknown): value is ServerMessageData {
   );
 }
 
-export function ThinkingIndicator(): React.ReactElement | null {
-  const [thinking, setThinking] = useState(false);
+export function ThinkingIndicator({
+  initialThinking = false,
+}: {
+  initialThinking?: boolean;
+} = {}): React.ReactElement | null {
+  // Seed from REST so a refresh mid-turn shows "thinking" immediately
+  // — the WS will reassert the same state on connect via OpencodeProcessor's
+  // StartFrame emission, and any subsequent transition flips this naturally.
+  const [thinking, setThinking] = useState(initialThinking);
 
   const onServerMessage = useCallback((raw: unknown) => {
     // Pipecat wraps our pushed dict in `{ data: <dict> }` when it
