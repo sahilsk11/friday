@@ -11,10 +11,7 @@ import contextlib
 from dataclasses import dataclass, field
 from typing import Any
 
-import json
-from collections.abc import Sequence
 from datetime import UTC, datetime
-from pathlib import Path
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -26,7 +23,6 @@ from claude_agent_sdk import (
     get_session_info,
     get_session_messages,
     list_sessions,
-    project_key_for_directory,
     query,
 )
 from loguru import logger
@@ -268,13 +264,12 @@ class ClaudeCodeProvider:
         return _session_info_from_sdk(info)
 
     async def get_transcript(self, session_id: str) -> list[Message]:
-        # Two reads: SDK gives us message structure (parsed, sidechain
-        # filtered); the raw JSONL gives us per-message timestamps the SDK
-        # strips. Join on uuid.
-        sdk_msgs, ts_by_uuid = await asyncio.to_thread(
-            _read_transcript_with_timestamps, session_id
-        )
-        return [_message_from_sdk(m, ts_by_uuid) for m in sdk_msgs]
+        # SDK returns parsed, sidechain-filtered messages but strips
+        # per-message timestamps. We don't re-parse the raw JSONL to recover
+        # them — completed_at stays None, which the UI already handles.
+        # Timestamps aren't worth a disk read on every transcript fetch.
+        sdk_msgs = await asyncio.to_thread(get_session_messages, session_id)
+        return [_message_from_sdk(m) for m in sdk_msgs]
 
     async def list_models(self) -> ModelCatalog:
         return ModelCatalog(models=list(_CLAUDE_MODELS), default=_CLAUDE_DEFAULT_MODEL)
@@ -301,42 +296,7 @@ def _session_info_from_sdk(row: object) -> SessionInfo:
     )
 
 
-def _read_transcript_with_timestamps(
-    session_id: str,
-) -> tuple[Sequence[object], dict[str, datetime]]:
-    """Synchronous helper that pulls SDK messages and the matching JSONL
-    timestamps. Returned untyped (the SDK doesn't export ``SessionMessage``
-    as a public stable type) — the caller projects them into ``Message``."""
-    info = get_session_info(session_id)
-    if info is None:
-        raise LookupError(f"claude-code session not found: {session_id}")
-    sdk_msgs = get_session_messages(session_id)
-    ts_by_uuid: dict[str, datetime] = {}
-    cwd = getattr(info, "cwd", None)
-    if cwd:
-        jsonl_path = Path.home() / ".claude" / "projects" / project_key_for_directory(cwd) / (
-            f"{session_id}.jsonl"
-        )
-        if jsonl_path.is_file():
-            with jsonl_path.open() as f:
-                for line in f:
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    uid = entry.get("uuid")
-                    ts = entry.get("timestamp")
-                    if uid and ts:
-                        try:
-                            ts_by_uuid[uid] = datetime.fromisoformat(
-                                ts.replace("Z", "+00:00")
-                            )
-                        except ValueError:
-                            continue
-    return sdk_msgs, ts_by_uuid
-
-
-def _message_from_sdk(msg: object, ts_by_uuid: dict[str, datetime]) -> Message:
+def _message_from_sdk(msg: object) -> Message:
     """SessionMessage → our domain Message.
 
     The SDK stores the raw Anthropic API message at ``msg.message`` (a dict
@@ -367,7 +327,7 @@ def _message_from_sdk(msg: object, ts_by_uuid: dict[str, datetime]) -> Message:
     return Message(
         role=role,
         text="".join(text_chunks),
-        completed_at=ts_by_uuid.get(getattr(msg, "uuid", "")),
+        completed_at=None,
         parts=parts,
         model=model,
     )
