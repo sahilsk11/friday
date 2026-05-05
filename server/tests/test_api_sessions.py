@@ -1,7 +1,7 @@
 """HTTP + SSE tests for the sessions router.
 
-The router talks to opencode via ``SessionManager`` → ``OpencodeClient.http``.
-Tests inject a manager wired to a non-started OpencodeClient (no SSE loop)
+The router talks to opencode via ``SessionManager`` → ``OpencodeProvider.http``.
+Tests inject a manager wired to a non-started OpencodeProvider (no SSE loop)
 and let pytest-httpx canned responses stand in for opencode HTTP.
 
 For SSE we drive synthetic events directly into the cached
@@ -26,7 +26,7 @@ from friday.core.events import (
     MessageUpdated,
     SessionStatus,
 )
-from friday.core.opencode_session import OpencodeClient
+from friday.core.opencode_provider import OpencodeProvider, OpencodeSession
 from friday.core.session_manager import SessionManager
 from friday.main import create_app
 
@@ -35,8 +35,8 @@ OPENCODE_URL = "http://opencode.test"
 
 @pytest.fixture
 async def manager() -> AsyncIterator[SessionManager]:
-    """SessionManager wrapping a non-started OpencodeClient (HTTP-only)."""
-    client = OpencodeClient(OPENCODE_URL)
+    """SessionManager wrapping a non-started OpencodeProvider (HTTP-only)."""
+    client = OpencodeProvider(OPENCODE_URL)
     yield SessionManager(client)
     await client.aclose()
 
@@ -241,6 +241,10 @@ async def test_sse_streams_delta_final_and_state(manager: SessionManager) -> Non
     assert response.media_type == "text/event-stream"
 
     session = manager.attach("ses_a")
+    # `attach` is typed as ProviderSession (the abstraction); for this test we
+    # need the opencode-specific `dispatch()` to feed canned events through the
+    # observer chain. SessionManager always backs onto OpencodeSession today.
+    assert isinstance(session, OpencodeSession)
     await session.dispatch(SessionStatus(session_id="ses_a", status="busy"))
     await session.dispatch(
         MessagePartDelta(

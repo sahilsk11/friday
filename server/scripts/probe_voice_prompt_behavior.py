@@ -12,7 +12,7 @@ import os
 import re
 import sys
 
-from friday.core.opencode_session import SYSTEM_PROMPT_VOICE, OpencodeClient
+from friday.core.opencode_provider import SYSTEM_PROMPT_VOICE, OpencodeProvider
 
 BASE_URL = os.environ.get("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
 PROMPT = "Walk me through three ways to install Python on macOS."
@@ -44,7 +44,7 @@ async def main() -> int:
     final: list[str] = []
     done = asyncio.Event()
 
-    async with OpencodeClient(BASE_URL) as client:
+    async with OpencodeProvider(BASE_URL) as client:
         session = await client.new_session(title="probe-voice-prompt")
 
         async def on_final(text: str) -> None:

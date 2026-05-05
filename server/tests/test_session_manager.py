@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from pytest_httpx import HTTPXMock
 
-from friday.core.opencode_session import OpencodeClient
+from friday.core.opencode_provider import OpencodeProvider
 from friday.core.session_manager import Message, SessionInfo, SessionManager
 
 BASE_URL = "http://opencode.test"
@@ -37,8 +37,8 @@ def _row(
 
 @pytest.fixture
 def manager() -> SessionManager:
-    """SessionManager wired to a non-started OpencodeClient (HTTP-only tests)."""
-    client = OpencodeClient(BASE_URL)
+    """SessionManager wired to a non-started OpencodeProvider (HTTP-only tests)."""
+    client = OpencodeProvider(BASE_URL)
     return SessionManager(client)
 
 

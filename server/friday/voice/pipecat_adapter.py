@@ -39,7 +39,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from friday.core.narration_policy import StreamingFilter
-from friday.core.opencode_session import SYSTEM_PROMPT_VOICE
+from friday.core.opencode_provider import SYSTEM_PROMPT_VOICE
 from friday.core.provider import ModelChoice, ProviderSession, Unsubscribe
 from friday.core.state import AgentState
 from friday.core.tool_narrator import describe_tool

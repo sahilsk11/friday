@@ -37,7 +37,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 
-from friday.core.opencode_session import OpencodeClient
+from friday.core.opencode_provider import OpencodeProvider
 from friday.voice.pipecat_adapter import OpencodeProcessor
 
 PROMPT = (
@@ -59,7 +59,7 @@ async def main() -> int:
         return 2
 
     print(f"[probe] opencode: {base_url}")
-    client = OpencodeClient(base_url)
+    client = OpencodeProvider(base_url)
     await client.start()
     try:
         session = await client.new_session(title="friday narration probe")

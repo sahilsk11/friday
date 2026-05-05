@@ -2,7 +2,7 @@
 
 Opencode owns persistence; friday is a thin façade. This module exposes typed
 ``SessionInfo`` / ``Message`` objects (built from raw JSON) and routes live
-``OpencodeSession`` lookups through :class:`OpencodeClient`'s existing cache so
+``OpencodeSession`` lookups through :class:`OpencodeProvider`'s existing cache so
 event observers can attach without duplicating state.
 
 Wire shapes are pinned by ``scripts/probe_session_manager.py`` against a real
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from friday.core.opencode_session import OpencodeClient
+from friday.core.opencode_provider import OpencodeProvider
 from friday.core.provider import ModelChoice, ProviderSession
 
 
@@ -51,21 +51,21 @@ class Message:
 
 
 class SessionManager:
-    """Typed-domain wrapper over :class:`OpencodeClient`'s HTTP surface."""
+    """Typed-domain wrapper over :class:`OpencodeProvider`'s HTTP surface."""
 
-    def __init__(self, client: OpencodeClient) -> None:
-        self._client = client
+    def __init__(self, provider: OpencodeProvider) -> None:
+        self._provider = provider
 
     @property
     def http(self) -> Any:
         """The underlying opencode HTTP client. Used by handlers that need to
         proxy requests opencode doesn't surface through the typed API
         (e.g. ``GET /config/providers`` for the model picker)."""
-        return self._client.http
+        return self._provider.http
 
     async def list_sessions(self, *, directory: str | None = None) -> list[SessionInfo]:
         """List all sessions, optionally filtered to one working directory."""
-        resp = await self._client.http.get("/session")
+        resp = await self._provider.http.get("/session")
         resp.raise_for_status()
         rows: list[dict[str, Any]] = resp.json()
         sessions = [_parse_session_info(row) for row in rows]
@@ -75,13 +75,13 @@ class SessionManager:
 
     async def get(self, session_id: str) -> SessionInfo:
         """Fetch metadata for one session."""
-        resp = await self._client.http.get(f"/session/{session_id}")
+        resp = await self._provider.http.get(f"/session/{session_id}")
         resp.raise_for_status()
         return _parse_session_info(resp.json())
 
     async def get_transcript(self, session_id: str) -> list[Message]:
         """Fetch the full transcript for a session, ordered oldest-first."""
-        resp = await self._client.http.get(f"/session/{session_id}/message")
+        resp = await self._provider.http.get(f"/session/{session_id}/message")
         resp.raise_for_status()
         rows: list[dict[str, Any]] = resp.json()
         return [_parse_message(row) for row in rows]
@@ -93,11 +93,11 @@ class SessionManager:
         directory: str | None = None,
     ) -> ProviderSession:
         """Create a new session and return its live wrapper."""
-        return await self._client.new_session(title, directory=directory)
+        return await self._provider.new_session(title, directory=directory)
 
     def attach(self, session_id: str) -> ProviderSession:
         """Return a live wrapper for an existing session (cached)."""
-        return self._client.session(session_id)
+        return self._provider.session(session_id)
 
 
 def _parse_session_info(row: dict[str, Any]) -> SessionInfo:

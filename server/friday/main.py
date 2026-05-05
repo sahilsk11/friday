@@ -1,6 +1,6 @@
 """FastAPI app composition.
 
-Owns the ``OpencodeClient`` lifecycle and a process-wide ``SessionManager``,
+Owns the ``OpencodeProvider`` lifecycle and a process-wide ``SessionManager``,
 mounts the framework-neutral session API, the WebSocket voice router, and
 (when ``web/dist`` is built) the SPA bundle so a single uvicorn process
 serves both the API and the frontend on one port.
@@ -30,7 +30,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from friday.api.sessions import models_router, router as sessions_router
-from friday.core.opencode_session import OpencodeClient
+from friday.core.opencode_provider import OpencodeProvider
 from friday.core.session_manager import SessionManager
 from friday.voice.server import router as voice_router
 from friday.voice.server import shutdown as voice_shutdown
@@ -48,17 +48,17 @@ WEB_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
 
 @asynccontextmanager
 async def default_lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    """Start the OpencodeClient (HTTP + SSE) and expose a SessionManager."""
+    """Start the OpencodeProvider (HTTP + SSE) and expose a SessionManager."""
     base_url = os.environ.get("OPENCODE_BASE_URL", DEFAULT_OPENCODE_BASE_URL)
-    client = OpencodeClient(base_url)
-    await client.start()
-    app.state.client = client
-    app.state.manager = SessionManager(client)
+    provider = OpencodeProvider(base_url)
+    await provider.start()
+    app.state.provider = provider
+    app.state.manager = SessionManager(provider)
     try:
         yield
     finally:
         await voice_shutdown()
-        await client.aclose()
+        await provider.aclose()
 
 
 def _resolve_cors_origins() -> list[str]:

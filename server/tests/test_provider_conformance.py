@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import httpx
 
-from friday.core.claude_code_session import ClaudeCodeProvider, ClaudeCodeSession
-from friday.core.opencode_session import OpencodeClient, OpencodeSession
+from friday.core.claude_code_provider import ClaudeCodeProvider, ClaudeCodeSession
+from friday.core.opencode_provider import OpencodeProvider, OpencodeSession
 from friday.core.provider import Provider, ProviderSession
 
 
@@ -21,7 +21,7 @@ def test_opencode_session_is_provider_session() -> None:
 
 
 def test_opencode_client_is_provider() -> None:
-    client = OpencodeClient("http://test.invalid")
+    client = OpencodeProvider("http://test.invalid")
     assert isinstance(client, Provider)
     assert client.provider_id == "opencode"
 

@@ -1,13 +1,19 @@
-"""OpencodeClient + OpencodeSession — HTTP + SSE wrapper for opencode.
+"""Opencode provider — implements the Provider/ProviderSession protocols.
+
+Application code talks to this only via ``friday.core.provider``. The
+HTTP+SSE machinery, the per-session event dispatch, the reconnect policy —
+all of that is internal to this module.
 
 Ported from ``~/Projects/friday/backend/src/agent/opencodeAdapter.ts``.
 
 Key invariants:
-- One global SSE subscription per ``OpencodeClient``; events are routed to the
-  right :class:`OpencodeSession` by ``sessionID``.
-- ``message.updated`` for ``role == "assistant"`` with ``time.end`` set is the
-  signal that fires ``on_text_final`` and ``on_state(IDLE)``. Without it,
-  queued turns stall (friday v1 incident).
+- One global SSE subscription per ``OpencodeProvider``; events are routed
+  to the right :class:`OpencodeSession` by ``sessionID``. The shared
+  connection is the reason provider+session live in one file: splitting
+  them would only obscure the multiplexing.
+- ``message.updated`` for ``role == "assistant"`` with ``time.end`` set is
+  the signal that fires ``on_text_final`` and ``on_state(IDLE)``. Without
+  it, queued turns stall (friday v1 incident).
 - Reconnect with exponential backoff (capped at 5s); a generation counter
   lets stale loops bail.
 """
@@ -44,22 +50,6 @@ from friday.core.provider import (
 )
 from friday.core.state import AgentState
 
-# Re-exported for callers that import from opencode_session — kept as a
-# compatibility hop so churn is local. Canonical home is friday.core.provider.
-__all__ = [
-    "SYSTEM_PROMPT_VOICE",
-    "EventHandler",
-    "ModelChoice",
-    "OpencodeClient",
-    "OpencodeSession",
-    "StateHandler",
-    "TextDeltaHandler",
-    "TextFinalHandler",
-    "ToolStartHandler",
-    "Unsubscribe",
-]
-
-
 # Sent on every prompt_async via the per-turn ``system`` field (the only
 # mechanism opencode actually honors — its create-time systemPrompt is silently
 # dropped, see scripts/probe_systemprompt_variants.py).
@@ -88,7 +78,7 @@ SYSTEM_PROMPT_VOICE = (
 EventHandler = Callable[[OpencodeEvent], Awaitable[None]]
 
 
-class OpencodeClient:
+class OpencodeProvider:
     """Owns the HTTP client and the single global SSE subscription.
 
     Sessions are created via :meth:`new_session` or :meth:`session` (existing).
@@ -300,7 +290,7 @@ class OpencodeSession:
         self._accumulated.clear()
         self._reasoning_parts.clear()
 
-    # ── Inbound (called by OpencodeClient._dispatch) ────────────────────────
+    # ── Inbound (called by OpencodeProvider._dispatch) ────────────────────────
 
     async def dispatch(self, event: OpencodeEvent) -> None:
         if isinstance(event, MessagePartDelta):

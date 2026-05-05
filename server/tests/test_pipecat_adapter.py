@@ -37,7 +37,7 @@ from friday.core.events import (
     MessageUpdated,
     SessionStatus,
 )
-from friday.core.opencode_session import ModelChoice, OpencodeClient, OpencodeSession
+from friday.core.opencode_provider import ModelChoice, OpencodeProvider, OpencodeSession
 from friday.voice.pipecat_adapter import (
     RTVI_AGENT_STATE,
     RTVI_ASSISTANT_TEXT_DELTA,
@@ -79,7 +79,7 @@ SESSION_ID = "ses_a"
 @pytest.fixture
 async def session() -> AsyncIterator[OpencodeSession]:
     """A real OpencodeSession bound to a non-started client (no SSE loop)."""
-    client = OpencodeClient(OPENCODE_URL)
+    client = OpencodeProvider(OPENCODE_URL)
     yield client.session(SESSION_ID)
     await client.aclose()
 
