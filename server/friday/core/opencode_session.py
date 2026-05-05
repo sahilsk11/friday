@@ -61,7 +61,6 @@ TextDeltaHandler = Callable[[str], Awaitable[None]]
 TextFinalHandler = Callable[[str], Awaitable[None]]
 StateHandler = Callable[[AgentState], Awaitable[None]]
 ToolStartHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
-ModelHandler = Callable[[ModelChoice], Awaitable[None]]
 
 
 class OpencodeClient:
@@ -200,7 +199,6 @@ class OpencodeSession:
         self._final_handlers: list[TextFinalHandler] = []
         self._state_handlers: list[StateHandler] = []
         self._tool_start_handlers: list[ToolStartHandler] = []
-        self._model_handlers: list[ModelHandler] = []
         # Accumulated text per (sessionID, messageID) for on_text_final.
         self._accumulated: dict[str, str] = {}
         # Track which assistant messages we've already finalized.
@@ -213,11 +211,6 @@ class OpencodeSession:
         # We register part IDs here when we first see them as type="reasoning"
         # so _handle_delta can skip them entirely.
         self._reasoning_parts: set[str] = set()
-        # Sticky model for the next ``send_turn`` that doesn't pass an explicit
-        # one. Set by the API layer when the user picks a model from the UI;
-        # cleared after the next turn fires. Lets voice and REST share the same
-        # selection without each path needing its own bookkeeping.
-        self.next_model: ModelChoice | None = None
 
     # ── Observer registration ───────────────────────────────────────────────
 
@@ -234,27 +227,12 @@ class OpencodeSession:
         """Fires once per tool invocation, with the tool name."""
         self._tool_start_handlers.append(handler)
 
-    def on_model(self, handler: ModelHandler) -> None:
-        """Fires when an assistant turn completes, with the model that ran it.
-
-        Idempotent — the same handler may be invoked repeatedly with the same
-        value across consecutive turns. Sourced from ``info.modelID`` /
-        ``info.providerID`` on the wire, which is opencode's ground truth.
-        """
-        self._model_handlers.append(handler)
-
     # ── Outbound ────────────────────────────────────────────────────────────
 
     async def send_turn(self, text: str, model: ModelChoice | None = None) -> None:
         body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
-        # Explicit per-call ``model`` wins; otherwise fall back to whatever the
-        # UI most recently set as sticky. Either way, clear ``next_model`` so a
-        # follow-up turn defaults back to opencode's global default unless the
-        # user picks again.
-        choice = model or self.next_model
-        if choice is not None:
-            body["model"] = choice.to_wire()
-        self.next_model = None
+        if model is not None:
+            body["model"] = model.to_wire()
         resp = await self._http.post(f"/session/{self.id}/prompt_async", json=body)
         resp.raise_for_status()
 
@@ -318,10 +296,6 @@ class OpencodeSession:
         if text:
             for handler in self._final_handlers:
                 await handler(text)
-        if event.model_id and event.provider_id:
-            choice = ModelChoice(provider_id=event.provider_id, model_id=event.model_id)
-            for handler in self._model_handlers:
-                await handler(choice)
         await self._fan_out_state(AgentState.IDLE)
 
     async def _fan_out_state(self, state: AgentState) -> None:

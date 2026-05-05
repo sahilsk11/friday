@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 
 import { isApiError } from '@/lib/api';
+import { useSelectedModel } from '@/lib/selectedModel';
 import { createSession, listModels, listSessions } from '@/lib/sessions';
 import type { ModelInfo, ModelRef } from '@/types/api';
 
@@ -18,7 +19,6 @@ function formatTimestamp(iso: string): string {
 }
 
 const DEFAULT_DIRECTORY = '/root/projects';
-const LAST_MODEL_KEY = 'friday.lastModel';
 
 function modelKey(m: ModelRef): string {
   return `${m.providerID}/${m.modelID}`;
@@ -28,23 +28,6 @@ function parseModelKey(key: string): ModelRef | null {
   const idx = key.indexOf('/');
   if (idx < 0) return null;
   return { providerID: key.slice(0, idx), modelID: key.slice(idx + 1) };
-}
-
-function loadLastModel(): ModelRef | null {
-  try {
-    const raw = localStorage.getItem(LAST_MODEL_KEY);
-    return raw ? parseModelKey(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveLastModel(m: ModelRef): void {
-  try {
-    localStorage.setItem(LAST_MODEL_KEY, modelKey(m));
-  } catch {
-    // localStorage disabled — fine, modal just won't remember next time.
-  }
 }
 
 export default function SessionsList() {
@@ -134,9 +117,9 @@ export default function SessionsList() {
 function NewSessionModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const { model: selectedModel, setModel } = useSelectedModel();
   const [title, setTitle] = useState('');
   const [directory, setDirectory] = useState(DEFAULT_DIRECTORY);
-  const [modelKeyValue, setModelKeyValue] = useState<string>('');
   const directoryRef = useRef<HTMLInputElement>(null);
 
   const modelsQuery = useQuery({
@@ -145,22 +128,6 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
     // Models are static-ish per opencode boot; no need to refetch on focus.
     staleTime: 5 * 60 * 1000,
   });
-
-  // Once models load, pick the last-used (localStorage) → opencode default →
-  // first available. Only seed once: don't fight the user if they've changed it.
-  useEffect(() => {
-    if (modelKeyValue) return;
-    if (!modelsQuery.data) return;
-    const { models, default: dflt } = modelsQuery.data;
-    if (models.length === 0) return;
-    const valid = new Set(models.map(modelKey));
-    const last = loadLastModel();
-    const seed =
-      (last && valid.has(modelKey(last)) && modelKey(last)) ||
-      (dflt && valid.has(modelKey(dflt)) && modelKey(dflt)) ||
-      modelKey(models[0]);
-    setModelKeyValue(seed);
-  }, [modelsQuery.data, modelKeyValue]);
 
   const groupedModels = useMemo<[string, { providerName: string; items: ModelInfo[] }][]>(() => {
     if (!modelsQuery.data) return [];
@@ -176,9 +143,13 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
     return [...out.entries()];
   }, [modelsQuery.data]);
 
+  // Picking a model in the modal updates the global hook — the same value
+  // is read by the chip on the session page. The session create call
+  // doesn't carry the model; it rides on the first turn.
+  const currentValue = selectedModel ? modelKey(selectedModel) : '';
+
   const createMutation = useMutation({
-    mutationFn: ({ t, d, m }: { t: string; d: string; m: ModelRef | undefined }) =>
-      createSession(t || undefined, d || undefined, m),
+    mutationFn: ({ t, d }: { t: string; d: string }) => createSession(t || undefined, d || undefined),
     onSuccess: async (row) => {
       await queryClient.invalidateQueries({ queryKey: ['sessions'] });
       void navigate(`/s/${row.id}`);
@@ -229,9 +200,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
               directoryRef.current?.focus();
               return;
             }
-            const model = modelKeyValue ? parseModelKey(modelKeyValue) : null;
-            if (model) saveLastModel(model);
-            createMutation.mutate({ t: title.trim(), d, m: model ?? undefined });
+            createMutation.mutate({ t: title.trim(), d });
           }}
         >
           <label className="flex flex-col gap-1">
@@ -269,8 +238,11 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
           <label className="flex flex-col gap-1">
             <span className="text-xs uppercase tracking-wide text-neutral-500">model</span>
             <select
-              value={modelKeyValue}
-              onChange={(e) => setModelKeyValue(e.target.value)}
+              value={currentValue}
+              onChange={(e) => {
+                const next = parseModelKey(e.target.value);
+                if (next) setModel(next);
+              }}
               disabled={
                 createMutation.isPending || modelsQuery.isLoading || groupedModels.length === 0
               }

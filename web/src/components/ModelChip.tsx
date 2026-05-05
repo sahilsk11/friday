@@ -1,14 +1,14 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-import { apiClient } from '@/lib/api';
 import { listModels } from '@/lib/sessions';
 import type { ModelInfo, ModelRef } from '@/types/api';
 
-// Header chip + popover for picking the model on a session. Used by both
-// SessionView (REST turns) and VoiceRoom (voice turns) — they share the
-// same backend state via PATCH /sessions/:id/model, so a switch in one
-// applies to the next turn from either path.
+// Header chip + popover for picking the model. Pure controlled component:
+// the parent owns ``selected`` state and decides what to do with it (REST
+// posts include it in the turn body; voice attaches it to the end-turn WS
+// message). No server PATCH — the chosen model rides along on the next
+// turn from whichever path sends it.
 
 export function modelKey(m: ModelRef): string {
   return `${m.providerID}/${m.modelID}`;
@@ -21,14 +21,14 @@ export function parseModelKey(key: string): ModelRef | null {
 }
 
 export function ModelChip({
-  sessionId,
-  active,
+  selected,
+  onChange,
 }: {
-  sessionId: string;
-  /** Model the last assistant turn ran on (or pre-first-turn staging). */
-  active: ModelRef | null;
+  /** Current selection. ``null`` hides the chip until the user picks one. */
+  selected: ModelRef | null;
+  /** Called when the user picks a different model from the popover. */
+  onChange: (m: ModelRef) => void;
 }) {
-  const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const popoverRef = useRef<HTMLDivElement>(null);
 
@@ -37,16 +37,6 @@ export function ModelChip({
     queryFn: listModels,
     staleTime: 5 * 60 * 1000,
     enabled: open,
-  });
-
-  const setModelMutation = useMutation({
-    mutationFn: (m: ModelRef) =>
-      apiClient.patch<void>(`/sessions/${sessionId}/model`, m),
-    onSuccess: async () => {
-      // The session detail caches `current_model`; refetch so the chip
-      // reflects the staged choice immediately (until SSE confirms reality).
-      await queryClient.invalidateQueries({ queryKey: ['session', sessionId] });
-    },
   });
 
   const grouped = useMemo<[string, { providerName: string; items: ModelInfo[] }][]>(() => {
@@ -81,10 +71,7 @@ export function ModelChip({
     };
   }, [open]);
 
-  if (!active) {
-    // Pre-first-turn with no staged model — keep the header clean.
-    return null;
-  }
+  if (!selected) return null;
 
   return (
     <div className="relative" ref={popoverRef}>
@@ -92,19 +79,19 @@ export function ModelChip({
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="inline-flex items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900 px-3 py-1 text-xs hover:border-neutral-500"
-        title={`${active.providerID}/${active.modelID}`}
+        title={`${selected.providerID}/${selected.modelID}`}
       >
         <span className="text-neutral-400">model</span>
-        <span className="font-medium text-neutral-100">{labelFor(active)}</span>
+        <span className="font-medium text-neutral-100">{labelFor(selected)}</span>
       </button>
       {open ? (
         <div className="absolute right-0 z-20 mt-2 w-72 rounded-md border border-neutral-800 bg-neutral-950 p-3 shadow-xl">
           <div className="mb-2 text-xs uppercase tracking-wide text-neutral-500">change model</div>
           <select
-            value={modelKey(active)}
+            value={modelKey(selected)}
             onChange={(e) => {
               const next = parseModelKey(e.target.value);
-              if (next) setModelMutation.mutate(next);
+              if (next) onChange(next);
               setOpen(false);
             }}
             disabled={modelsQuery.isLoading || grouped.length === 0}

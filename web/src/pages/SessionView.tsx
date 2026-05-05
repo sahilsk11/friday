@@ -5,6 +5,7 @@ import { Link, useParams } from 'react-router';
 import { ModelChip } from '@/components/ModelChip';
 import { isApiError } from '@/lib/api';
 import { useSessionEvents } from '@/lib/events';
+import { useSelectedModel } from '@/lib/selectedModel';
 import { getSession, postTurn } from '@/lib/sessions';
 import type { AgentState } from '@/types/api';
 
@@ -40,15 +41,12 @@ export default function SessionView() {
   });
 
   const live = useSessionEvents(id);
-
-  // Ground truth: prefer live SSE-reported model (always reality after the
-  // first turn lands), fall back to the snapshot from GET /sessions/:id.
-  const activeModel = live.model ?? sessionQuery.data?.current_model ?? null;
+  const { model: selectedModel, setModel } = useSelectedModel();
 
   const turnMutation = useMutation({
     mutationFn: (text: string) => {
       if (!id) throw new Error('missing session id');
-      return postTurn(id, text);
+      return postTurn(id, text, selectedModel ?? undefined);
     },
     onSuccess: async () => {
       setDraft('');
@@ -88,7 +86,7 @@ export default function SessionView() {
           </h1>
         </div>
         <div className="flex items-center gap-3">
-          {id ? <ModelChip sessionId={id} active={activeModel} /> : null}
+          <ModelChip selected={selectedModel} onChange={setModel} />
           <StatePill state={live.state} />
           <Link
             to={`/s/${id}`}

@@ -13,6 +13,7 @@ plumbing.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 
 import httpx
@@ -37,7 +38,7 @@ from friday.core.events import (
     MessageUpdated,
     SessionStatus,
 )
-from friday.core.opencode_session import OpencodeClient, OpencodeSession
+from friday.core.opencode_session import ModelChoice, OpencodeClient, OpencodeSession
 from friday.voice.pipecat_adapter import (
     RTVI_AGENT_STATE,
     RTVI_ASSISTANT_TEXT_DELTA,
@@ -70,6 +71,7 @@ def _rtvi_messages_of_type(pushed: list[Frame], type_name: str) -> list[dict[str
         if isinstance(data, dict) and data.get("type") == type_name:
             out.append(data)
     return out
+
 
 OPENCODE_URL = "http://opencode.test"
 SESSION_ID = "ses_a"
@@ -126,6 +128,38 @@ async def test_finalized_transcription_posts_turn_to_opencode(
     # downstream as a frame. The ack is a separate TTSSpeakFrame, asserted in
     # ``test_ack_fires_on_finalized_transcription``.
     assert not any(isinstance(f, TranscriptionFrame) for f in pushed)
+
+
+async def test_next_turn_model_is_forwarded_then_cleared(
+    httpx_mock: HTTPXMock, session: OpencodeSession
+) -> None:
+    """When the WS handler stamps ``next_turn_model`` from an end-turn message,
+    the next finalized transcription forwards it to opencode and clears it."""
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
+        status_code=204,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
+        status_code=204,
+    )
+    proc, _ = _make_processor(session)
+    proc.next_turn_model = ModelChoice(provider_id="opencode", model_id="gpt-5-nano")
+
+    await proc.process_frame(_transcription("first"), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(_transcription("second"), FrameDirection.DOWNSTREAM)
+
+    sent = httpx_mock.get_requests()
+    assert json.loads(sent[0].content) == {
+        "parts": [{"type": "text", "text": "first"}],
+        "model": {"providerID": "opencode", "modelID": "gpt-5-nano"},
+    }
+    # Second turn has no model — the field was consumed on the first turn,
+    # opencode's per-session stickiness carries the choice forward.
+    assert json.loads(sent[1].content) == {"parts": [{"type": "text", "text": "second"}]}
+    assert proc.next_turn_model is None
 
 
 async def test_non_finalized_transcription_passes_through(

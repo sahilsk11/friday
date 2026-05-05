@@ -19,6 +19,7 @@ import { ActivityFeed } from '@/components/ActivityFeed';
 import { ModelChip } from '@/components/ModelChip';
 import { ThinkingIndicator } from '@/components/ThinkingIndicator';
 import { fridayBaseUrl } from '@/lib/env';
+import { useSelectedModel } from '@/lib/selectedModel';
 import { getSession } from '@/lib/sessions';
 import type { ModelRef, TranscriptEntry } from '@/types/api';
 
@@ -120,7 +121,6 @@ export default function VoiceRoom(): React.ReactElement {
       <VoiceRoomShell
         sessionId={id}
         initialTranscript={sessionQuery.data?.transcript ?? []}
-        currentModel={sessionQuery.data?.current_model ?? null}
       />
     </PipecatClientProvider>
   );
@@ -129,12 +129,11 @@ export default function VoiceRoom(): React.ReactElement {
 function VoiceRoomShell({
   sessionId,
   initialTranscript,
-  currentModel,
 }: {
   sessionId: string;
   initialTranscript: TranscriptEntry[];
-  currentModel: ModelRef | null;
 }): React.ReactElement {
+  const { model: selectedModel, setModel } = useSelectedModel();
   return (
     <div className="mx-auto flex h-screen max-w-5xl flex-col px-6 py-6">
       <header className="mb-6 flex items-center justify-between">
@@ -142,7 +141,7 @@ function VoiceRoomShell({
           ← sessions
         </Link>
         <div className="flex items-center gap-3">
-          <ModelChip sessionId={sessionId} active={currentModel} />
+          <ModelChip selected={selectedModel} onChange={setModel} />
           <Link
             to={`/s/${sessionId}/transcript`}
             className="rounded-md border border-neutral-700 px-3 py-1.5 text-xs hover:border-neutral-500"
@@ -225,17 +224,22 @@ function VoiceRoomShell({
 
 // "Send" button — tells the server we're done speaking, force-commits the
 // in-progress transcript on the ElevenLabs side. Server-side handler
-// pushes a synthetic VADUserStoppedSpeakingFrame upstream. Disabled
-// while disconnected.
+// pushes a synthetic VADUserStoppedSpeakingFrame upstream. We piggyback
+// the user's current model selection onto the message so the server can
+// stamp it on the next finalized transcription before forwarding to
+// opencode. Disabled while disconnected.
 function SendTurnButton(): React.ReactElement {
   const client = usePipecatClient();
+  const { model } = useSelectedModel();
   return (
     <button
       type="button"
       disabled={!client}
       onClick={() => {
         if (!client) return;
-        client.sendClientMessage('end-turn');
+        const payload: { model?: ModelRef } = {};
+        if (model) payload.model = model;
+        client.sendClientMessage('end-turn', payload);
       }}
       className="rounded-md bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
     >
