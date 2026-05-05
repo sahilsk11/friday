@@ -19,6 +19,7 @@ import { ActivityFeed } from '@/components/ActivityFeed';
 import { ModelChip } from '@/components/ModelChip';
 import { ThinkingIndicator } from '@/components/ThinkingIndicator';
 import { fridayBaseUrl } from '@/lib/env';
+import { useNarrateTools } from '@/lib/narrateTools';
 import { useSelectedModel } from '@/lib/selectedModel';
 import { getSession } from '@/lib/sessions';
 import type { ModelRef, TranscriptEntry } from '@/types/api';
@@ -134,6 +135,7 @@ function VoiceRoomShell({
   initialTranscript: TranscriptEntry[];
 }): React.ReactElement {
   const { model: selectedModel, setModel } = useSelectedModel();
+  const { narrateTools, setNarrateTools } = useNarrateTools();
   return (
     <div className="mx-auto flex h-screen max-w-5xl flex-col px-6 py-6">
       <header className="mb-6 flex items-center justify-between">
@@ -141,6 +143,7 @@ function VoiceRoomShell({
           ← sessions
         </Link>
         <div className="flex items-center gap-3">
+          <NarrateToolsToggle value={narrateTools} onChange={setNarrateTools} />
           <ModelChip selected={selectedModel} onChange={setModel} />
           <Link
             to={`/s/${sessionId}/transcript`}
@@ -231,19 +234,47 @@ function VoiceRoomShell({
 function SendTurnButton(): React.ReactElement {
   const client = usePipecatClient();
   const { model } = useSelectedModel();
+  const { narrateTools } = useNarrateTools();
   return (
     <button
       type="button"
       disabled={!client}
       onClick={() => {
         if (!client) return;
-        const payload: { model?: ModelRef } = {};
+        const payload: { model?: ModelRef; narrateTools: boolean } = { narrateTools };
         if (model) payload.model = model;
         client.sendClientMessage('end-turn', payload);
       }}
       className="rounded-md bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
     >
       Send turn ⏎
+    </button>
+  );
+}
+
+// Compact pill toggle for "speak tool starts out loud." Off is the default
+// — the activity feed shows tools regardless; this only governs TTS.
+function NarrateToolsToggle({
+  value,
+  onChange,
+}: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+}): React.ReactElement {
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        onChange(!value);
+      }}
+      title={value ? 'Tool narration on — click to mute' : 'Tool narration off — click to enable'}
+      className={
+        value
+          ? 'rounded-md border border-emerald-700 bg-emerald-950 px-3 py-1.5 text-xs text-emerald-200 hover:border-emerald-500'
+          : 'rounded-md border border-neutral-700 px-3 py-1.5 text-xs text-neutral-400 hover:border-neutral-500'
+      }
+    >
+      narrate tools: {value ? 'on' : 'off'}
     </button>
   );
 }

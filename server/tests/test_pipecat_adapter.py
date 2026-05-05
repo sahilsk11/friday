@@ -370,7 +370,8 @@ async def test_fenced_code_blocks_are_not_pushed_as_text(session: OpencodeSessio
 
 
 async def test_tool_start_emits_checkpoint_speak(session: OpencodeSession) -> None:
-    _, pushed = _make_processor(session)
+    proc, pushed = _make_processor(session)
+    proc.narrate_tools = True
 
     await session.dispatch(
         MessagePartUpdated(
@@ -390,9 +391,34 @@ async def test_tool_start_emits_checkpoint_speak(session: OpencodeSession) -> No
     assert speak_frames[0].text == "looking at a file"
 
 
+async def test_tool_narration_off_by_default(session: OpencodeSession) -> None:
+    """With ``narrate_tools`` False (the default), tool starts surface to the
+    activity feed via RTVI but never reach TTS."""
+    _, pushed = _make_processor(session)
+
+    await session.dispatch(
+        MessagePartUpdated(
+            session_id=SESSION_ID,
+            message_id="m1",
+            part_id="tp1",
+            part_type="tool",
+            text=None,
+            tool_name="read",
+            tool_status="running",
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
+    rtvi_tools = _rtvi_messages_of_type(pushed, RTVI_TOOL_STARTED)
+    # No label is generated when narration is off — UI falls back to the name.
+    assert rtvi_tools == [{"type": RTVI_TOOL_STARTED, "name": "read"}]
+
+
 async def test_tool_status_updates_dont_double_announce(session: OpencodeSession) -> None:
     """Opencode emits MessagePartUpdated repeatedly per tool — only narrate once."""
-    _, pushed = _make_processor(session)
+    proc, pushed = _make_processor(session)
+    proc.narrate_tools = True
 
     for status in ("pending", "running", "completed"):
         await session.dispatch(
@@ -412,7 +438,8 @@ async def test_tool_status_updates_dont_double_announce(session: OpencodeSession
 
 
 async def test_unknown_tool_emits_no_checkpoint(session: OpencodeSession) -> None:
-    _, pushed = _make_processor(session)
+    proc, pushed = _make_processor(session)
+    proc.narrate_tools = True
 
     await session.dispatch(
         MessagePartUpdated(
@@ -465,7 +492,8 @@ async def test_message_finalized_emits_rtvi_assistant_text_final(session: Openco
 async def test_tool_start_emits_rtvi_for_unknown_tool_too(session: OpencodeSession) -> None:
     """Unknown tools still appear in the activity feed even when there's no
     spoken narration phrase."""
-    _, pushed = _make_processor(session)
+    proc, pushed = _make_processor(session)
+    proc.narrate_tools = True
 
     await session.dispatch(
         MessagePartUpdated(
