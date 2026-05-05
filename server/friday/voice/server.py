@@ -135,8 +135,19 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     # PipelineRunner before ``StartFrame`` propagates), so we ack as soon
     # as the client says hello. Without this, voice-ui-kit's ClientStatus
     # pill reads "Agent connecting" forever even though everything works.
+    #
+    # Right after the bot-ready ack, replay the current opencode agent
+    # state so a UI that just (re)connected mid-turn shows the thinking
+    # indicator immediately — opencode only fires state events on
+    # transitions, so without this an in-flight turn looks idle until the
+    # next change. ``send_server_message`` is the post-start, RTVI-aware
+    # path; pushing an RTVIServerMessageFrame from the processor before
+    # this point trips RTVIProcessor's "StartFrame not received yet" check.
     async def _on_client_ready(processor: RTVIProcessor) -> None:
         await processor.set_bot_ready()
+        await processor.send_server_message(
+            {"type": "agent-state", "state": opencode_session.current_state.value}
+        )
 
     rtvi.event_handler("on_client_ready")(_on_client_ready)
 
@@ -181,6 +192,20 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
             # the next turn only goes out when the user taps Send again.
             logger.info("voice: interrupt received | session={}", opencode_session.id)
             await processor.push_frame(InterruptionTaskFrame(), FrameDirection.UPSTREAM)
+        elif msg.type == "set-tts":
+            # Speaker toggle. Defaults to off on every fresh page load —
+            # the client sends this whenever the user flips the switch
+            # (and once on connect to assert the current value). When off
+            # we keep the WS open and keep streaming events to the UI;
+            # we just don't burn TTS synthesis or speak the assistant.
+            enabled = _parse_tts_enabled(msg.data)
+            if enabled is not None:
+                opencode.tts_enabled = enabled
+                logger.info(
+                    "voice: set-tts | session={} enabled={}",
+                    opencode_session.id,
+                    enabled,
+                )
 
     rtvi.event_handler("on_client_message")(_on_client_message)
 
@@ -217,6 +242,16 @@ def _parse_narrate_tools(data: object) -> bool | None:
     if not isinstance(data, dict):
         return None
     val = data.get("narrateTools")
+    if isinstance(val, bool):
+        return val
+    return None
+
+
+def _parse_tts_enabled(data: object) -> bool | None:
+    """Extract the ``enabled`` flag from a set-tts payload, if any."""
+    if not isinstance(data, dict):
+        return None
+    val = data.get("enabled")
     if isinstance(val, bool):
         return val
     return None

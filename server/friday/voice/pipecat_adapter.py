@@ -48,7 +48,12 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from friday.core.ack_generator import generate_ack
 from friday.core.narration_policy import StreamingFilter
-from friday.core.opencode_session import SYSTEM_PROMPT_VOICE, ModelChoice, OpencodeSession
+from friday.core.opencode_session import (
+    SYSTEM_PROMPT_VOICE,
+    ModelChoice,
+    OpencodeSession,
+    Unsubscribe,
+)
 from friday.core.state import AgentState
 from friday.core.tool_narrator import describe_tool
 
@@ -101,11 +106,23 @@ class OpencodeProcessor(FrameProcessor):
         # activity feed. The WS handler flips this from the client toggle
         # carried on ``end-turn``. Sticky across turns until changed.
         self.narrate_tools: bool = False
+        # Master TTS gate. Off by default so a fresh page load (or a
+        # mid-turn refresh) doesn't suddenly start talking — the user
+        # opts in via the speaker toggle, which sends ``set-tts`` over
+        # RTVI. When False we skip ack generation, drop tool narration
+        # TTS, and don't push LLM frames into the TTS service.
+        self.tts_enabled: bool = False
 
-        session.on_text_delta(self._on_delta)
-        session.on_text_final(self._on_final)
-        session.on_state(self._on_state)
-        session.on_tool_start(self._on_tool_start)
+        # Hold the unsubscribe handles so cleanup() can detach this
+        # processor's callbacks from the cached OpencodeSession. Without
+        # this, every reconnect leaks another set of dead handlers that
+        # keep firing into a torn-down pipeline.
+        self._unsubscribes: list[Unsubscribe] = [
+            session.on_text_delta(self._on_delta),
+            session.on_text_final(self._on_final),
+            session.on_state(self._on_state),
+            session.on_tool_start(self._on_tool_start),
+        ]
 
     @override
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -125,10 +142,13 @@ class OpencodeProcessor(FrameProcessor):
                 self._ack_task.cancel()
             # Spawn ack generation BEFORE awaiting send_turn so the OpenRouter
             # round-trip overlaps the prompt POST. Both run concurrently with
-            # everything downstream; neither blocks the frame loop.
-            self._ack_task = asyncio.create_task(self._generate_and_speak_ack(frame.text))
-            self._bg_tasks.add(self._ack_task)
-            self._ack_task.add_done_callback(self._bg_tasks.discard)
+            # everything downstream; neither blocks the frame loop. Skip
+            # entirely when TTS is muted — no point burning the OpenRouter
+            # call on a phrase that won't be spoken.
+            if self.tts_enabled:
+                self._ack_task = asyncio.create_task(self._generate_and_speak_ack(frame.text))
+                self._bg_tasks.add(self._ack_task)
+                self._ack_task.add_done_callback(self._bg_tasks.discard)
             # Consume the model the WS handler stamped from end-turn (if any)
             # — opencode's per-session stickiness then carries it across
             # subsequent turns until the user picks again.
@@ -138,6 +158,20 @@ class OpencodeProcessor(FrameProcessor):
             return
 
         await self.push_frame(frame, direction)
+
+    @override
+    async def cleanup(self) -> None:
+        """Detach observers from the cached OpencodeSession.
+
+        The session lives across pipelines (one global SSE subscription
+        keyed on session id), so handlers we registered in ``__init__``
+        would otherwise outlive this pipeline and keep pushing frames
+        into a torn-down processor.
+        """
+        for unsubscribe in self._unsubscribes:
+            unsubscribe()
+        self._unsubscribes.clear()
+        await super().cleanup()
 
     async def _handle_interruption(self) -> None:
         """User barged in via the Interrupt button. Abort opencode and reset.
@@ -194,6 +228,13 @@ class OpencodeProcessor(FrameProcessor):
             RTVIServerMessageFrame(data={"type": RTVI_ASSISTANT_TEXT_DELTA, "text": text})
         )
 
+        if not self.tts_enabled:
+            # UI already got the delta above. Suppress any in-flight ack
+            # so a late ack TTS doesn't fire after the user muted; nothing
+            # else needs to flow downstream.
+            self._acked = True
+            return
+
         speakable = self._narration.feed(text)
         if not speakable:
             # Inside a code fence (or held pending a fence delimiter). Don't
@@ -241,7 +282,7 @@ class OpencodeProcessor(FrameProcessor):
 
     async def _narrate_tool(self, tool_name: str, tool_input: dict[str, Any]) -> None:
         rtvi_data: dict[str, object] = {"type": RTVI_TOOL_STARTED, "name": tool_name}
-        if not self.narrate_tools:
+        if not self.narrate_tools or not self.tts_enabled:
             # UI still gets the tool start (activity feed falls back to the
             # raw name); skip the OpenRouter label call and the TTS frame.
             await self.push_frame(RTVIServerMessageFrame(data=rtvi_data))

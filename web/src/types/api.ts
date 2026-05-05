@@ -30,13 +30,14 @@ export interface ModelsResponse {
   default: ModelRef | null;
 }
 
+export type AgentState = 'idle' | 'listening' | 'thinking' | 'speaking';
+
 export interface SessionDetail {
   session: SessionRow;
   transcript: TranscriptEntry[];
   current_model: ModelRef | null;
+  agent_state: AgentState;
 }
-
-export type AgentState = 'idle' | 'listening' | 'thinking' | 'speaking';
 
 // SSE frame types (see GET /sessions/:id/events in BackendIntegration.md).
 export type SessionEvent =

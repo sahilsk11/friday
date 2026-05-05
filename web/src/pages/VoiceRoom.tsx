@@ -5,12 +5,7 @@ import {
   usePipecatClient,
   usePipecatClientMicControl,
 } from '@pipecat-ai/client-react';
-import {
-  ClientStatus,
-  ConnectButton,
-  TranscriptOverlay,
-  VoiceVisualizer,
-} from '@pipecat-ai/voice-ui-kit';
+import { ClientStatus, TranscriptOverlay, VoiceVisualizer } from '@pipecat-ai/voice-ui-kit';
 import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
 import { useQuery } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -23,7 +18,7 @@ import { fridayBaseUrl } from '@/lib/env';
 import { useNarrateTools } from '@/lib/narrateTools';
 import { useSelectedModel } from '@/lib/selectedModel';
 import { getSession } from '@/lib/sessions';
-import type { ModelRef, TranscriptEntry } from '@/types/api';
+import type { AgentState, ModelRef, TranscriptEntry } from '@/types/api';
 
 // THE ONLY PAGE THAT IMPORTS @pipecat-ai/*.
 //
@@ -102,10 +97,19 @@ export default function VoiceRoom(): React.ReactElement {
     // Resolve mic device + getUserMedia ahead of connect. Without this,
     // PipecatClient.connect() opens the WS but never starts pushing
     // audio frames — STT sits idle. <PipecatAppBase> handles this via
-    // initDevicesOnMount; we have to do it explicitly.
-    void pcClient.initDevices().catch((err: unknown) => {
-      console.error('initDevices failed', err);
-    });
+    // initDevicesOnMount; we have to do it explicitly. We then chain
+    // connect() so the WS opens automatically on page load — the WS is
+    // the event channel, and we want opencode events flowing to the UI
+    // for as long as the page is mounted, regardless of mic/speaker
+    // state. STT is gated by the mic toggle, TTS by the speaker toggle.
+    void (async () => {
+      try {
+        await pcClient.initDevices();
+        await pcClient.connect();
+      } catch (err) {
+        console.error('voice setup failed', err);
+      }
+    })();
     setClient(pcClient);
     return () => {
       void pcClient.disconnect().catch(() => {
@@ -127,6 +131,7 @@ export default function VoiceRoom(): React.ReactElement {
       <VoiceRoomShell
         sessionId={id}
         initialTranscript={sessionQuery.data?.transcript ?? []}
+        initialAgentState={sessionQuery.data?.agent_state ?? 'idle'}
       />
     </PipecatClientProvider>
   );
@@ -135,9 +140,11 @@ export default function VoiceRoom(): React.ReactElement {
 function VoiceRoomShell({
   sessionId,
   initialTranscript,
+  initialAgentState,
 }: {
   sessionId: string;
   initialTranscript: TranscriptEntry[];
+  initialAgentState: AgentState;
 }): React.ReactElement {
   const { model: selectedModel, setModel } = useSelectedModel();
   const { narrateTools, setNarrateTools } = useNarrateTools();
@@ -187,8 +194,10 @@ function VoiceRoomShell({
           {/* "Thinking…" indicator — visible only while opencode is busy.
               Bridges the long silent window (probe measured 11–40s) between
               prompt accepted and first content event. Tied to opencode's
-              session state, not a dumb timer. */}
-          <ThinkingIndicator />
+              session state, not a dumb timer. Seeded from REST so a
+              refresh mid-turn renders the right state on first paint;
+              the WS reasserts it on connect via OpencodeProcessor. */}
+          <ThinkingIndicator initialThinking={initialAgentState === 'thinking'} />
 
           {/* Live partial transcript — words appear as you speak. */}
           <div className="min-h-[3rem] rounded-xl border border-neutral-800 bg-black/40 px-3 py-2 text-sm text-neutral-300">
@@ -209,7 +218,7 @@ function VoiceRoomShell({
           <InterruptButton />
 
           <div className="mt-auto flex items-center justify-end gap-3">
-            <ConnectControl />
+            <SpeakerToggle />
           </div>
         </section>
 
@@ -407,24 +416,43 @@ function InterruptButton(): React.ReactElement {
   );
 }
 
-// The kit's <ConnectButton> is a state-aware *display* — it doesn't call
-// client.connect()/disconnect() itself; we wire the callbacks here.
-function ConnectControl(): React.ReactElement {
+// Speaker on/off. Master gate for TTS audio output.
+//
+// Default off on every fresh page load — silent until the user opts in.
+// That neatly avoids two annoyances:
+//
+//   1. Refresh mid-turn doesn't suddenly start narrating mid-sentence.
+//   2. When opencode is several steps ahead of TTS, hitting this button
+//      stops the queue immediately instead of waiting for it to drain.
+//
+// The state lives on the server (`OpencodeProcessor.tts_enabled`) so we
+// can drop TTSSpeakFrame and LLMTextFrame *before* synthesis runs — a
+// client-only mute would still pay the ElevenLabs bill. Toggle here
+// pushes a `set-tts` RTVI message; the server flips the flag on the
+// active processor. Component state, no localStorage — that's how we
+// get the "default off on reload" behavior.
+function SpeakerToggle(): React.ReactElement {
   const client = usePipecatClient();
+  const [enabled, setEnabled] = useState(false);
+  const handleToggle = useCallback(() => {
+    if (!client) return;
+    const next = !enabled;
+    setEnabled(next);
+    client.sendClientMessage('set-tts', { enabled: next });
+  }, [client, enabled]);
   return (
-    <ConnectButton
-      onConnect={() => {
-        if (!client) return;
-        void client.connect().catch((err: unknown) => {
-          console.error('connect failed', err);
-        });
-      }}
-      onDisconnect={() => {
-        if (!client) return;
-        void client.disconnect().catch(() => {
-          // Already disconnected — ignore.
-        });
-      }}
-    />
+    <button
+      type="button"
+      disabled={!client}
+      onClick={handleToggle}
+      title={enabled ? 'Speaker on — click to mute' : 'Speaker off — click to enable TTS'}
+      className={
+        enabled
+          ? 'rounded-md border border-emerald-700 bg-emerald-950 px-3 py-1.5 text-xs text-emerald-200 hover:border-emerald-500'
+          : 'rounded-md border border-neutral-700 px-3 py-1.5 text-xs text-neutral-400 hover:border-neutral-500'
+      }
+    >
+      speaker: {enabled ? 'on' : 'off'}
+    </button>
   );
 }
