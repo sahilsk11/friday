@@ -109,8 +109,18 @@ class ClaudeCodeSession:
             }
         if model is not None:
             opts.model = model.model_id
+
+        # cwd is *always* required — it's the lookup key for Claude Code's
+        # on-disk session store (~/.claude/projects/<encoded-cwd>/<id>.jsonl).
+        # Without it, ``resume`` fails with "No conversation found", and a
+        # fresh session lands under the wrong project dir.
         if self.directory is not None:
             opts.cwd = self.directory
+        # resume an existing session when we have its id, otherwise the
+        # SDK creates a fresh session and we capture the id from its first
+        # response.
+        if self.id:
+            opts.resume = self.id
 
         async def run_query():
             async for msg in query(prompt=text, options=opts):

@@ -67,8 +67,16 @@ class ModelsResponse(BaseModel):
 
 
 class CreateSessionBody(BaseModel):
+    """Body for ``POST /sessions``.
+
+    ``directory`` is required — it's the working directory tools resolve
+    paths against (opencode persists it server-side; claude-code uses it
+    as the lookup key for the on-disk session store). Treating it as
+    optional left a footgun where the backend defaulted to whatever cwd
+    its host process happened to be running in."""
+
+    directory: str
     title: str | None = None
-    directory: str | None = None
 
 
 class TurnBody(BaseModel):
@@ -141,17 +149,16 @@ async def list_sessions(
 
 @router.post("", response_model=SessionRow, status_code=201)
 async def create_session(body: CreateSessionBody, provider: ProviderDep) -> SessionRow:
-    if body.directory is not None:
-        # Validate up-front: tools resolve paths against this cwd, so a
-        # bogus directory means every tool call fails downstream with a
-        # confusing error. We share a filesystem with the backend (same
-        # process box), so a local stat is correct.
-        if not os.path.isabs(body.directory):
-            raise HTTPException(status_code=400, detail="directory must be an absolute path")
-        if not await asyncio.to_thread(os.path.isdir, body.directory):
-            raise HTTPException(
-                status_code=400, detail=f"directory does not exist: {body.directory}"
-            )
+    # Validate up-front: tools resolve paths against this cwd, so a bogus
+    # directory means every tool call fails downstream with a confusing
+    # error. We share a filesystem with the backend (same process box),
+    # so a local stat is correct.
+    if not os.path.isabs(body.directory):
+        raise HTTPException(status_code=400, detail="directory must be an absolute path")
+    if not await asyncio.to_thread(os.path.isdir, body.directory):
+        raise HTTPException(
+            status_code=400, detail=f"directory does not exist: {body.directory}"
+        )
     session = await provider.create_session(title=body.title, directory=body.directory)
     info = await provider.get_session(session.id)
     return SessionRow.from_info(info)

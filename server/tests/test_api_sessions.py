@@ -100,11 +100,12 @@ async def test_list_sessions_passes_directory_filter(
 
 
 async def test_create_session_posts_and_returns_metadata(
-    httpx_mock: HTTPXMock, client: httpx.AsyncClient
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient, tmp_path: Path
 ) -> None:
+    directory = str(tmp_path)
     httpx_mock.add_response(
         method="POST",
-        url=f"{OPENCODE_URL}/session",
+        url=f"{OPENCODE_URL}/session?directory={directory}",
         json={"id": "ses_new", "title": "fresh"},
     )
     httpx_mock.add_response(
@@ -112,13 +113,13 @@ async def test_create_session_posts_and_returns_metadata(
         json={
             "id": "ses_new",
             "title": "fresh",
-            "directory": "/x",
+            "directory": directory,
             "time": {"created": 1_700_000_000_000, "updated": 1_700_000_000_000},
         },
     )
 
     async with client:
-        resp = await client.post("/sessions", json={"title": "fresh"})
+        resp = await client.post("/sessions", json={"title": "fresh", "directory": directory})
 
     assert resp.status_code == 201
     assert resp.json()["id"] == "ses_new"
