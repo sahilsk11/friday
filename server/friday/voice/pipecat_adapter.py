@@ -48,7 +48,7 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from friday.core.ack_generator import generate_ack
 from friday.core.narration_policy import StreamingFilter
-from friday.core.opencode_session import ModelChoice, OpencodeSession
+from friday.core.opencode_session import SYSTEM_PROMPT_VOICE, ModelChoice, OpencodeSession
 from friday.core.state import AgentState
 from friday.core.tool_narrator import describe_tool
 
@@ -64,9 +64,15 @@ RTVI_AGENT_STATE = "agent-state"
 class OpencodeProcessor(FrameProcessor):
     """Pipecat FrameProcessor wrapping a single OpencodeSession."""
 
-    def __init__(self, session: OpencodeSession) -> None:
+    def __init__(
+        self, session: OpencodeSession, *, system_prompt: str = SYSTEM_PROMPT_VOICE
+    ) -> None:
         super().__init__()
         self._session = session
+        # Sent on every send_turn via opencode's per-turn ``system`` field.
+        # Per-turn is the only injection path opencode honors (create-time
+        # systemPrompt is silently dropped).
+        self._system_prompt = system_prompt
         # _acked: an ack has already been spoken (or pre-empted by real text)
         # for the current turn. Set when the ack TTS frame is pushed, or in
         # ``_on_delta`` to suppress a still-in-flight ack from talking over
@@ -128,7 +134,7 @@ class OpencodeProcessor(FrameProcessor):
             # subsequent turns until the user picks again.
             model = self.next_turn_model
             self.next_turn_model = None
-            await self._session.send_turn(frame.text, model=model)
+            await self._session.send_turn(frame.text, model=model, system=self._system_prompt)
             return
 
         await self.push_frame(frame, direction)

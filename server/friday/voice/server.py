@@ -66,7 +66,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 
-from friday.core.opencode_session import SYSTEM_PROMPT_VOICE, ModelChoice
+from friday.core.opencode_session import ModelChoice
 from friday.core.session_manager import SessionManager
 from friday.voice.pipecat_adapter import OpencodeProcessor
 
@@ -107,7 +107,7 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
         opencode_session = manager.attach(session_id)
         logger.info("voice: attached to opencode session | id={}", opencode_session.id)
     else:
-        opencode_session = await manager.create(system_prompt=SYSTEM_PROMPT_VOICE)
+        opencode_session = await manager.create()
         logger.info("voice: created new opencode session | id={}", opencode_session.id)
 
     transport = FastAPIWebsocketTransport(
