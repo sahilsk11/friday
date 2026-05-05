@@ -90,13 +90,10 @@ export default function VoiceRoom(): React.ReactElement {
       wsUrl: buildWsUrl(id),
       mediaManager: new WavMediaManager(undefined, 16_000),
     });
-    // Mic starts disabled. Each connected second of unmuted mic streams PCM
-    // to the server's STT (ElevenLabs/Deepgram), which bills by audio time
-    // — so leaving the mic hot during the 2-min narration window racks up
-    // spend on silence and risks the bot's TTS feeding back into STT. The
-    // RecordButton gates this: click to unmute (Start), click to commit +
-    // re-mute (Send). initDevices() still runs so the permission prompt
-    // fires up front; only the local track is muted.
+    // Mic starts disabled at construction time so initDevices() can fire
+    // the permission prompt without instantly streaming PCM. AutoEnableMicOnConnect
+    // flips it on once the transport is connected — clicking Connect should
+    // mean "I'm ready to talk," not "now click Start too."
     const pcClient = new PipecatClient({
       enableMic: false,
       enableCam: false,
@@ -168,16 +165,13 @@ function VoiceRoomShell({
             <ClientStatus />
           </div>
 
-          {/* Local mic visualizer — proves we're hearing you. */}
-          <div className="flex h-32 items-center justify-center rounded-xl border border-neutral-800 bg-black/40">
-            <VoiceVisualizer
-              participantType="local"
-              barColor="#10b981"
-              barCount={48}
-              barGap={2}
-              barWidth={4}
-            />
-          </div>
+          <AutoEnableMicOnConnect />
+
+          {/* Local mic visualizer — proves we're hearing you. Only rendered
+              while the mic is actually open; otherwise we showed a green
+              waveform that made it look like STT was running even when the
+              user hadn't started a turn yet. */}
+          <LocalMicVisualizer />
 
           {/* Bot visualizer — pulses while TTS plays. */}
           <div className="flex h-16 items-center justify-center rounded-xl border border-neutral-800 bg-black/40">
@@ -229,6 +223,43 @@ function VoiceRoomShell({
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+// Flips the mic on as soon as the transport reports Connected. Lives as
+// its own component so it can use usePipecatClientMicControl — that hook
+// only works inside <PipecatClientProvider>.
+function AutoEnableMicOnConnect(): null {
+  const { enableMic } = usePipecatClientMicControl();
+  const onConnected = useCallback(() => {
+    enableMic(true);
+  }, [enableMic]);
+  useRTVIClientEvent(RTVIEvent.Connected, onConnected);
+  return null;
+}
+
+// Renders the green local-audio waveform only while the mic is actually
+// open. When muted (idle, or after Send), shows a static "muted" tile so
+// it's obvious nothing is being streamed to STT.
+function LocalMicVisualizer(): React.ReactElement {
+  const { isMicEnabled } = usePipecatClientMicControl();
+  if (!isMicEnabled) {
+    return (
+      <div className="flex h-32 items-center justify-center rounded-xl border border-neutral-800 bg-black/40 text-xs text-neutral-500">
+        mic muted
+      </div>
+    );
+  }
+  return (
+    <div className="flex h-32 items-center justify-center rounded-xl border border-neutral-800 bg-black/40">
+      <VoiceVisualizer
+        participantType="local"
+        barColor="#10b981"
+        barCount={48}
+        barGap={2}
+        barWidth={4}
+      />
     </div>
   );
 }
