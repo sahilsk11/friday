@@ -5,7 +5,7 @@ import {
   usePipecatClient,
   usePipecatClientMicControl,
 } from '@pipecat-ai/client-react';
-import { ClientStatus, TranscriptOverlay, VoiceVisualizer } from '@pipecat-ai/voice-ui-kit';
+import { ClientStatus, VoiceVisualizer } from '@pipecat-ai/voice-ui-kit';
 import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
 import { useQuery } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -199,10 +199,16 @@ function VoiceRoomShell({
               the WS reasserts it on connect via OpencodeProcessor. */}
           <ThinkingIndicator initialThinking={initialAgentState === 'thinking'} />
 
-          {/* Live partial transcript — words appear as you speak. */}
-          <div className="min-h-[3rem] rounded-xl border border-neutral-800 bg-black/40 px-3 py-2 text-sm text-neutral-300">
-            <TranscriptOverlay participant="local" size="sm" />
-          </div>
+          {/* Live partial transcript — running text the server emits as
+              ElevenLabs commits each ~500ms-pause segment. Replaces (not
+              appends) on each message; the final lock-in for the activity
+              feed is a separate `user-transcript-final` message. */}
+          <RunningUserTranscript />
+          {/* Bot-side partial transcripts (live captions of the assistant's
+              spoken reply) would go here — the voice-ui-kit version pulled
+              both local and bot from the same component. We dropped local
+              for our own; bot side never showed reliably and isn't a
+              priority. Add back via a dedicated component if needed. */}
 
           {/* Single Start/Send toggle. Idle: mic muted, no STT spend. Click
               to open the mic and start streaming audio; click again to
@@ -246,6 +252,39 @@ function AutoEnableMicOnConnect(): null {
   }, [enableMic]);
   useRTVIClientEvent(RTVIEvent.Connected, onConnected);
   return null;
+}
+
+// Live running transcript — what we've heard so far this turn.
+//
+// Replaces (not appends) on each `user-transcript-running` server message
+// the TurnAccumulator emits per ElevenLabs commit. Clears on
+// `user-transcript-final` (turn ended, locked into the feed) and on a
+// fresh turn's first running message. This is intentionally simple state:
+// one string, one box.
+//
+// We rolled our own instead of voice-ui-kit's <TranscriptOverlay> because
+// that component listens to pipecat's built-in user-transcript RTVI event,
+// which we disabled on the server (the observer fans every commit out as
+// a separate "final=true" — see ActivityFeed and server.py for why).
+function RunningUserTranscript(): React.ReactElement {
+  const [text, setText] = useState('');
+  const onServerMessage = useCallback((raw: unknown) => {
+    const inner: unknown = (raw as { data?: unknown } | null)?.data ?? raw;
+    if (typeof inner !== 'object' || inner === null) return;
+    const t = (inner as { type?: unknown }).type;
+    if (t === 'user-transcript-running') {
+      const next = (inner as { text?: unknown }).text;
+      if (typeof next === 'string') setText(next);
+    } else if (t === 'user-transcript-final') {
+      setText('');
+    }
+  }, []);
+  useRTVIClientEvent(RTVIEvent.ServerMessage, onServerMessage);
+  return (
+    <div className="min-h-[3rem] rounded-xl border border-neutral-800 bg-black/40 px-3 py-2 text-sm text-neutral-300">
+      {text || <span className="text-neutral-600">…</span>}
+    </div>
+  );
 }
 
 // Renders the green local-audio waveform only while the mic is actually
