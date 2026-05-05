@@ -88,13 +88,19 @@ async def session() -> AsyncIterator[OpencodeSession]:
 _TEST_SYSTEM_PROMPT = "TEST_SYS_PROMPT"
 
 
-def _make_processor(session: OpencodeSession) -> tuple[OpencodeProcessor, list[Frame]]:
+def _make_processor(
+    session: OpencodeSession, *, tts_enabled: bool = True
+) -> tuple[OpencodeProcessor, list[Frame]]:
     """Build the processor and replace ``push_frame`` with a capture list.
 
     Returns the processor and a list that grows as frames are pushed.
+    Tests default to ``tts_enabled=True`` so existing TTS-emission cases
+    keep passing — production sets the flag from the client's speaker
+    toggle (off by default on a fresh page load).
     """
     pushed: list[Frame] = []
     proc = OpencodeProcessor(session, system_prompt=_TEST_SYSTEM_PROMPT)
+    proc.tts_enabled = tts_enabled
 
     async def capture(frame: Frame, _direction: FrameDirection = FrameDirection.DOWNSTREAM) -> None:
         pushed.append(frame)

@@ -113,6 +113,11 @@ class SessionDetail(BaseModel):
     session: SessionRow
     transcript: list[MessageRow]
     current_model: ModelRef | None
+    # Snapshot of the live agent state from the cached OpencodeSession —
+    # ``thinking`` if opencode is mid-turn right now, ``idle`` otherwise.
+    # Lets a freshly loaded page seed the thinking indicator without
+    # waiting for the next opencode transition over the WS.
+    agent_state: AgentState
 
 
 def get_manager(request: Request) -> SessionManager:
@@ -164,10 +169,15 @@ async def get_session(session_id: str, manager: ManagerDep) -> SessionDetail:
         (m.model for m in reversed(transcript) if m.role == "assistant" and m.model is not None),
         None,
     )
+    # ``agent_state`` is the live snapshot from the cached OpencodeSession,
+    # not historical. ``manager.attach`` is a cache lookup — same instance
+    # the voice pipeline observes, so the state is fresh.
+    session = manager.attach(session_id)
     return SessionDetail(
         session=SessionRow.from_info(info),
         transcript=[MessageRow.from_message(m) for m in transcript],
         current_model=ModelRef.from_choice(last_model) if last_model else None,
+        agent_state=session.current_state,
     )
 
 
