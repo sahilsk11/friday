@@ -78,8 +78,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 
-from friday.core.provider import ModelChoice
-from friday.core.session_manager import SessionManager
+from friday.core.provider import ModelChoice, Provider
 from friday.voice.elevenlabs_force_commit import ElevenLabsRealtimeSTTServiceForceCommit
 from friday.voice.pipecat_adapter import ProviderSessionProcessor
 from friday.voice.turn_accumulator import TurnAccumulator
@@ -87,14 +86,14 @@ from friday.voice.turn_accumulator import TurnAccumulator
 router = APIRouter(tags=["voice"])
 
 
-# We can't use the HTTP-flavored ``get_manager`` Depends from
+# We can't use the HTTP-flavored ``get_provider`` Depends from
 # ``friday.api.sessions`` here — FastAPI's WebSocket scope doesn't have a
 # ``Request`` to inject. Read straight off ``app.state`` instead.
-def _resolve_manager(websocket: WebSocket) -> SessionManager:
-    manager: SessionManager | None = getattr(websocket.app.state, "manager", None)
-    if manager is None:
-        raise RuntimeError("session manager not ready")
-    return manager
+def _resolve_provider(websocket: WebSocket) -> Provider:
+    provider: Provider | None = getattr(websocket.app.state, "provider", None)
+    if provider is None:
+        raise RuntimeError("provider not ready")
+    return provider
 
 
 # Sample rates match the @pipecat-ai/websocket-transport client defaults
@@ -114,15 +113,15 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     Returns when the client closes the WebSocket; pipecat's PipelineRunner
     tears down its pipeline and closes the underlying ``FastAPIWebsocketClient``.
     """
-    manager = _resolve_manager(websocket)
+    provider = _resolve_provider(websocket)
     await websocket.accept()
 
     if session_id:
-        session = manager.attach(session_id)
-        logger.info("voice: attached to opencode session | id={}", session.id)
+        session = provider.attach(session_id)
+        logger.info("voice: attached to provider session | id={}", session.id)
     else:
-        session = await manager.create()
-        logger.info("voice: created new opencode session | id={}", session.id)
+        session = await provider.create_session()
+        logger.info("voice: created new provider session | id={}", session.id)
 
     transport = FastAPIWebsocketTransport(
         websocket=websocket,

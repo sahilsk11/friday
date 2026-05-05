@@ -1,4 +1,4 @@
-"""SessionManager unit tests using pytest-httpx canned responses.
+"""OpencodeProvider persistence tests using pytest-httpx canned responses.
 
 A live integration test is provided via ``scripts/probe_session_manager.py``
 (run against a real opencode 1.14 server); the unit tests here pin the wire
@@ -14,7 +14,7 @@ import pytest
 from pytest_httpx import HTTPXMock
 
 from friday.core.opencode_provider import OpencodeProvider
-from friday.core.session_manager import Message, SessionInfo, SessionManager
+from friday.core.provider import Message, SessionInfo
 
 BASE_URL = "http://opencode.test"
 
@@ -36,13 +36,14 @@ def _row(
 
 
 @pytest.fixture
-def manager() -> SessionManager:
-    """SessionManager wired to a non-started OpencodeProvider (HTTP-only tests)."""
-    client = OpencodeProvider(BASE_URL)
-    return SessionManager(client)
+def provider() -> OpencodeProvider:
+    """Non-started OpencodeProvider for HTTP-only tests."""
+    return OpencodeProvider(BASE_URL)
 
 
-async def test_list_sessions_parses_rows(httpx_mock: HTTPXMock, manager: SessionManager) -> None:
+async def test_list_sessions_parses_rows(
+    httpx_mock: HTTPXMock, provider: OpencodeProvider
+) -> None:
     httpx_mock.add_response(
         url=f"{BASE_URL}/session",
         json=[
@@ -51,7 +52,7 @@ async def test_list_sessions_parses_rows(httpx_mock: HTTPXMock, manager: Session
         ],
     )
 
-    sessions = await manager.list_sessions()
+    sessions = await provider.list_sessions()
 
     assert sessions == [
         SessionInfo(
@@ -72,32 +73,34 @@ async def test_list_sessions_parses_rows(httpx_mock: HTTPXMock, manager: Session
 
 
 async def test_list_sessions_filters_by_directory(
-    httpx_mock: HTTPXMock, manager: SessionManager
+    httpx_mock: HTTPXMock, provider: OpencodeProvider
 ) -> None:
     httpx_mock.add_response(
         url=f"{BASE_URL}/session",
         json=[_row(sid="ses_a", directory="/keep"), _row(sid="ses_b", directory="/skip")],
     )
 
-    sessions = await manager.list_sessions(directory="/keep")
+    sessions = await provider.list_sessions(directory="/keep")
 
     assert [s.id for s in sessions] == ["ses_a"]
 
 
-async def test_get_returns_one_session(httpx_mock: HTTPXMock, manager: SessionManager) -> None:
+async def test_get_returns_one_session(
+    httpx_mock: HTTPXMock, provider: OpencodeProvider
+) -> None:
     httpx_mock.add_response(
         url=f"{BASE_URL}/session/ses_a",
         json=_row(sid="ses_a", title="probe"),
     )
 
-    info = await manager.get("ses_a")
+    info = await provider.get_session("ses_a")
 
     assert info.id == "ses_a"
     assert info.title == "probe"
 
 
 async def test_get_transcript_concatenates_text_parts(
-    httpx_mock: HTTPXMock, manager: SessionManager
+    httpx_mock: HTTPXMock, provider: OpencodeProvider
 ) -> None:
     httpx_mock.add_response(
         url=f"{BASE_URL}/session/ses_a/message",
@@ -122,7 +125,7 @@ async def test_get_transcript_concatenates_text_parts(
         ],
     )
 
-    transcript = await manager.get_transcript("ses_a")
+    transcript = await provider.get_transcript("ses_a")
 
     assert len(transcript) == 2
     assert transcript[0] == Message(
@@ -138,7 +141,7 @@ async def test_get_transcript_concatenates_text_parts(
 
 
 async def test_get_transcript_accepts_legacy_time_end(
-    httpx_mock: HTTPXMock, manager: SessionManager
+    httpx_mock: HTTPXMock, provider: OpencodeProvider
 ) -> None:
     httpx_mock.add_response(
         url=f"{BASE_URL}/session/ses_a/message",
@@ -150,13 +153,13 @@ async def test_get_transcript_accepts_legacy_time_end(
         ],
     )
 
-    transcript = await manager.get_transcript("ses_a")
+    transcript = await provider.get_transcript("ses_a")
 
     assert transcript[0].completed_at == datetime.fromtimestamp(5.0, tz=UTC)
 
 
 async def test_create_returns_session_with_id(
-    httpx_mock: HTTPXMock, manager: SessionManager
+    httpx_mock: HTTPXMock, provider: OpencodeProvider
 ) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -164,12 +167,12 @@ async def test_create_returns_session_with_id(
         json={"id": "ses_new", "title": "fresh"},
     )
 
-    session = await manager.create("fresh")
+    session = await provider.create_session("fresh")
 
     assert session.id == "ses_new"
 
 
-async def test_attach_returns_same_instance(manager: SessionManager) -> None:
-    a = manager.attach("ses_x")
-    b = manager.attach("ses_x")
+async def test_attach_returns_same_instance(provider: OpencodeProvider) -> None:
+    a = provider.attach("ses_x")
+    b = provider.attach("ses_x")
     assert a is b

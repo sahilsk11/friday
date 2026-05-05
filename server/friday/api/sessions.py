@@ -24,8 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from friday.core.provider import ModelChoice
-from friday.core.session_manager import Message, SessionInfo, SessionManager
+from friday.core.provider import Message, ModelChoice, Provider, SessionInfo
 from friday.core.state import AgentState
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -120,59 +119,59 @@ class SessionDetail(BaseModel):
     agent_state: AgentState
 
 
-def get_manager(request: Request) -> SessionManager:
-    """FastAPI dependency. Tests override this to inject a manager directly."""
-    manager: SessionManager | None = getattr(request.app.state, "manager", None)
-    if manager is None:
-        raise HTTPException(status_code=503, detail="session manager not ready")
-    return manager
+def get_provider(request: Request) -> Provider:
+    """FastAPI dependency. Tests override this to inject a provider directly."""
+    provider: Provider | None = getattr(request.app.state, "provider", None)
+    if provider is None:
+        raise HTTPException(status_code=503, detail="provider not ready")
+    return provider
 
 
-ManagerDep = Annotated[SessionManager, Depends(get_manager)]
+ProviderDep = Annotated[Provider, Depends(get_provider)]
 
 
 @router.get("", response_model=list[SessionRow])
 async def list_sessions(
-    manager: ManagerDep,
+    provider: ProviderDep,
     directory: str | None = None,
 ) -> list[SessionRow]:
-    sessions = await manager.list_sessions(directory=directory)
+    sessions = await provider.list_sessions(directory=directory)
     return [SessionRow.from_info(s) for s in sessions]
 
 
 @router.post("", response_model=SessionRow, status_code=201)
-async def create_session(body: CreateSessionBody, manager: ManagerDep) -> SessionRow:
+async def create_session(body: CreateSessionBody, provider: ProviderDep) -> SessionRow:
     if body.directory is not None:
-        # Validate up-front: opencode launches tools that resolve paths
-        # against this cwd, so a bogus directory means every tool call
-        # fails downstream with a confusing error. We share a filesystem
-        # with opencode (same process box), so a local stat is correct.
+        # Validate up-front: tools resolve paths against this cwd, so a
+        # bogus directory means every tool call fails downstream with a
+        # confusing error. We share a filesystem with the backend (same
+        # process box), so a local stat is correct.
         if not os.path.isabs(body.directory):
             raise HTTPException(status_code=400, detail="directory must be an absolute path")
         if not await asyncio.to_thread(os.path.isdir, body.directory):
             raise HTTPException(
                 status_code=400, detail=f"directory does not exist: {body.directory}"
             )
-    session = await manager.create(title=body.title, directory=body.directory)
-    info = await manager.get(session.id)
+    session = await provider.create_session(title=body.title, directory=body.directory)
+    info = await provider.get_session(session.id)
     return SessionRow.from_info(info)
 
 
 @router.get("/{session_id}", response_model=SessionDetail)
-async def get_session(session_id: str, manager: ManagerDep) -> SessionDetail:
-    info = await manager.get(session_id)
-    transcript = await manager.get_transcript(session_id)
-    # ``current_model`` reports what opencode actually ran most recently —
+async def get_session(session_id: str, provider: ProviderDep) -> SessionDetail:
+    info = await provider.get_session(session_id)
+    transcript = await provider.get_transcript(session_id)
+    # ``current_model`` reports what the backend actually ran most recently —
     # ground truth, not intent. The user's pending selection lives in client
     # state and rides along on the next turn body.
     last_model = next(
         (m.model for m in reversed(transcript) if m.role == "assistant" and m.model is not None),
         None,
     )
-    # ``agent_state`` is the live snapshot from the cached OpencodeSession,
-    # not historical. ``manager.attach`` is a cache lookup — same instance
+    # ``agent_state`` is the live snapshot from the cached provider session,
+    # not historical. ``provider.attach`` is a cache lookup — same instance
     # the voice pipeline observes, so the state is fresh.
-    session = manager.attach(session_id)
+    session = provider.attach(session_id)
     return SessionDetail(
         session=SessionRow.from_info(info),
         transcript=[MessageRow.from_message(m) for m in transcript],
@@ -182,8 +181,8 @@ async def get_session(session_id: str, manager: ManagerDep) -> SessionDetail:
 
 
 @router.post("/{session_id}/turn", status_code=202)
-async def post_turn(session_id: str, body: TurnBody, manager: ManagerDep) -> dict[str, str]:
-    session = manager.attach(session_id)
+async def post_turn(session_id: str, body: TurnBody, provider: ProviderDep) -> dict[str, str]:
+    session = provider.attach(session_id)
     await session.send_turn(body.text, model=body.model.to_choice() if body.model else None)
     return {"session_id": session_id}
 
@@ -191,9 +190,9 @@ async def post_turn(session_id: str, body: TurnBody, manager: ManagerDep) -> dic
 @router.get("/{session_id}/events")
 async def stream_events(
     session_id: str,
-    manager: ManagerDep,
+    provider: ProviderDep,
 ) -> StreamingResponse:
-    session = manager.attach(session_id)
+    session = provider.attach(session_id)
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=_SSE_QUEUE_LIMIT)
 
     async def on_delta(text: str) -> None:
@@ -216,43 +215,23 @@ async def stream_events(
 
 
 @models_router.get("/models", response_model=ModelsResponse)
-async def list_models(manager: ManagerDep) -> ModelsResponse:
-    """Proxy to opencode's ``GET /config/providers``, filtered to active +
-    toolcall-capable models (anything else won't drive the agent).
-
-    ``default`` is opencode's globally-configured default for whichever
-    provider it points at; the UI uses this as the modal's pre-selection.
-    """
-    resp = await manager.http.get("/config/providers")
-    resp.raise_for_status()
-    payload = resp.json()
-    providers = payload.get("providers") or []
-    out: list[ModelInfo] = []
-    for prov in providers:
-        provider_id = prov.get("id", "")
-        provider_name = prov.get("name", provider_id)
-        for model_id, model in (prov.get("models") or {}).items():
-            caps = model.get("capabilities") or {}
-            if model.get("status") != "active":
-                continue
-            if not caps.get("toolcall"):
-                continue
-            out.append(
-                ModelInfo(
-                    providerID=provider_id,
-                    providerName=provider_name,
-                    modelID=model_id,
-                    modelName=model.get("name", model_id),
-                )
+async def list_models(provider: ProviderDep) -> ModelsResponse:
+    """The model picker. Each provider returns its own catalog and default —
+    opencode proxies its ``/config/providers`` endpoint, claude-code returns
+    a static list (the SDK doesn't expose runtime model discovery)."""
+    catalog = await provider.list_models()
+    return ModelsResponse(
+        models=[
+            ModelInfo(
+                providerID=m.provider_id,
+                providerName=m.provider_name,
+                modelID=m.model_id,
+                modelName=m.model_name,
             )
-    # opencode's `default` is `{ providerID: modelID, ... }` — pick whichever
-    # provider it surfaces first as the global default.
-    default_map: dict[str, str] = payload.get("default") or {}
-    default: ModelRef | None = None
-    for provider_id, model_id in default_map.items():
-        default = ModelRef(providerID=provider_id, modelID=model_id)
-        break
-    return ModelsResponse(models=out, default=default)
+            for m in catalog.models
+        ],
+        default=ModelRef.from_choice(catalog.default) if catalog.default else None,
+    )
 
 
 async def _sse_stream(queue: asyncio.Queue[str]) -> AsyncIterator[bytes]:

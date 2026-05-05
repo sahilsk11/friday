@@ -13,7 +13,6 @@ plumbing.
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncIterator
 
 import httpx
@@ -37,7 +36,7 @@ from friday.core.events import (
     MessageUpdated,
     SessionStatus,
 )
-from friday.core.opencode_provider import ModelChoice, OpencodeProvider, OpencodeSession
+from friday.core.opencode_provider import OpencodeProvider, OpencodeSession
 from friday.voice.pipecat_adapter import (
     RTVI_AGENT_STATE,
     RTVI_ASSISTANT_TEXT_DELTA,
@@ -80,7 +79,7 @@ SESSION_ID = "ses_a"
 async def session() -> AsyncIterator[OpencodeSession]:
     """A real OpencodeSession bound to a non-started client (no SSE loop)."""
     client = OpencodeProvider(OPENCODE_URL)
-    yield client.session(SESSION_ID)
+    yield client.attach(SESSION_ID)
     await client.aclose()
 
 

@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any, Self
 
 import httpx
@@ -40,7 +41,11 @@ from friday.core.events import (
     parse_event,
 )
 from friday.core.provider import (
+    Message,
+    ModelCatalog,
     ModelChoice,
+    ModelInfo,
+    SessionInfo,
     StateHandler,
     TextDeltaHandler,
     TextFinalHandler,
@@ -99,11 +104,6 @@ class OpencodeProvider:
         """Provider identifier — opencode."""
         return "opencode"
 
-    @property
-    def http(self) -> httpx.AsyncClient:
-        """Shared HTTP client. SessionManager and other layers use this for typed calls."""
-        return self._http
-
     async def __aenter__(self) -> Self:
         await self.start()
         return self
@@ -127,14 +127,9 @@ class OpencodeProvider:
             self._sse_task = None
         await self._http.aclose()
 
-    # ── HTTP API ────────────────────────────────────────────────────────────
+    # ── Live sessions ──────────────────────────────────────────────────
 
-    async def create_session(self, title: str | None = None) -> OpencodeSession:
-        """Provider-protocol method. Use :meth:`new_session` for the
-        opencode-specific ``directory`` knob."""
-        return await self.new_session(title)
-
-    async def new_session(
+    async def create_session(
         self,
         title: str | None = None,
         *,
@@ -152,9 +147,9 @@ class OpencodeProvider:
         resp = await self._http.post("/session", json=body, params=params)
         resp.raise_for_status()
         session_id: str = resp.json()["id"]
-        return self.session(session_id)
+        return self.attach(session_id)
 
-    def session(self, session_id: str) -> OpencodeSession:
+    def attach(self, session_id: str) -> OpencodeSession:
         existing = self._sessions.get(session_id)
         if existing is not None:
             return existing
@@ -162,10 +157,60 @@ class OpencodeProvider:
         self._sessions[session_id] = session
         return session
 
-    async def list_sessions(self) -> list[dict[str, Any]]:
+    # ── Persistence ────────────────────────────────────────────────────
+
+    async def list_sessions(self, *, directory: str | None = None) -> list[SessionInfo]:
         resp = await self._http.get("/session")
         resp.raise_for_status()
-        return resp.json()
+        rows: list[dict[str, Any]] = resp.json()
+        sessions = [_parse_session_info(row) for row in rows]
+        if directory is not None:
+            sessions = [s for s in sessions if s.directory == directory]
+        return sessions
+
+    async def get_session(self, session_id: str) -> SessionInfo:
+        resp = await self._http.get(f"/session/{session_id}")
+        resp.raise_for_status()
+        return _parse_session_info(resp.json())
+
+    async def get_transcript(self, session_id: str) -> list[Message]:
+        resp = await self._http.get(f"/session/{session_id}/message")
+        resp.raise_for_status()
+        rows: list[dict[str, Any]] = resp.json()
+        return [_parse_message(row) for row in rows]
+
+    async def list_models(self) -> ModelCatalog:
+        """Proxy ``GET /config/providers`` filtered to active + toolcall-capable
+        models. ``default`` is whichever provider opencode surfaces first in
+        its global default map."""
+        resp = await self._http.get("/config/providers")
+        resp.raise_for_status()
+        payload = resp.json()
+        providers = payload.get("providers") or []
+        models: list[ModelInfo] = []
+        for prov in providers:
+            provider_id = prov.get("id", "")
+            provider_name = prov.get("name", provider_id)
+            for model_id, model in (prov.get("models") or {}).items():
+                caps = model.get("capabilities") or {}
+                if model.get("status") != "active":
+                    continue
+                if not caps.get("toolcall"):
+                    continue
+                models.append(
+                    ModelInfo(
+                        provider_id=provider_id,
+                        provider_name=provider_name,
+                        model_id=model_id,
+                        model_name=model.get("name", model_id),
+                    )
+                )
+        default_map: dict[str, str] = payload.get("default") or {}
+        default: ModelChoice | None = None
+        for provider_id, model_id in default_map.items():
+            default = ModelChoice(provider_id=provider_id, model_id=model_id)
+            break
+        return ModelCatalog(models=models, default=default)
 
     # ── SSE loop ────────────────────────────────────────────────────────────
 
@@ -276,7 +321,7 @@ class OpencodeSession:
     ) -> None:
         body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
         if model is not None:
-            body["model"] = model.to_wire()
+            body["model"] = {"providerID": model.provider_id, "modelID": model.model_id}
         if system is not None:
             body["system"] = system
         resp = await self._http.post(f"/session/{self.id}/prompt_async", json=body)
@@ -358,3 +403,46 @@ class OpencodeSession:
 
 def _state_from_status(status: str) -> AgentState:
     return AgentState.THINKING if status == "busy" else AgentState.IDLE
+
+
+# ── Wire shape parsers ──────────────────────────────────────────────────────
+#
+# Pinned by ``scripts/probe_session_manager.py`` against a real opencode 1.14
+# server; if opencode bumps the schema, the probe is the canary.
+
+
+def _parse_session_info(row: dict[str, Any]) -> SessionInfo:
+    time = row.get("time") or {}
+    return SessionInfo(
+        id=row["id"],
+        title=row.get("title", ""),
+        directory=row.get("directory", ""),
+        created_at=_ms_to_datetime(time.get("created", 0)),
+        updated_at=_ms_to_datetime(time.get("updated", time.get("created", 0))),
+    )
+
+
+def _parse_message(row: dict[str, Any]) -> Message:
+    info = row.get("info") or {}
+    parts: list[dict[str, Any]] = row.get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+    time = info.get("time") or {}
+    completed_ms = time.get("completed") or time.get("end")
+    model_id = info.get("modelID")
+    provider_id = info.get("providerID")
+    model = (
+        ModelChoice(provider_id=provider_id, model_id=model_id)
+        if model_id and provider_id
+        else None
+    )
+    return Message(
+        role=info.get("role", ""),
+        text=text,
+        completed_at=_ms_to_datetime(completed_ms) if completed_ms else None,
+        parts=parts,
+        model=model,
+    )
+
+
+def _ms_to_datetime(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000.0, tz=UTC)

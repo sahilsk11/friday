@@ -11,6 +11,11 @@ import contextlib
 from dataclasses import dataclass, field
 from typing import Any
 
+import json
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -18,12 +23,20 @@ from claude_agent_sdk import (
     StreamEvent,
     SystemMessage,
     ToolUseBlock,
+    get_session_info,
+    get_session_messages,
+    list_sessions,
+    project_key_for_directory,
     query,
 )
 from loguru import logger
 
 from friday.core.provider import (
+    Message,
+    ModelCatalog,
     ModelChoice,
+    ModelInfo,
+    SessionInfo,
     StateHandler,
     TextDeltaHandler,
     TextFinalHandler,
@@ -51,6 +64,7 @@ class ClaudeCodeSession:
 
     id: str = ""
     title: str | None = None
+    directory: str | None = None
     current_state: AgentState = AgentState.IDLE
 
     _delta_handlers: list[TextDeltaHandler] = field(default_factory=list, repr=False)
@@ -99,6 +113,8 @@ class ClaudeCodeSession:
             }
         if model is not None:
             opts.model = model.model_id
+        if self.directory is not None:
+            opts.cwd = self.directory
 
         async def run_query():
             async for msg in query(prompt=text, options=opts):
@@ -172,15 +188,190 @@ class ClaudeCodeSession:
             await handler(state)
 
 
+# Static model catalog. Claude Code's SDK doesn't expose a runtime model
+# listing, and the server-side defaults move when Anthropic ships new models —
+# bumping this constant is the right place to track that. Names match the
+# strings the SDK records on assistant messages (msg.message["model"]).
+_CLAUDE_MODELS: list[ModelInfo] = [
+    ModelInfo(
+        provider_id="anthropic",
+        provider_name="Anthropic",
+        model_id="claude-opus-4-7",
+        model_name="Claude Opus 4.7",
+    ),
+    ModelInfo(
+        provider_id="anthropic",
+        provider_name="Anthropic",
+        model_id="claude-sonnet-4-6",
+        model_name="Claude Sonnet 4.6",
+    ),
+    ModelInfo(
+        provider_id="anthropic",
+        provider_name="Anthropic",
+        model_id="claude-haiku-4-5",
+        model_name="Claude Haiku 4.5",
+    ),
+]
+_CLAUDE_DEFAULT_MODEL = ModelChoice(provider_id="anthropic", model_id="claude-sonnet-4-6")
+
+
 class ClaudeCodeProvider:
-    """Provider implementation wrapping Claude Agent SDK."""
+    """Provider implementation wrapping Claude Agent SDK.
+
+    Persistence is backed by Claude Code's on-disk JSONL store at
+    ``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl``. The SDK's
+    sync helpers (``list_sessions`` / ``get_session_info`` /
+    ``get_session_messages``) handle reads; we wrap them in
+    ``asyncio.to_thread`` so the async API surface stays clean."""
+
+    def __init__(self) -> None:
+        # Cache live sessions so repeat ``attach`` returns the same instance —
+        # matches OpencodeProvider semantics so observers can compose.
+        self._sessions: dict[str, ClaudeCodeSession] = {}
 
     @property
     def provider_id(self) -> str:
         return "claude-code"
 
-    async def create_session(self, title: str | None = None) -> ClaudeCodeSession:
-        return ClaudeCodeSession(_http=None, title=title)
+    # ── Live sessions ──────────────────────────────────────────────────
+
+    async def create_session(
+        self,
+        title: str | None = None,
+        *,
+        directory: str | None = None,
+    ) -> ClaudeCodeSession:
+        # No real "create" call — Claude Code spawns the session id on the
+        # first SDK query. We materialize a wrapper now and let the id land
+        # when send_turn fires its first message.
+        session = ClaudeCodeSession(_http=None, title=title, directory=directory)
+        return session
+
+    def attach(self, session_id: str) -> ClaudeCodeSession:
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            return existing
+        session = ClaudeCodeSession(_http=None, id=session_id)
+        self._sessions[session_id] = session
+        return session
+
+    # ── Persistence ────────────────────────────────────────────────────
+
+    async def list_sessions(self, *, directory: str | None = None) -> list[SessionInfo]:
+        rows = await asyncio.to_thread(list_sessions, directory=directory)
+        return [_session_info_from_sdk(row) for row in rows]
+
+    async def get_session(self, session_id: str) -> SessionInfo:
+        info = await asyncio.to_thread(get_session_info, session_id)
+        if info is None:
+            raise LookupError(f"claude-code session not found: {session_id}")
+        return _session_info_from_sdk(info)
+
+    async def get_transcript(self, session_id: str) -> list[Message]:
+        # Two reads: SDK gives us message structure (parsed, sidechain
+        # filtered); the raw JSONL gives us per-message timestamps the SDK
+        # strips. Join on uuid.
+        sdk_msgs, ts_by_uuid = await asyncio.to_thread(
+            _read_transcript_with_timestamps, session_id
+        )
+        return [_message_from_sdk(m, ts_by_uuid) for m in sdk_msgs]
+
+    async def list_models(self) -> ModelCatalog:
+        return ModelCatalog(models=list(_CLAUDE_MODELS), default=_CLAUDE_DEFAULT_MODEL)
+
+    # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def aclose(self) -> None:
-        pass
+        # Cancel any in-flight live sessions so background query() tasks
+        # stop pushing events into torn-down handlers.
+        for session in list(self._sessions.values()):
+            await session.cancel()
+        self._sessions.clear()
+
+
+def _session_info_from_sdk(row: object) -> SessionInfo:
+    """SDKSessionInfo → our domain SessionInfo."""
+    return SessionInfo(
+        id=getattr(row, "session_id", ""),
+        # custom_title takes precedence; fall back to the auto summary.
+        title=getattr(row, "custom_title", None) or getattr(row, "summary", "") or "",
+        directory=getattr(row, "cwd", None) or "",
+        created_at=_ms_to_datetime(getattr(row, "created_at", None) or 0),
+        updated_at=_ms_to_datetime(getattr(row, "last_modified", None) or 0),
+    )
+
+
+def _read_transcript_with_timestamps(
+    session_id: str,
+) -> tuple[Sequence[object], dict[str, datetime]]:
+    """Synchronous helper that pulls SDK messages and the matching JSONL
+    timestamps. Returned untyped (the SDK doesn't export ``SessionMessage``
+    as a public stable type) — the caller projects them into ``Message``."""
+    info = get_session_info(session_id)
+    if info is None:
+        raise LookupError(f"claude-code session not found: {session_id}")
+    sdk_msgs = get_session_messages(session_id)
+    ts_by_uuid: dict[str, datetime] = {}
+    cwd = getattr(info, "cwd", None)
+    if cwd:
+        jsonl_path = Path.home() / ".claude" / "projects" / project_key_for_directory(cwd) / (
+            f"{session_id}.jsonl"
+        )
+        if jsonl_path.is_file():
+            with jsonl_path.open() as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    uid = entry.get("uuid")
+                    ts = entry.get("timestamp")
+                    if uid and ts:
+                        try:
+                            ts_by_uuid[uid] = datetime.fromisoformat(
+                                ts.replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            continue
+    return sdk_msgs, ts_by_uuid
+
+
+def _message_from_sdk(msg: object, ts_by_uuid: dict[str, datetime]) -> Message:
+    """SessionMessage → our domain Message.
+
+    The SDK stores the raw Anthropic API message at ``msg.message`` (a dict
+    with ``content``, ``model``, ``role``, …). We flatten the content
+    blocks for ``text`` and ``parts``, and lift ``model`` onto our
+    ModelChoice for assistant turns."""
+    role = getattr(msg, "type", "")
+    raw = getattr(msg, "message", None) or {}
+    content = raw.get("content") if isinstance(raw, dict) else None
+    parts: list[dict[str, object]] = []
+    text_chunks: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            parts.append(block)
+            if block.get("type") == "text":
+                text_chunks.append(str(block.get("text", "")))
+    elif isinstance(content, str):
+        # User messages can be a bare string in the JSONL.
+        text_chunks.append(content)
+        parts.append({"type": "text", "text": content})
+    model: ModelChoice | None = None
+    if role == "assistant" and isinstance(raw, dict):
+        model_id = raw.get("model")
+        if isinstance(model_id, str):
+            model = ModelChoice(provider_id="anthropic", model_id=model_id)
+    return Message(
+        role=role,
+        text="".join(text_chunks),
+        completed_at=ts_by_uuid.get(getattr(msg, "uuid", "")),
+        parts=parts,
+        model=model,
+    )
+
+
+def _ms_to_datetime(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000.0, tz=UTC)

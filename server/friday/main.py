@@ -1,9 +1,10 @@
 """FastAPI app composition.
 
-Owns the ``OpencodeProvider`` lifecycle and a process-wide ``SessionManager``,
-mounts the framework-neutral session API, the WebSocket voice router, and
-(when ``web/dist`` is built) the SPA bundle so a single uvicorn process
-serves both the API and the frontend on one port.
+Owns the ``Provider`` lifecycle, mounts the framework-neutral session API,
+the WebSocket voice router, and (when ``web/dist`` is built) the SPA bundle
+so a single uvicorn process serves both the API and the frontend on one
+port. Today the provider is always opencode; the choice is one env-flip
+away when a second backend is wired in.
 
 CORS: allows ``localhost``/``127.0.0.1`` on common Vite/Next dev ports so a
 frontend dev server (default Vite is :5173) can hit the API directly. In
@@ -31,7 +32,6 @@ from fastapi.staticfiles import StaticFiles
 
 from friday.api.sessions import models_router, router as sessions_router
 from friday.core.opencode_provider import OpencodeProvider
-from friday.core.session_manager import SessionManager
 from friday.voice.server import router as voice_router
 from friday.voice.server import shutdown as voice_shutdown
 
@@ -48,12 +48,11 @@ WEB_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
 
 @asynccontextmanager
 async def default_lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    """Start the OpencodeProvider (HTTP + SSE) and expose a SessionManager."""
+    """Start the OpencodeProvider (HTTP + SSE) and expose it on app.state."""
     base_url = os.environ.get("OPENCODE_BASE_URL", DEFAULT_OPENCODE_BASE_URL)
     provider = OpencodeProvider(base_url)
     await provider.start()
     app.state.provider = provider
-    app.state.manager = SessionManager(provider)
     try:
         yield
     finally:
@@ -70,7 +69,7 @@ def _resolve_cors_origins() -> list[str]:
 
 def create_app(*, with_lifespan: bool = True) -> FastAPI:
     """Build the FastAPI app. Tests pass ``with_lifespan=False`` and inject
-    a ``SessionManager`` via ``app.dependency_overrides[get_manager]``.
+    a ``Provider`` via ``app.dependency_overrides[get_provider]``.
     """
     app = FastAPI(title="friday", lifespan=default_lifespan if with_lifespan else None)
     app.add_middleware(
