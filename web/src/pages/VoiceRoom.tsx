@@ -1,6 +1,7 @@
-import { PipecatClient } from '@pipecat-ai/client-js';
+import { PipecatClient, RTVIEvent } from '@pipecat-ai/client-js';
 import {
   PipecatClientProvider,
+  useRTVIClientEvent,
   usePipecatClient,
   usePipecatClientMicControl,
 } from '@pipecat-ai/client-react';
@@ -12,7 +13,7 @@ import {
 } from '@pipecat-ai/voice-ui-kit';
 import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
 import { useQuery } from '@tanstack/react-query';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router';
 
 import { ActivityFeed } from '@/components/ActivityFeed';
@@ -89,8 +90,15 @@ export default function VoiceRoom(): React.ReactElement {
       wsUrl: buildWsUrl(id),
       mediaManager: new WavMediaManager(undefined, 16_000),
     });
+    // Mic starts disabled. Each connected second of unmuted mic streams PCM
+    // to the server's STT (ElevenLabs/Deepgram), which bills by audio time
+    // — so leaving the mic hot during the 2-min narration window racks up
+    // spend on silence and risks the bot's TTS feeding back into STT. The
+    // RecordButton gates this: click to unmute (Start), click to commit +
+    // re-mute (Send). initDevices() still runs so the permission prompt
+    // fires up front; only the local track is muted.
     const pcClient = new PipecatClient({
-      enableMic: true,
+      enableMic: false,
       enableCam: false,
       transport,
     });
@@ -193,20 +201,20 @@ function VoiceRoomShell({
             <TranscriptOverlay participant="local" size="sm" />
           </div>
 
-          {/* Tap-to-end-turn. ElevenLabs realtime STT is in MANUAL commit
-              mode (see TRANSPORT.md) — it only finalizes a transcript when
-              we explicitly say so. Without this button, you'd talk forever
-              and the agent would never get a turn. We don't currently have
-              hands-free auto-end-of-turn detection. */}
-          <SendTurnButton />
+          {/* Single Start/Send toggle. Idle: mic muted, no STT spend. Click
+              to open the mic and start streaming audio; click again to
+              commit the transcript and re-mute. Spacebar (when not focused
+              in an input) toggles the same action. ElevenLabs realtime STT
+              is in MANUAL commit mode — Send is what actually finalizes
+              the transcript. */}
+          <RecordButton />
           {/* Manual barge-in. Stops TTS mid-sentence and aborts the in-flight
-              opencode turn. Send and Interrupt are independent — interrupt
-              just shuts the bot up; you tap Send when you've got a new turn
-              ready. No VAD yet, so this is the only way to barge in. */}
+              opencode turn without opening the mic. RecordButton already
+              interrupts when started mid-narration, so this is for "shut
+              up but I'm not ready to talk yet." */}
           <InterruptButton />
 
-          <div className="mt-auto flex items-center justify-between gap-3">
-            <MicToggle />
+          <div className="mt-auto flex items-center justify-end gap-3">
             <ConnectControl />
           </div>
         </section>
@@ -225,29 +233,97 @@ function VoiceRoomShell({
   );
 }
 
-// "Send" button — tells the server we're done speaking, force-commits the
-// in-progress transcript on the ElevenLabs side. Server-side handler
-// pushes a synthetic VADUserStoppedSpeakingFrame upstream. We piggyback
-// the user's current model selection onto the message so the server can
-// stamp it on the next finalized transcription before forwarding to
-// opencode. Disabled while disconnected.
-function SendTurnButton(): React.ReactElement {
+// Tracks whether opencode is mid-turn, by listening for the same
+// `agent-state` RTVI message ThinkingIndicator consumes. Used to decide
+// whether RecordButton needs to fire `interrupt` before unmuting.
+function useAgentBusy(): boolean {
+  const [busy, setBusy] = useState(false);
+  const onServerMessage = useCallback((raw: unknown) => {
+    const inner: unknown = (raw as { data?: unknown } | null)?.data ?? raw;
+    if (
+      typeof inner !== 'object' ||
+      inner === null ||
+      (inner as { type?: unknown }).type !== 'agent-state'
+    ) {
+      return;
+    }
+    const state = (inner as { state?: unknown }).state;
+    if (typeof state !== 'string') return;
+    setBusy(state === 'thinking');
+  }, []);
+  useRTVIClientEvent(RTVIEvent.ServerMessage, onServerMessage);
+  return busy;
+}
+
+// Single primary action: Start (idle) ⇄ Send (recording).
+//
+// - Start: unmutes the local mic so audio frames flow to the server STT.
+//   If the agent is currently narrating, also fires `interrupt` first so
+//   the user can barge in cleanly; this matches what the Interrupt button
+//   does, but folded into the same action.
+// - Send: fires `end-turn` (force-commits the in-progress transcript on
+//   ElevenLabs) and re-mutes the mic so we stop spending on audio while
+//   the agent works. Piggybacks the model + narrate-tools toggle so the
+//   server can stamp them on the next finalized transcription.
+//
+// Spacebar is wired here too: pressing space anywhere outside text inputs
+// or focused buttons toggles Start/Send. Buttons keep their own native
+// space-to-activate so the global handler skips them and we don't fire
+// the toggle twice.
+function RecordButton(): React.ReactElement {
   const client = usePipecatClient();
+  const { enableMic, isMicEnabled } = usePipecatClientMicControl();
   const { model } = useSelectedModel();
   const { narrateTools } = useNarrateTools();
+  const agentBusy = useAgentBusy();
+
+  const handleToggle = useCallback(() => {
+    if (!client) return;
+    if (isMicEnabled) {
+      const payload: { model?: ModelRef; narrateTools: boolean } = { narrateTools };
+      if (model) payload.model = model;
+      client.sendClientMessage('end-turn', payload);
+      enableMic(false);
+    } else {
+      if (agentBusy) client.sendClientMessage('interrupt');
+      enableMic(true);
+    }
+  }, [client, isMicEnabled, enableMic, model, narrateTools, agentBusy]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || e.repeat) return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        // Buttons get native space-to-activate; let them handle it so we
+        // don't double-fire. Inputs/textareas/contenteditable need space
+        // for actual typing.
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON') return;
+        if (target.isContentEditable) return;
+      }
+      e.preventDefault();
+      handleToggle();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [handleToggle]);
+
+  const recording = isMicEnabled;
   return (
     <button
       type="button"
       disabled={!client}
-      onClick={() => {
-        if (!client) return;
-        const payload: { model?: ModelRef; narrateTools: boolean } = { narrateTools };
-        if (model) payload.model = model;
-        client.sendClientMessage('end-turn', payload);
-      }}
-      className="rounded-md bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+      onClick={handleToggle}
+      className={
+        recording
+          ? 'rounded-md bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50'
+          : 'rounded-md bg-neutral-800 px-4 py-3 text-sm font-medium text-neutral-100 hover:bg-neutral-700 disabled:opacity-50'
+      }
     >
-      Send turn ⏎
+      {recording ? 'Send (space)' : 'Start (space)'}
     </button>
   );
 }
@@ -296,24 +372,6 @@ function InterruptButton(): React.ReactElement {
       className="rounded-md border border-red-700 bg-red-950 px-4 py-2 text-sm font-medium text-red-200 hover:bg-red-900 disabled:opacity-50"
     >
       Interrupt
-    </button>
-  );
-}
-
-// Hand-rolled mic toggle. The kit's <UserAudioControl> reads
-// `client.selectedCam` via usePipecatClientMediaDevices, which throws on
-// WebSocketTransport. usePipecatClientMicControl is the camera-free hook.
-function MicToggle(): React.ReactElement {
-  const { enableMic, isMicEnabled } = usePipecatClientMicControl();
-  return (
-    <button
-      type="button"
-      onClick={() => {
-        enableMic(!isMicEnabled);
-      }}
-      className="rounded-md border border-neutral-700 px-3 py-2 text-sm hover:border-neutral-500"
-    >
-      {isMicEnabled ? 'mute mic' : 'unmute mic'}
     </button>
   );
 }
