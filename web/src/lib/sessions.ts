@@ -9,15 +9,10 @@ export function listSessions(directory?: string): Promise<SessionRow[]> {
   return apiClient.get<SessionRow[]>(`/sessions${qs}`);
 }
 
-export function createSession(
-  title?: string,
-  directory?: string,
-  model?: ModelRef,
-): Promise<SessionRow> {
-  const body: { title?: string; directory?: string; model?: ModelRef } = {};
+export function createSession(title?: string, directory?: string): Promise<SessionRow> {
+  const body: { title?: string; directory?: string } = {};
   if (title) body.title = title;
   if (directory) body.directory = directory;
-  if (model) body.model = model;
   return apiClient.post<SessionRow>('/sessions', body);
 }
 

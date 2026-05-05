@@ -91,18 +91,9 @@ class SessionManager:
         system_prompt: str | None = None,
         *,
         directory: str | None = None,
-        model: ModelChoice | None = None,
     ) -> OpencodeSession:
-        """Create a new session and return its live wrapper.
-
-        ``model``, if given, is parked on the live session as ``next_model``
-        and consumed by the first ``send_turn``. After that, opencode itself
-        is source of truth via ``info.modelID`` on each assistant message.
-        """
-        session = await self._client.new_session(title, system_prompt, directory=directory)
-        if model is not None:
-            session.next_model = model
-        return session
+        """Create a new session and return its live wrapper."""
+        return await self._client.new_session(title, system_prompt, directory=directory)
 
     def attach(self, session_id: str) -> OpencodeSession:
         """Return a live wrapper for an existing session (cached)."""

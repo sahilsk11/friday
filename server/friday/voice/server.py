@@ -66,8 +66,8 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 
+from friday.core.opencode_session import SYSTEM_PROMPT_VOICE, ModelChoice
 from friday.core.session_manager import SessionManager
-from friday.core.opencode_session import SYSTEM_PROMPT_VOICE
 from friday.voice.pipecat_adapter import OpencodeProcessor
 
 router = APIRouter(tags=["voice"])
@@ -153,7 +153,16 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     # ``vad_silence_threshold_secs``.
     async def _on_client_message(processor: RTVIProcessor, msg: ClientMessage) -> None:
         if msg.type == "end-turn":
-            logger.info("voice: end-turn received | session={}", opencode_session.id)
+            # Optional ``model`` rides along on end-turn — we stamp it on the
+            # OpencodeProcessor so the next finalized transcription forwards
+            # it to opencode. No server-side stickiness; the client owns the
+            # selection and re-sends it whenever it changes.
+            opencode.next_turn_model = _parse_model(msg.data)
+            logger.info(
+                "voice: end-turn received | session={} model={}",
+                opencode_session.id,
+                opencode.next_turn_model,
+            )
             await processor.push_frame(VADUserStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
         elif msg.type == "interrupt":
             # User tapped the Interrupt button. Push InterruptionTaskFrame
@@ -194,6 +203,22 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
         await runner.run(task)
     except Exception:
         logger.exception("voice: pipeline run failed | session={}", opencode_session.id)
+
+
+def _parse_model(data: object) -> ModelChoice | None:
+    """Pull a ``{providerID, modelID}`` pair out of an RTVI client-message
+    payload. Defensive — the field is optional and the wire is JSON, so
+    anything unexpected just returns ``None``."""
+    if not isinstance(data, dict):
+        return None
+    model = data.get("model")
+    if not isinstance(model, dict):
+        return None
+    provider_id = model.get("providerID")
+    model_id = model.get("modelID")
+    if isinstance(provider_id, str) and isinstance(model_id, str):
+        return ModelChoice(provider_id=provider_id, model_id=model_id)
+    return None
 
 
 async def shutdown() -> None:

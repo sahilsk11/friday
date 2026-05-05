@@ -48,7 +48,7 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from friday.core.ack_generator import generate_ack
 from friday.core.narration_policy import StreamingFilter
-from friday.core.opencode_session import OpencodeSession
+from friday.core.opencode_session import ModelChoice, OpencodeSession
 from friday.core.state import AgentState
 from friday.core.tool_narrator import describe_tool
 
@@ -86,6 +86,10 @@ class OpencodeProcessor(FrameProcessor):
         # Current in-flight ack task. Cancelled on a fresh transcription so
         # an ack from a stale turn can't speak over the new one.
         self._ack_task: asyncio.Task[None] | None = None
+        # Model the WS handler stamped from the most recent ``end-turn``
+        # client message. Consumed (and cleared) by the next finalized
+        # transcription. ``None`` means "let opencode use its default."
+        self.next_turn_model: ModelChoice | None = None
 
         session.on_text_delta(self._on_delta)
         session.on_text_final(self._on_final)
@@ -114,7 +118,12 @@ class OpencodeProcessor(FrameProcessor):
             self._ack_task = asyncio.create_task(self._generate_and_speak_ack(frame.text))
             self._bg_tasks.add(self._ack_task)
             self._ack_task.add_done_callback(self._bg_tasks.discard)
-            await self._session.send_turn(frame.text)
+            # Consume the model the WS handler stamped from end-turn (if any)
+            # — opencode's per-session stickiness then carries it across
+            # subsequent turns until the user picks again.
+            model = self.next_turn_model
+            self.next_turn_model = None
+            await self._session.send_turn(frame.text, model=model)
             return
 
         await self.push_frame(frame, direction)
@@ -208,11 +217,15 @@ class OpencodeProcessor(FrameProcessor):
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
         task.add_done_callback(
-            lambda t: logger.error(
-                "opencode_processor: narrate_tool failed | tool={} err={}", tool_name, t.exception()
+            lambda t: (
+                logger.error(
+                    "opencode_processor: narrate_tool failed | tool={} err={}",
+                    tool_name,
+                    t.exception(),
+                )
+                if not t.cancelled() and t.exception()
+                else None
             )
-            if not t.cancelled() and t.exception()
-            else None
         )
 
     async def _narrate_tool(self, tool_name: str, tool_input: dict[str, Any]) -> None:
