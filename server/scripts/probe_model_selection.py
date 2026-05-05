@@ -19,7 +19,7 @@ import asyncio
 import os
 import sys
 
-from friday.core.opencode_session import ModelChoice, OpencodeClient
+from friday.core.opencode_provider import ModelChoice, OpencodeProvider
 from friday.core.session_manager import SessionManager
 from friday.core.state import AgentState
 
@@ -53,7 +53,7 @@ def _last_assistant_model(transcript) -> ModelChoice | None:  # type: ignore[no-
 async def main() -> int:
     print(f"[probe] base_url={BASE_URL}")
 
-    async with OpencodeClient(BASE_URL) as client:
+    async with OpencodeProvider(BASE_URL) as client:
         manager = SessionManager(client)
 
         # Track on_model events so we can confirm SSE plumbing fires.

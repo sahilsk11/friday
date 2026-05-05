@@ -1,4 +1,4 @@
-"""End-to-end smoke test for OpencodeClient + OpencodeSession.
+"""End-to-end smoke test for OpencodeProvider + OpencodeSession.
 
 Run against a live opencode server::
 
@@ -16,7 +16,7 @@ import os
 import sys
 import time
 
-from friday.core.opencode_session import OpencodeClient
+from friday.core.opencode_provider import OpencodeProvider
 from friday.core.state import AgentState
 
 BASE_URL = os.environ.get("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
@@ -30,7 +30,7 @@ async def main() -> int:
     done = asyncio.Event()
     started_at = time.monotonic()
 
-    async with OpencodeClient(BASE_URL) as client:
+    async with OpencodeProvider(BASE_URL) as client:
         session = await client.new_session(title="probe")
         print(f"[probe] session_id={session.id}")
 

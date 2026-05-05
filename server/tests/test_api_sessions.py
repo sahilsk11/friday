@@ -1,8 +1,8 @@
 """HTTP + SSE tests for the sessions router.
 
-The router talks to opencode via ``SessionManager`` → ``OpencodeClient.http``.
-Tests inject a manager wired to a non-started OpencodeClient (no SSE loop)
-and let pytest-httpx canned responses stand in for opencode HTTP.
+The router talks to opencode via ``OpencodeProvider.http``. Tests inject a
+non-started OpencodeProvider (no SSE loop) and let pytest-httpx canned
+responses stand in for opencode HTTP.
 
 For SSE we drive synthetic events directly into the cached
 ``OpencodeSession`` via ``dispatch()`` — the SSE generator's observers fire
@@ -20,31 +20,30 @@ import pytest
 from httpx import ASGITransport
 from pytest_httpx import HTTPXMock
 
-from friday.api.sessions import get_manager, stream_events
+from friday.api.sessions import get_provider, stream_events
 from friday.core.events import (
     MessagePartDelta,
     MessageUpdated,
     SessionStatus,
 )
-from friday.core.opencode_session import OpencodeClient
-from friday.core.session_manager import SessionManager
+from friday.core.opencode_provider import OpencodeProvider, OpencodeSession
 from friday.main import create_app
 
 OPENCODE_URL = "http://opencode.test"
 
 
 @pytest.fixture
-async def manager() -> AsyncIterator[SessionManager]:
-    """SessionManager wrapping a non-started OpencodeClient (HTTP-only)."""
-    client = OpencodeClient(OPENCODE_URL)
-    yield SessionManager(client)
+async def provider() -> AsyncIterator[OpencodeProvider]:
+    """A non-started OpencodeProvider (HTTP-only)."""
+    client = OpencodeProvider(OPENCODE_URL)
+    yield client
     await client.aclose()
 
 
 @pytest.fixture
-def client(manager: SessionManager) -> httpx.AsyncClient:
+def client(provider: OpencodeProvider) -> httpx.AsyncClient:
     app = create_app(with_lifespan=False)
-    app.dependency_overrides[get_manager] = lambda: manager
+    app.dependency_overrides[get_provider] = lambda: provider
     transport = ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://friday.test")
 
@@ -101,11 +100,12 @@ async def test_list_sessions_passes_directory_filter(
 
 
 async def test_create_session_posts_and_returns_metadata(
-    httpx_mock: HTTPXMock, client: httpx.AsyncClient
+    httpx_mock: HTTPXMock, client: httpx.AsyncClient, tmp_path: Path
 ) -> None:
+    directory = str(tmp_path)
     httpx_mock.add_response(
         method="POST",
-        url=f"{OPENCODE_URL}/session",
+        url=f"{OPENCODE_URL}/session?directory={directory}",
         json={"id": "ses_new", "title": "fresh"},
     )
     httpx_mock.add_response(
@@ -113,13 +113,13 @@ async def test_create_session_posts_and_returns_metadata(
         json={
             "id": "ses_new",
             "title": "fresh",
-            "directory": "/x",
+            "directory": directory,
             "time": {"created": 1_700_000_000_000, "updated": 1_700_000_000_000},
         },
     )
 
     async with client:
-        resp = await client.post("/sessions", json={"title": "fresh"})
+        resp = await client.post("/sessions", json={"title": "fresh", "directory": directory})
 
     assert resp.status_code == 201
     assert resp.json()["id"] == "ses_new"
@@ -225,7 +225,7 @@ async def test_post_turn_forwards_to_opencode(
     assert json.loads(sent.content) == {"parts": [{"type": "text", "text": "hi"}]}
 
 
-async def test_sse_streams_delta_final_and_state(manager: SessionManager) -> None:
+async def test_sse_streams_delta_final_and_state(provider: OpencodeProvider) -> None:
     """Drive the SSE route handler directly and consume its body iterator.
 
     We bypass ASGITransport here — it buffers streaming responses in-process,
@@ -237,10 +237,14 @@ async def test_sse_streams_delta_final_and_state(manager: SessionManager) -> Non
     is verified end-to-end against live opencode in
     ``scripts/probe_api_sessions.py``.
     """
-    response = await stream_events(session_id="ses_a", manager=manager)
+    response = await stream_events(session_id="ses_a", provider=provider)
     assert response.media_type == "text/event-stream"
 
-    session = manager.attach("ses_a")
+    session = provider.attach("ses_a")
+    # `attach` is typed as ProviderSession (the abstraction); for this test we
+    # need the opencode-specific `dispatch()` to feed canned events through the
+    # observer chain. OpencodeProvider always returns OpencodeSession today.
+    assert isinstance(session, OpencodeSession)
     await session.dispatch(SessionStatus(session_id="ses_a", status="busy"))
     await session.dispatch(
         MessagePartDelta(
@@ -279,7 +283,7 @@ async def test_sse_streams_delta_final_and_state(manager: SessionManager) -> Non
     assert collected[3] == {"type": "state", "state": "idle"}
 
 
-async def test_get_manager_503_when_unset() -> None:
+async def test_get_provider_503_when_unset() -> None:
     """If lifespan never ran and no override is registered, /sessions returns 503."""
     app = create_app(with_lifespan=False)
     transport = ASGITransport(app=app)
