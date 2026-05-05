@@ -1,4 +1,4 @@
-"""Tests for OpencodeProcessor.
+"""Tests for ProviderSessionProcessor.
 
 These exercise the adapter as a black box: feed it pipecat frames and
 synthetic opencode events (via ``OpencodeSession.dispatch``), and assert on
@@ -13,7 +13,6 @@ plumbing.
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncIterator
 
 import httpx
@@ -37,13 +36,13 @@ from friday.core.events import (
     MessageUpdated,
     SessionStatus,
 )
-from friday.core.opencode_session import ModelChoice, OpencodeClient, OpencodeSession
+from friday.core.opencode_provider import OpencodeProvider, OpencodeSession
 from friday.voice.pipecat_adapter import (
     RTVI_AGENT_STATE,
     RTVI_ASSISTANT_TEXT_DELTA,
     RTVI_ASSISTANT_TEXT_FINAL,
     RTVI_TOOL_STARTED,
-    OpencodeProcessor,
+    ProviderSessionProcessor,
 )
 
 
@@ -79,8 +78,8 @@ SESSION_ID = "ses_a"
 @pytest.fixture
 async def session() -> AsyncIterator[OpencodeSession]:
     """A real OpencodeSession bound to a non-started client (no SSE loop)."""
-    client = OpencodeClient(OPENCODE_URL)
-    yield client.session(SESSION_ID)
+    client = OpencodeProvider(OPENCODE_URL)
+    yield client.attach(SESSION_ID)
     await client.aclose()
 
 
@@ -89,7 +88,7 @@ _TEST_SYSTEM_PROMPT = "TEST_SYS_PROMPT"
 
 def _make_processor(
     session: OpencodeSession, *, tts_enabled: bool = True
-) -> tuple[OpencodeProcessor, list[Frame]]:
+) -> tuple[ProviderSessionProcessor, list[Frame]]:
     """Build the processor and replace ``push_frame`` with a capture list.
 
     Returns the processor and a list that grows as frames are pushed.
@@ -98,7 +97,7 @@ def _make_processor(
     toggle (off by default on a fresh page load).
     """
     pushed: list[Frame] = []
-    proc = OpencodeProcessor(session, system_prompt=_TEST_SYSTEM_PROMPT)
+    proc = ProviderSessionProcessor(session, system_prompt=_TEST_SYSTEM_PROMPT)
     proc.tts_enabled = tts_enabled
 
     async def capture(frame: Frame, _direction: FrameDirection = FrameDirection.DOWNSTREAM) -> None:

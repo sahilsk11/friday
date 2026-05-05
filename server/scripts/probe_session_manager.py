@@ -16,7 +16,7 @@ import asyncio
 import os
 import sys
 
-from friday.core.opencode_session import OpencodeClient
+from friday.core.opencode_provider import OpencodeProvider
 from friday.core.session_manager import SessionManager
 from friday.core.state import AgentState
 
@@ -29,7 +29,7 @@ async def main() -> int:
     print(f"[probe] base_url={BASE_URL}")
     done = asyncio.Event()
 
-    async with OpencodeClient(BASE_URL) as client:
+    async with OpencodeProvider(BASE_URL) as client:
         manager = SessionManager(client)
 
         existing = await manager.list_sessions()

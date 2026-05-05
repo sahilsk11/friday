@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, "/Users/sahil.kapur/Projects/friday/server")
 
-from friday.core.claude_code_session import ClaudeCodeProvider, ClaudeCodeSession
+from friday.core.claude_code_provider import ClaudeCodeProvider, ClaudeCodeSession
 from friday.core.state import AgentState
 
 

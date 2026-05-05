@@ -161,7 +161,7 @@ async def test_arm_flush_falls_back_to_timeout_when_no_commit_arrives() -> None:
 async def test_interruption_clears_buffer_and_passes_through() -> None:
     """Interrupt = abandon the in-flight turn. Buffer drops, no flush
     fires, the InterruptionFrame still flows downstream so TTS/STT/
-    OpencodeProcessor can clear their own state, and we emit an empty
+    ProviderSessionProcessor can clear their own state, and we emit an empty
     running message so the client UI overlay clears (otherwise the last
     running text would linger until the next turn)."""
     acc, pushed = _make_accumulator(silence_secs=10.0)

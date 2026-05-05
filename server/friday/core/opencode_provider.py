@@ -1,13 +1,19 @@
-"""OpencodeClient + OpencodeSession — HTTP + SSE wrapper for opencode.
+"""Opencode provider — implements the Provider/ProviderSession protocols.
+
+Application code talks to this only via ``friday.core.provider``. The
+HTTP+SSE machinery, the per-session event dispatch, the reconnect policy —
+all of that is internal to this module.
 
 Ported from ``~/Projects/friday/backend/src/agent/opencodeAdapter.ts``.
 
 Key invariants:
-- One global SSE subscription per ``OpencodeClient``; events are routed to the
-  right :class:`OpencodeSession` by ``sessionID``.
-- ``message.updated`` for ``role == "assistant"`` with ``time.end`` set is the
-  signal that fires ``on_text_final`` and ``on_state(IDLE)``. Without it,
-  queued turns stall (friday v1 incident).
+- One global SSE subscription per ``OpencodeProvider``; events are routed
+  to the right :class:`OpencodeSession` by ``sessionID``. The shared
+  connection is the reason provider+session live in one file: splitting
+  them would only obscure the multiplexing.
+- ``message.updated`` for ``role == "assistant"`` with ``time.end`` set is
+  the signal that fires ``on_text_final`` and ``on_state(IDLE)``. Without
+  it, queued turns stall (friday v1 incident).
 - Reconnect with exponential backoff (capped at 5s); a generation counter
   lets stale loops bail.
 """
@@ -18,7 +24,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Self
 
 import httpx
@@ -34,20 +40,20 @@ from friday.core.events import (
     SessionStatus,
     parse_event,
 )
+from friday.core.provider import (
+    Message,
+    ModelCatalog,
+    ModelChoice,
+    ModelInfo,
+    SessionInfo,
+    StateHandler,
+    TextDeltaHandler,
+    TextFinalHandler,
+    ToolStartHandler,
+    Unsubscribe,
+    subscribe,
+)
 from friday.core.state import AgentState
-
-
-@dataclass(frozen=True, slots=True)
-class ModelChoice:
-    """One opencode model selection. Wire shape matches the ``model`` field
-    accepted by ``POST /session/{id}/prompt_async``."""
-
-    provider_id: str
-    model_id: str
-
-    def to_wire(self) -> dict[str, str]:
-        return {"providerID": self.provider_id, "modelID": self.model_id}
-
 
 # Sent on every prompt_async via the per-turn ``system`` field (the only
 # mechanism opencode actually honors — its create-time systemPrompt is silently
@@ -75,14 +81,9 @@ SYSTEM_PROMPT_VOICE = (
 )
 
 EventHandler = Callable[[OpencodeEvent], Awaitable[None]]
-TextDeltaHandler = Callable[[str], Awaitable[None]]
-TextFinalHandler = Callable[[str], Awaitable[None]]
-StateHandler = Callable[[AgentState], Awaitable[None]]
-ToolStartHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
-Unsubscribe = Callable[[], None]
 
 
-class OpencodeClient:
+class OpencodeProvider:
     """Owns the HTTP client and the single global SSE subscription.
 
     Sessions are created via :meth:`new_session` or :meth:`session` (existing).
@@ -99,9 +100,9 @@ class OpencodeClient:
         self._closed = False
 
     @property
-    def http(self) -> httpx.AsyncClient:
-        """Shared HTTP client. SessionManager and other layers use this for typed calls."""
-        return self._http
+    def provider_id(self) -> str:
+        """Provider identifier — opencode."""
+        return "opencode"
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -126,9 +127,9 @@ class OpencodeClient:
             self._sse_task = None
         await self._http.aclose()
 
-    # ── HTTP API ────────────────────────────────────────────────────────────
+    # ── Live sessions ──────────────────────────────────────────────────
 
-    async def new_session(
+    async def create_session(
         self,
         title: str | None = None,
         *,
@@ -146,9 +147,9 @@ class OpencodeClient:
         resp = await self._http.post("/session", json=body, params=params)
         resp.raise_for_status()
         session_id: str = resp.json()["id"]
-        return self.session(session_id)
+        return self.attach(session_id)
 
-    def session(self, session_id: str) -> OpencodeSession:
+    def attach(self, session_id: str) -> OpencodeSession:
         existing = self._sessions.get(session_id)
         if existing is not None:
             return existing
@@ -156,10 +157,60 @@ class OpencodeClient:
         self._sessions[session_id] = session
         return session
 
-    async def list_sessions(self) -> list[dict[str, Any]]:
+    # ── Persistence ────────────────────────────────────────────────────
+
+    async def list_sessions(self, *, directory: str | None = None) -> list[SessionInfo]:
         resp = await self._http.get("/session")
         resp.raise_for_status()
-        return resp.json()
+        rows: list[dict[str, Any]] = resp.json()
+        sessions = [_parse_session_info(row) for row in rows]
+        if directory is not None:
+            sessions = [s for s in sessions if s.directory == directory]
+        return sessions
+
+    async def get_session(self, session_id: str) -> SessionInfo:
+        resp = await self._http.get(f"/session/{session_id}")
+        resp.raise_for_status()
+        return _parse_session_info(resp.json())
+
+    async def get_transcript(self, session_id: str) -> list[Message]:
+        resp = await self._http.get(f"/session/{session_id}/message")
+        resp.raise_for_status()
+        rows: list[dict[str, Any]] = resp.json()
+        return [_parse_message(row) for row in rows]
+
+    async def list_models(self) -> ModelCatalog:
+        """Proxy ``GET /config/providers`` filtered to active + toolcall-capable
+        models. ``default`` is whichever provider opencode surfaces first in
+        its global default map."""
+        resp = await self._http.get("/config/providers")
+        resp.raise_for_status()
+        payload = resp.json()
+        providers = payload.get("providers") or []
+        models: list[ModelInfo] = []
+        for prov in providers:
+            provider_id = prov.get("id", "")
+            provider_name = prov.get("name", provider_id)
+            for model_id, model in (prov.get("models") or {}).items():
+                caps = model.get("capabilities") or {}
+                if model.get("status") != "active":
+                    continue
+                if not caps.get("toolcall"):
+                    continue
+                models.append(
+                    ModelInfo(
+                        provider_id=provider_id,
+                        provider_name=provider_name,
+                        model_id=model_id,
+                        model_name=model.get("name", model_id),
+                    )
+                )
+        default_map: dict[str, str] = payload.get("default") or {}
+        default: ModelChoice | None = None
+        for provider_id, model_id in default_map.items():
+            default = ModelChoice(provider_id=provider_id, model_id=model_id)
+            break
+        return ModelCatalog(models=models, default=default)
 
     # ── SSE loop ────────────────────────────────────────────────────────────
 
@@ -231,7 +282,7 @@ class OpencodeSession:
         # so _handle_delta can skip them entirely.
         self._reasoning_parts: set[str] = set()
         # Latest agent state. Updated on every fan-out so reconnecting
-        # consumers (a fresh OpencodeProcessor, a REST GET) can read the
+        # consumers (a fresh ProviderSessionProcessor, a REST GET) can read the
         # current value without waiting for the next opencode transition.
         self._current_state: AgentState = AgentState.IDLE
 
@@ -242,17 +293,17 @@ class OpencodeSession:
     # session and push frames into pipelines that no longer exist.
 
     def on_text_delta(self, handler: TextDeltaHandler) -> Unsubscribe:
-        return _subscribe(self._delta_handlers, handler)
+        return subscribe(self._delta_handlers, handler)
 
     def on_text_final(self, handler: TextFinalHandler) -> Unsubscribe:
-        return _subscribe(self._final_handlers, handler)
+        return subscribe(self._final_handlers, handler)
 
     def on_state(self, handler: StateHandler) -> Unsubscribe:
-        return _subscribe(self._state_handlers, handler)
+        return subscribe(self._state_handlers, handler)
 
     def on_tool_start(self, handler: ToolStartHandler) -> Unsubscribe:
         """Fires once per tool invocation, with the tool name."""
-        return _subscribe(self._tool_start_handlers, handler)
+        return subscribe(self._tool_start_handlers, handler)
 
     @property
     def current_state(self) -> AgentState:
@@ -270,7 +321,7 @@ class OpencodeSession:
     ) -> None:
         body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
         if model is not None:
-            body["model"] = model.to_wire()
+            body["model"] = {"providerID": model.provider_id, "modelID": model.model_id}
         if system is not None:
             body["system"] = system
         resp = await self._http.post(f"/session/{self.id}/prompt_async", json=body)
@@ -284,7 +335,7 @@ class OpencodeSession:
         self._accumulated.clear()
         self._reasoning_parts.clear()
 
-    # ── Inbound (called by OpencodeClient._dispatch) ────────────────────────
+    # ── Inbound (called by OpencodeProvider._dispatch) ────────────────────────
 
     async def dispatch(self, event: OpencodeEvent) -> None:
         if isinstance(event, MessagePartDelta):
@@ -354,19 +405,44 @@ def _state_from_status(status: str) -> AgentState:
     return AgentState.THINKING if status == "busy" else AgentState.IDLE
 
 
-def _subscribe[H](handlers: list[H], handler: H) -> Unsubscribe:
-    """Append a handler and return a function that removes it.
+# ── Wire shape parsers ──────────────────────────────────────────────────────
+#
+# Pinned by ``scripts/probe_session_manager.py`` against a real opencode 1.14
+# server; if opencode bumps the schema, the probe is the canary.
 
-    Idempotent: calling the returned function twice is a no-op. Lets a
-    pipeline tear down its observers without leaking dead callbacks onto
-    the cached :class:`OpencodeSession`.
-    """
-    handlers.append(handler)
 
-    def unsubscribe() -> None:
-        try:
-            handlers.remove(handler)
-        except ValueError:
-            pass
+def _parse_session_info(row: dict[str, Any]) -> SessionInfo:
+    time = row.get("time") or {}
+    return SessionInfo(
+        id=row["id"],
+        title=row.get("title", ""),
+        directory=row.get("directory", ""),
+        created_at=_ms_to_datetime(time.get("created", 0)),
+        updated_at=_ms_to_datetime(time.get("updated", time.get("created", 0))),
+    )
 
-    return unsubscribe
+
+def _parse_message(row: dict[str, Any]) -> Message:
+    info = row.get("info") or {}
+    parts: list[dict[str, Any]] = row.get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+    time = info.get("time") or {}
+    completed_ms = time.get("completed") or time.get("end")
+    model_id = info.get("modelID")
+    provider_id = info.get("providerID")
+    model = (
+        ModelChoice(provider_id=provider_id, model_id=model_id)
+        if model_id and provider_id
+        else None
+    )
+    return Message(
+        role=info.get("role", ""),
+        text=text,
+        completed_at=_ms_to_datetime(completed_ms) if completed_ms else None,
+        parts=parts,
+        model=model,
+    )
+
+
+def _ms_to_datetime(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000.0, tz=UTC)

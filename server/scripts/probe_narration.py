@@ -37,8 +37,8 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 
-from friday.core.opencode_session import OpencodeClient
-from friday.voice.pipecat_adapter import OpencodeProcessor
+from friday.core.opencode_provider import OpencodeProvider
+from friday.voice.pipecat_adapter import ProviderSessionProcessor
 
 PROMPT = (
     "Briefly read the file 'PLAN.md' at the repo root and tell me in two short "
@@ -59,7 +59,7 @@ async def main() -> int:
         return 2
 
     print(f"[probe] opencode: {base_url}")
-    client = OpencodeClient(base_url)
+    client = OpencodeProvider(base_url)
     await client.start()
     try:
         session = await client.new_session(title="friday narration probe")
@@ -67,7 +67,7 @@ async def main() -> int:
 
         captured: list[Frame] = []
         finished = asyncio.Event()
-        proc = OpencodeProcessor(session)
+        proc = ProviderSessionProcessor(session)
 
         async def capture(
             frame: Frame, _direction: FrameDirection = FrameDirection.DOWNSTREAM

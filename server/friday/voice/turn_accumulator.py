@@ -5,7 +5,7 @@ Why this exists
 ElevenLabs realtime STT commits aggressively in VAD mode (every ~500ms of
 silence), and even in MANUAL mode auto-commits at 90s to keep its audio
 buffer bounded. Each commit becomes a ``TranscriptionFrame``. Without an
-accumulator, every commit fires a turn at the downstream ``OpencodeProcessor``
+accumulator, every commit fires a turn at the downstream ``ProviderSessionProcessor``
 — splitting one spoken thought across multiple opencode turns whenever the
 user pauses, and producing a phantom turn at the 90s mark for long
 utterances.
@@ -16,7 +16,7 @@ finished speaking, run the agent." This processor separates the two.
 
 Pipeline placement
 ------------------
-Sits between STT and OpencodeProcessor::
+Sits between STT and ProviderSessionProcessor::
 
     transport.input → stt → TurnAccumulator → opencode → tts → ...
 
@@ -48,7 +48,7 @@ frontend in place of pipecat's built-in user-transcript RTVI auto-emit
 
 The running message replaces the live transcript display on every commit.
 The final message is the lock-in signal: the activity feed appends one
-entry, and the same text lands at ``OpencodeProcessor`` as the synthetic
+entry, and the same text lands at ``ProviderSessionProcessor`` as the synthetic
 finalized ``TranscriptionFrame``.
 """
 
@@ -130,7 +130,7 @@ class TurnAccumulator(FrameProcessor):
             # — without it, the previous turn's last running text would
             # linger until the next turn starts. The frame itself flows
             # through to clear downstream TTS/STT state and trigger
-            # OpencodeProcessor's abort path.
+            # ProviderSessionProcessor's abort path.
             had_buffer = bool(self._buffer)
             self._reset()
             if had_buffer:
@@ -256,7 +256,7 @@ class TurnAccumulator(FrameProcessor):
                 data={"type": RTVI_USER_TRANSCRIPT_FINAL, "text": text}
             )
         )
-        # Synthetic finalized transcription downstream — OpencodeProcessor
+        # Synthetic finalized transcription downstream — ProviderSessionProcessor
         # consumes this exactly like it would consume an ElevenLabs
         # committed_transcript in MANUAL mode.
         await self.push_frame(
