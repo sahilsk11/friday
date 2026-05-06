@@ -9,16 +9,6 @@ export function listSessions(directory?: string): Promise<SessionRow[]> {
   return apiClient.get<SessionRow[]>(`/sessions${qs}`);
 }
 
-export function createSession(
-  directory: string,
-  harness: string,
-  title?: string,
-): Promise<SessionRow> {
-  const body: { directory: string; harness: string; title?: string } = { directory, harness };
-  if (title) body.title = title;
-  return apiClient.post<SessionRow>('/sessions', body);
-}
-
 export function getSession(id: string): Promise<SessionDetail> {
   return apiClient.get<SessionDetail>(`/sessions/${id}`);
 }
