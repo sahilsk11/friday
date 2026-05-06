@@ -40,6 +40,7 @@ from loguru import logger
 
 from friday.api.sessions import harnesses_router, models_router, router as sessions_router
 from friday.core.claude_code_provider import ClaudeCodeProvider
+from friday.core.codex_provider import CodexProvider
 from friday.core.opencode_provider import OpencodeProvider
 from friday.core.session_registry import ProviderRegistry
 from friday.voice.server import router as voice_router
@@ -84,6 +85,12 @@ async def default_lifespan(app: FastAPI) -> AsyncGenerator[None]:
     registry.add(claude)
     logger.info("claude-code provider started")
 
+    # ── Codex ───────────────────────────────────────────────────────
+    # Always register — codex CLI must be installed and in PATH.
+    codex = CodexProvider()
+    registry.add(codex)
+    logger.info("codex provider started")
+
     if not registry.all():
         raise RuntimeError("no providers available — set ANTHROPIC_API_KEY or start opencode")
 
@@ -95,6 +102,7 @@ async def default_lifespan(app: FastAPI) -> AsyncGenerator[None]:
         if opencode is not None:
             await opencode.aclose()
         await claude.aclose()
+        await codex.aclose()
 
 
 def _resolve_cors_origins() -> list[str]:

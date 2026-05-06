@@ -20,6 +20,7 @@ from friday.core.provider import Provider, SessionNotFound
 _PROVIDER_NAMES: dict[str, str] = {
     "opencode": "OpenCode",
     "claude-code": "Claude Code",
+    "codex": "Codex",
 }
 
 
