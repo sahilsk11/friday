@@ -4,8 +4,8 @@ import { Link, useNavigate } from 'react-router';
 
 import { isApiError } from '@/lib/api';
 import { useSelectedModel } from '@/lib/selectedModel';
-import { createSession, listModels, listSessions } from '@/lib/sessions';
-import type { ModelInfo, ModelRef } from '@/types/api';
+import { createSession, listHarnesses, listModels, listSessions } from '@/lib/sessions';
+import type { HarnessInfo, ModelInfo, ModelRef } from '@/types/api';
 
 // Plain REST. No voice-ui-kit imports here — per jarvis.md, only the
 // voice room page touches the voice stack.
@@ -41,22 +41,16 @@ export default function SessionsList() {
 
   return (
     <div className="mx-auto max-w-3xl px-6 py-10">
-      <header className="mb-8 flex items-baseline justify-between">
+      <header className="mb-8 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">friday</h1>
-        <span className="text-sm text-neutral-400">opencode sessions</span>
-      </header>
-
-      <div className="mb-8 flex justify-end">
         <button
           type="button"
-          onClick={() => {
-            setModalOpen(true);
-          }}
+          onClick={() => setModalOpen(true)}
           className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-white"
         >
           new session
         </button>
-      </div>
+      </header>
 
       {sessionsQuery.isLoading ? (
         <p className="text-sm text-neutral-400">loading…</p>
@@ -104,11 +98,7 @@ export default function SessionsList() {
       )}
 
       {modalOpen ? (
-        <NewSessionModal
-          onClose={() => {
-            setModalOpen(false);
-          }}
-        />
+        <NewSessionModal onClose={() => setModalOpen(false)} />
       ) : null}
     </div>
   );
@@ -122,10 +112,25 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
   const [directory, setDirectory] = useState(DEFAULT_DIRECTORY);
   const directoryRef = useRef<HTMLInputElement>(null);
 
+  const harnessesQuery = useQuery({
+    queryKey: ['harnesses'],
+    queryFn: listHarnesses,
+    staleTime: 60_000,
+  });
+
+  // Default to the first available harness once loaded.
+  const [harness, setHarness] = useState<string>('');
+  useEffect(() => {
+    if (harness === '' && harnessesQuery.data && harnessesQuery.data.length > 0) {
+      setHarness(harnessesQuery.data[0].id);
+    }
+  }, [harnessesQuery.data, harness]);
+
+  // Refetch models whenever the harness changes.
   const modelsQuery = useQuery({
-    queryKey: ['models'],
-    queryFn: listModels,
-    // Models are static-ish per opencode boot; no need to refetch on focus.
+    queryKey: ['models', harness],
+    queryFn: () => listModels(harness || undefined),
+    enabled: harness !== '',
     staleTime: 5 * 60 * 1000,
   });
 
@@ -143,21 +148,24 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
     return [...out.entries()];
   }, [modelsQuery.data]);
 
-  // Picking a model in the modal updates the global hook — the same value
-  // is read by the chip on the session page. The session create call
-  // doesn't carry the model; it rides on the first turn.
+  // When the harness changes, reset model to the new default.
+  useEffect(() => {
+    if (modelsQuery.data?.default) {
+      setModel(modelsQuery.data.default);
+    }
+  }, [modelsQuery.data?.default, setModel]);
+
   const currentValue = selectedModel ? modelKey(selectedModel) : '';
 
   const createMutation = useMutation({
-    mutationFn: ({ t, d }: { t: string; d: string }) => createSession(t || undefined, d || undefined),
+    mutationFn: ({ t, d, h }: { t: string; d: string; h: string }) =>
+      createSession(d, h, t || undefined),
     onSuccess: async (row) => {
       await queryClient.invalidateQueries({ queryKey: ['sessions'] });
       void navigate(`/s/${row.id}`);
     },
   });
 
-  // Esc to close. Don't close while a request is in flight — the user
-  // either gets a session back (we navigate) or an error to read.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !createMutation.isPending) {
@@ -165,9 +173,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
       }
     };
     window.addEventListener('keydown', onKey);
-    return () => {
-      window.removeEventListener('keydown', onKey);
-    };
+    return () => window.removeEventListener('keydown', onKey);
   }, [onClose, createMutation.isPending]);
 
   const errorMessage = createMutation.error
@@ -179,15 +185,11 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
-      onClick={() => {
-        if (!createMutation.isPending) onClose();
-      }}
+      onClick={() => { if (!createMutation.isPending) onClose(); }}
     >
       <div
         className="w-full max-w-md rounded-lg border border-neutral-800 bg-neutral-950 p-6 shadow-xl"
-        onClick={(e) => {
-          e.stopPropagation();
-        }}
+        onClick={(e) => e.stopPropagation()}
       >
         <h2 className="mb-4 text-lg font-semibold">new session</h2>
 
@@ -196,13 +198,31 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
           onSubmit={(e) => {
             e.preventDefault();
             const d = directory.trim();
-            if (!d) {
-              directoryRef.current?.focus();
-              return;
-            }
-            createMutation.mutate({ t: title.trim(), d });
+            if (!d) { directoryRef.current?.focus(); return; }
+            if (!harness) return;
+            createMutation.mutate({ t: title.trim(), d, h: harness });
           }}
         >
+          <label className="flex flex-col gap-1">
+            <span className="text-xs uppercase tracking-wide text-neutral-500">harness</span>
+            <select
+              value={harness}
+              onChange={(e) => setHarness(e.target.value)}
+              disabled={createMutation.isPending || harnessesQuery.isLoading}
+              className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm focus:border-neutral-500 focus:outline-none disabled:opacity-50"
+            >
+              {harnessesQuery.isLoading ? (
+                <option value="">loading…</option>
+              ) : harnessesQuery.error ? (
+                <option value="">failed to load</option>
+              ) : (
+                (harnessesQuery.data ?? []).map((h: HarnessInfo) => (
+                  <option key={h.id} value={h.id}>{h.name}</option>
+                ))
+              )}
+            </select>
+          </label>
+
           <label className="flex flex-col gap-1">
             <span className="text-xs uppercase tracking-wide text-neutral-500">title</span>
             <input
@@ -285,7 +305,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
             </button>
             <button
               type="submit"
-              disabled={createMutation.isPending || !directory.trim()}
+              disabled={createMutation.isPending || !directory.trim() || !harness}
               className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-white disabled:opacity-50"
             >
               {createMutation.isPending ? 'creating…' : 'create'}

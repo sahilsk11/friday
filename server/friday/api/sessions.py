@@ -2,10 +2,12 @@
 
 Endpoints:
 
+- ``GET    /harnesses``               — list available provider backends
+- ``GET    /models?harness=<id>``     — model catalog for a specific harness
 - ``GET    /sessions``                — list, optional ``?directory=`` filter
-- ``POST   /sessions``                — create new (also creates opencode session)
+- ``POST   /sessions``                — create new (harness + directory required)
 - ``GET    /sessions/{id}``           — metadata + transcript
-- ``POST   /sessions/{id}/turn``      — text turn (voice layer also POSTs here)
+- ``POST   /sessions/{id}/turn``      — text turn
 - ``GET    /sessions/{id}/events``    — SSE stream of live deltas + state
 
 The router is framework-neutral: **no pipecat imports.** Both the CLI (Step 4)
@@ -24,11 +26,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from friday.core.provider import Message, ModelChoice, Provider, SessionInfo
+from friday.core.provider import Message, ModelChoice, Provider, SessionInfo, SessionNotFound
+from friday.core.session_registry import ProviderRegistry
 from friday.core.state import AgentState
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 models_router = APIRouter(tags=["models"])
+harnesses_router = APIRouter(tags=["harnesses"])
 
 # Keep-alive cadence for idle SSE streams. Browsers/proxies will drop a stream
 # that's silent for too long; 15s is comfortably under the usual 60s timeout.
@@ -50,7 +54,7 @@ class ModelRef(BaseModel):
         return ModelChoice(provider_id=self.providerID, model_id=self.modelID)
 
     @classmethod
-    def from_choice(cls, choice: ModelChoice) -> ModelRef:
+    def from_choice(cls, choice: ModelChoice) -> "ModelRef":
         return cls(providerID=choice.provider_id, modelID=choice.model_id)
 
 
@@ -66,17 +70,21 @@ class ModelsResponse(BaseModel):
     default: ModelRef | None
 
 
+class HarnessInfo(BaseModel):
+    id: str
+    name: str
+
+
 class CreateSessionBody(BaseModel):
     """Body for ``POST /sessions``.
 
     ``directory`` is required — it's the working directory tools resolve
-    paths against (opencode persists it server-side; claude-code uses it
-    as the lookup key for the on-disk session store). Treating it as
-    optional left a footgun where the backend defaulted to whatever cwd
-    its host process happened to be running in."""
+    paths against. ``harness`` picks which provider backend runs the session;
+    defaults to the first available provider if omitted."""
 
     directory: str
     title: str | None = None
+    harness: str | None = None
 
 
 class TurnBody(BaseModel):
@@ -92,7 +100,7 @@ class SessionRow(BaseModel):
     updated_at: str
 
     @classmethod
-    def from_info(cls, info: SessionInfo) -> SessionRow:
+    def from_info(cls, info: SessionInfo) -> "SessionRow":
         return cls(
             id=info.id,
             title=info.title,
@@ -108,7 +116,7 @@ class MessageRow(BaseModel):
     completed_at: str | None
 
     @classmethod
-    def from_message(cls, m: Message) -> MessageRow:
+    def from_message(cls, m: Message) -> "MessageRow":
         return cls(
             role=m.role,
             text=m.text,
@@ -120,112 +128,71 @@ class SessionDetail(BaseModel):
     session: SessionRow
     transcript: list[MessageRow]
     current_model: ModelRef | None
-    # Snapshot of the live agent state from the cached OpencodeSession —
-    # ``thinking`` if opencode is mid-turn right now, ``idle`` otherwise.
-    # Lets a freshly loaded page seed the thinking indicator without
-    # waiting for the next opencode transition over the WS.
     agent_state: AgentState
 
 
-def get_provider(request: Request) -> Provider:
-    """FastAPI dependency. Tests override this to inject a provider directly."""
-    provider: Provider | None = getattr(request.app.state, "provider", None)
-    if provider is None:
+def get_registry(request: Request) -> ProviderRegistry:
+    """FastAPI dependency. Tests override this to inject a registry directly."""
+    registry: ProviderRegistry | None = getattr(request.app.state, "registry", None)
+    if registry is None:
         raise HTTPException(status_code=503, detail="provider not ready")
+    return registry
+
+
+# Keep the old name for backward compat with tests that still override get_provider.
+# Tests should migrate to get_registry, but this avoids a hard break.
+def get_provider(request: Request) -> Provider:
+    registry = get_registry(request)
+    providers = registry.all()
+    if not providers:
+        raise HTTPException(status_code=503, detail="no provider available")
+    return providers[0]
+
+
+RegistryDep = Annotated[ProviderRegistry, Depends(get_registry)]
+
+
+def _pick_provider(registry: ProviderRegistry, harness: str | None) -> Provider:
+    """Resolve a provider by harness id, falling back to the first available."""
+    if harness is not None:
+        p = registry.get(harness)
+        if p is None:
+            raise HTTPException(status_code=400, detail=f"unknown harness: {harness!r}")
+        return p
+    providers = registry.all()
+    if not providers:
+        raise HTTPException(status_code=503, detail="no provider available")
+    return providers[0]
+
+
+async def _require_provider_for_session(registry: ProviderRegistry, session_id: str) -> Provider:
+    """Look up which provider owns a session; 404 if none claim it."""
+    provider = await registry.resolve_for_session(session_id)
+    if provider is None:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
     return provider
 
 
-ProviderDep = Annotated[Provider, Depends(get_provider)]
+# ── Harnesses ──────────────────────────────────────────────────────────────
 
 
-@router.get("", response_model=list[SessionRow])
-async def list_sessions(
-    provider: ProviderDep,
-    directory: str | None = None,
-) -> list[SessionRow]:
-    sessions = await provider.list_sessions(directory=directory)
-    return [SessionRow.from_info(s) for s in sessions]
+@harnesses_router.get("/harnesses", response_model=list[HarnessInfo])
+async def list_harnesses(registry: RegistryDep) -> list[HarnessInfo]:
+    """List all available provider backends (harnesses)."""
+    return [
+        HarnessInfo(id=p.provider_id, name=registry.provider_name(p.provider_id))
+        for p in registry.all()
+    ]
 
 
-@router.post("", response_model=SessionRow, status_code=201)
-async def create_session(body: CreateSessionBody, provider: ProviderDep) -> SessionRow:
-    # Validate up-front: tools resolve paths against this cwd, so a bogus
-    # directory means every tool call fails downstream with a confusing
-    # error. We share a filesystem with the backend (same process box),
-    # so a local stat is correct.
-    if not os.path.isabs(body.directory):
-        raise HTTPException(status_code=400, detail="directory must be an absolute path")
-    if not await asyncio.to_thread(os.path.isdir, body.directory):
-        raise HTTPException(
-            status_code=400, detail=f"directory does not exist: {body.directory}"
-        )
-    session = await provider.create_session(title=body.title, directory=body.directory)
-    info = await provider.get_session(session.id)
-    return SessionRow.from_info(info)
-
-
-@router.get("/{session_id}", response_model=SessionDetail)
-async def get_session(session_id: str, provider: ProviderDep) -> SessionDetail:
-    info = await provider.get_session(session_id)
-    transcript = await provider.get_transcript(session_id)
-    # ``current_model`` reports what the backend actually ran most recently —
-    # ground truth, not intent. The user's pending selection lives in client
-    # state and rides along on the next turn body.
-    last_model = next(
-        (m.model for m in reversed(transcript) if m.role == "assistant" and m.model is not None),
-        None,
-    )
-    # ``agent_state`` is the live snapshot from the cached provider session,
-    # not historical. ``provider.attach`` is a cache lookup — same instance
-    # the voice pipeline observes, so the state is fresh.
-    session = provider.attach(session_id)
-    return SessionDetail(
-        session=SessionRow.from_info(info),
-        transcript=[MessageRow.from_message(m) for m in transcript],
-        current_model=ModelRef.from_choice(last_model) if last_model else None,
-        agent_state=session.current_state,
-    )
-
-
-@router.post("/{session_id}/turn", status_code=202)
-async def post_turn(session_id: str, body: TurnBody, provider: ProviderDep) -> dict[str, str]:
-    session = provider.attach(session_id)
-    await session.send_turn(body.text, model=body.model.to_choice() if body.model else None)
-    return {"session_id": session_id}
-
-
-@router.get("/{session_id}/events")
-async def stream_events(
-    session_id: str,
-    provider: ProviderDep,
-) -> StreamingResponse:
-    session = provider.attach(session_id)
-    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=_SSE_QUEUE_LIMIT)
-
-    async def on_delta(text: str) -> None:
-        await queue.put(_pack("text.delta", {"text": text}))
-
-    async def on_final(text: str) -> None:
-        await queue.put(_pack("text.final", {"text": text}))
-
-    async def on_state(state: AgentState) -> None:
-        await queue.put(_pack("state", {"state": state.value}))
-
-    # NOTE: observers stay registered for the lifetime of the OpencodeSession.
-    # Each new SSE connection adds 3 handlers; for v1 with a single client per
-    # session that's fine. Step 7 (auth + multi-client) revisits this.
-    session.on_text_delta(on_delta)
-    session.on_text_final(on_final)
-    session.on_state(on_state)
-
-    return StreamingResponse(_sse_stream(queue), media_type="text/event-stream")
+# ── Models ─────────────────────────────────────────────────────────────────
 
 
 @models_router.get("/models", response_model=ModelsResponse)
-async def list_models(provider: ProviderDep) -> ModelsResponse:
-    """The model picker. Each provider returns its own catalog and default —
-    opencode proxies its ``/config/providers`` endpoint, claude-code returns
-    a static list (the SDK doesn't expose runtime model discovery)."""
+async def list_models(registry: RegistryDep, harness: str | None = None) -> ModelsResponse:
+    """The model picker. Pass ``?harness=<id>`` to get models for a specific
+    provider; omit to get models for the first available provider."""
+    provider = _pick_provider(registry, harness)
     catalog = await provider.list_models()
     return ModelsResponse(
         models=[
@@ -241,12 +208,100 @@ async def list_models(provider: ProviderDep) -> ModelsResponse:
     )
 
 
-async def _sse_stream(queue: asyncio.Queue[str]) -> AsyncIterator[bytes]:
-    """Yield SSE frames from queue; emit a comment on idle to keep proxies open.
+# ── Sessions ───────────────────────────────────────────────────────────────
 
-    Disconnects raise ``CancelledError`` from ``queue.get()``, which Starlette
-    catches and the generator exits cleanly.
-    """
+
+@router.get("", response_model=list[SessionRow])
+async def list_sessions(
+    registry: RegistryDep,
+    directory: str | None = None,
+) -> list[SessionRow]:
+    """List sessions across all providers, merged and sorted newest-first."""
+    results = await asyncio.gather(
+        *[p.list_sessions(directory=directory) for p in registry.all()],
+        return_exceptions=True,
+    )
+    rows: list[SessionRow] = []
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        rows.extend(SessionRow.from_info(info) for info in r)
+    rows.sort(key=lambda r: r.updated_at, reverse=True)
+    return rows
+
+
+@router.post("", response_model=SessionRow, status_code=201)
+async def create_session(body: CreateSessionBody, registry: RegistryDep) -> SessionRow:
+    if not os.path.isabs(body.directory):
+        raise HTTPException(status_code=400, detail="directory must be an absolute path")
+    if not await asyncio.to_thread(os.path.isdir, body.directory):
+        raise HTTPException(
+            status_code=400, detail=f"directory does not exist: {body.directory}"
+        )
+    provider = _pick_provider(registry, body.harness)
+    session = await provider.create_session(title=body.title, directory=body.directory)
+    registry.register_session(session.id, provider.provider_id)
+    info = await provider.get_session(session.id)
+    return SessionRow.from_info(info)
+
+
+@router.get("/{session_id}", response_model=SessionDetail)
+async def get_session(session_id: str, registry: RegistryDep) -> SessionDetail:
+    provider = await _require_provider_for_session(registry, session_id)
+    try:
+        info = await provider.get_session(session_id)
+    except SessionNotFound:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    transcript = await provider.get_transcript(session_id)
+    last_model = next(
+        (m.model for m in reversed(transcript) if m.role == "assistant" and m.model is not None),
+        None,
+    )
+    session = provider.attach(session_id)
+    return SessionDetail(
+        session=SessionRow.from_info(info),
+        transcript=[MessageRow.from_message(m) for m in transcript],
+        current_model=ModelRef.from_choice(last_model) if last_model else None,
+        agent_state=session.current_state,
+    )
+
+
+@router.post("/{session_id}/turn", status_code=202)
+async def post_turn(
+    session_id: str, body: TurnBody, registry: RegistryDep
+) -> dict[str, str]:
+    provider = await _require_provider_for_session(registry, session_id)
+    session = provider.attach(session_id)
+    await session.send_turn(body.text, model=body.model.to_choice() if body.model else None)
+    return {"session_id": session_id}
+
+
+@router.get("/{session_id}/events")
+async def stream_events(
+    session_id: str,
+    registry: RegistryDep,
+) -> StreamingResponse:
+    provider = await _require_provider_for_session(registry, session_id)
+    session = provider.attach(session_id)
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=_SSE_QUEUE_LIMIT)
+
+    async def on_delta(text: str) -> None:
+        await queue.put(_pack("text.delta", {"text": text}))
+
+    async def on_final(text: str) -> None:
+        await queue.put(_pack("text.final", {"text": text}))
+
+    async def on_state(state: AgentState) -> None:
+        await queue.put(_pack("state", {"state": state.value}))
+
+    session.on_text_delta(on_delta)
+    session.on_text_final(on_final)
+    session.on_state(on_state)
+
+    return StreamingResponse(_sse_stream(queue), media_type="text/event-stream")
+
+
+async def _sse_stream(queue: asyncio.Queue[str]) -> AsyncIterator[bytes]:
     while True:
         try:
             chunk = await asyncio.wait_for(queue.get(), timeout=_SSE_KEEPALIVE_SECONDS)

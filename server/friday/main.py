@@ -3,8 +3,14 @@
 Owns the ``Provider`` lifecycle, mounts the framework-neutral session API,
 the WebSocket voice router, and (when ``web/dist`` is built) the SPA bundle
 so a single uvicorn process serves both the API and the frontend on one
-port. Today the provider is always opencode; the choice is one env-flip
-away when a second backend is wired in.
+port.
+
+Both OpenCode and ClaudeCode providers are started at startup when their
+respective dependencies are present. OpenCode requires ``opencode serve``
+running at ``OPENCODE_BASE_URL`` (default: localhost:4096). ClaudeCode
+requires ``ANTHROPIC_API_KEY``. If OpenCode is unreachable at startup it
+is skipped; if ClaudeCode's key is absent it is skipped. At least one
+provider must be available.
 
 CORS: allows ``localhost``/``127.0.0.1`` on common Vite/Next dev ports so a
 frontend dev server (default Vite is :5173) can hit the API directly. In
@@ -15,6 +21,7 @@ list, or ``*`` to allow any (only for debugging).
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -29,9 +36,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from loguru import logger
 
-from friday.api.sessions import models_router, router as sessions_router
+from friday.api.sessions import harnesses_router, models_router, router as sessions_router
+from friday.core.claude_code_provider import ClaudeCodeProvider
 from friday.core.opencode_provider import OpencodeProvider
+from friday.core.session_registry import ProviderRegistry
 from friday.voice.server import router as voice_router
 from friday.voice.server import shutdown as voice_shutdown
 
@@ -45,19 +55,46 @@ DEFAULT_CORS_ORIGINS = [
 # repo_root/server/friday/main.py → repo_root/web/dist
 WEB_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
 
+# How long to wait for OpenCode's SSE stream before giving up and skipping it.
+_OPENCODE_CONNECT_TIMEOUT = 5.0
+
 
 @asynccontextmanager
 async def default_lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    """Start the OpencodeProvider (HTTP + SSE) and expose it on app.state."""
+    registry = ProviderRegistry()
+
+    # ── OpenCode ───────────────────────────────────────────────────────
     base_url = os.environ.get("OPENCODE_BASE_URL", DEFAULT_OPENCODE_BASE_URL)
-    provider = OpencodeProvider(base_url)
-    await provider.start()
-    app.state.provider = provider
+    opencode = OpencodeProvider(base_url)
+    try:
+        await asyncio.wait_for(opencode.start(), timeout=_OPENCODE_CONNECT_TIMEOUT)
+        registry.add(opencode)
+        logger.info("opencode provider started | url={}", base_url)
+    except (asyncio.TimeoutError, Exception) as err:
+        logger.warning("opencode provider unavailable, skipping | err={}", err)
+        await opencode.aclose()
+        opencode = None  # type: ignore[assignment]
+
+    # ── ClaudeCode ────────────────────────────────────────────────────
+    # Always register — no external connection needed at startup. The SDK
+    # reads sessions from disk and only hits the Anthropic API on send_turn.
+    # Missing ANTHROPIC_API_KEY surfaces as an error when the first turn fires,
+    # not as a missing harness option.
+    claude = ClaudeCodeProvider()
+    registry.add(claude)
+    logger.info("claude-code provider started")
+
+    if not registry.all():
+        raise RuntimeError("no providers available — set ANTHROPIC_API_KEY or start opencode")
+
+    app.state.registry = registry
     try:
         yield
     finally:
         await voice_shutdown()
-        await provider.aclose()
+        if opencode is not None:
+            await opencode.aclose()
+        await claude.aclose()
 
 
 def _resolve_cors_origins() -> list[str]:
@@ -69,7 +106,7 @@ def _resolve_cors_origins() -> list[str]:
 
 def create_app(*, with_lifespan: bool = True) -> FastAPI:
     """Build the FastAPI app. Tests pass ``with_lifespan=False`` and inject
-    a ``Provider`` via ``app.dependency_overrides[get_provider]``.
+    a ``ProviderRegistry`` via ``app.dependency_overrides[get_registry]``.
     """
     app = FastAPI(title="friday", lifespan=default_lifespan if with_lifespan else None)
     app.add_middleware(
@@ -81,6 +118,7 @@ def create_app(*, with_lifespan: bool = True) -> FastAPI:
     )
     app.include_router(sessions_router)
     app.include_router(models_router)
+    app.include_router(harnesses_router)
     app.include_router(voice_router)
     _mount_spa(app)
     return app

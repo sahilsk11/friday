@@ -33,6 +33,7 @@ from friday.core.provider import (
     ModelChoice,
     ModelInfo,
     SessionInfo,
+    SessionNotFound,
     StateHandler,
     TextDeltaHandler,
     TextFinalHandler,
@@ -114,6 +115,14 @@ class ClaudeCodeSession:
         # on-disk session store (~/.claude/projects/<encoded-cwd>/<id>.jsonl).
         # Without it, ``resume`` fails with "No conversation found", and a
         # fresh session lands under the wrong project dir.
+        #
+        # directory may be None when attach() creates a wrapper for a session
+        # that existed before this process started (reconnect, server restart).
+        # Recover it from the on-disk session file via the SDK before proceeding.
+        if self.directory is None and self.id:
+            info = await asyncio.to_thread(get_session_info, self.id)
+            if info is not None:
+                self.directory = getattr(info, "cwd", None)
         if self.directory is not None:
             opts.cwd = self.directory
         # resume an existing session when we have its id, otherwise the
@@ -274,7 +283,7 @@ class ClaudeCodeProvider:
     async def get_session(self, session_id: str) -> SessionInfo:
         info = await asyncio.to_thread(get_session_info, session_id)
         if info is None:
-            raise LookupError(f"claude-code session not found: {session_id}")
+            raise SessionNotFound(f"claude-code session not found: {session_id}")
         return _session_info_from_sdk(info)
 
     async def get_transcript(self, session_id: str) -> list[Message]:
