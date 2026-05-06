@@ -265,6 +265,7 @@ function VoiceRoomShell({
           <InterruptButton />
 
           <div className="mt-auto flex items-center justify-end gap-3">
+            <MuteToggle />
             <SpeakerToggle />
           </div>
         </section>
@@ -519,6 +520,30 @@ function InterruptButton(): React.ReactElement {
       className="rounded-md border border-red-700 bg-red-950 px-4 py-2 text-sm font-medium text-red-200 hover:bg-red-900 disabled:opacity-50"
     >
       Interrupt
+    </button>
+  );
+}
+
+// Mic mute/unmute toggle. Independent of the Start/Send flow — lets the
+// user mute without committing a transcript. Useful when stepping away
+// mid-turn or pausing temporarily.
+function MuteToggle(): React.ReactElement {
+  const { enableMic, isMicEnabled } = usePipecatClientMicControl();
+  const handleToggle = useCallback(() => {
+    enableMic(!isMicEnabled);
+  }, [enableMic, isMicEnabled]);
+  return (
+    <button
+      type="button"
+      onClick={handleToggle}
+      title={isMicEnabled ? 'Mic on — click to mute' : 'Mic muted — click to unmute'}
+      className={
+        isMicEnabled
+          ? 'rounded-md border border-neutral-700 px-3 py-1.5 text-xs text-neutral-100 hover:border-neutral-500'
+          : 'rounded-md border border-red-700 bg-red-950 px-3 py-1.5 text-xs text-red-200 hover:border-red-500'
+      }
+    >
+      mic: {isMicEnabled ? 'on' : 'off'}
     </button>
   );
 }
