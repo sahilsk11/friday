@@ -7,16 +7,24 @@
 // Usage:
 //   node scripts/probe-voice.mjs [SESSION_ID]
 //
-// If no SESSION_ID is given, the script creates a fresh opencode session
-// via POST /sessions first.
+// If no SESSION_ID is given, the script creates a fresh voice session through
+// the app's new-session modal and WebSocket flow.
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
-const FRIDAY_BASE = process.env.FRIDAY_BASE_URL ?? 'http://localhost:8765';
 const FE_BASE = process.env.FE_BASE_URL ?? 'http://localhost:5173';
 const FAKE_AUDIO = process.env.FAKE_AUDIO_PATH ?? '/tmp/voice-test-input.wav';
 const HOLD_MS = Number(process.env.HOLD_MS ?? 25_000);
+const SEND_AFTER_MS = Number(process.env.SEND_AFTER_MS ?? 6000);
+const DEFAULT_PROBE_DIRECTORY = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../..',
+);
+const PROBE_DIRECTORY = process.env.PROBE_DIRECTORY ?? DEFAULT_PROBE_DIRECTORY;
+const PROBE_HARNESS = process.env.PROBE_HARNESS;
 
 if (!fs.existsSync(FAKE_AUDIO)) {
   console.error(`fake audio file missing: ${FAKE_AUDIO}`);
@@ -25,21 +33,6 @@ if (!fs.existsSync(FAKE_AUDIO)) {
   );
   process.exit(2);
 }
-
-async function ensureSession(arg) {
-  if (arg) return arg;
-  const r = await fetch(`${FRIDAY_BASE}/sessions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: 'probe-voice' }),
-  });
-  if (!r.ok) throw new Error(`POST /sessions failed: ${r.status}`);
-  const row = await r.json();
-  return row.id;
-}
-
-const sessionId = await ensureSession(process.argv[2]);
-console.log(`[probe] session=${sessionId}`);
 
 const browser = await chromium.launch({
   headless: true,
@@ -80,31 +73,34 @@ page.on('websocket', (ws) => {
   ws.on('socketerror', (e) => wsEvents.push(`ERROR ${ws.url()} ${String(e)}`));
 });
 
-const url = `${FE_BASE}/s/${sessionId}`;
+const existingSessionId = process.argv[2];
+const url = existingSessionId ? `${FE_BASE}/s/${existingSessionId}` : FE_BASE;
 console.log(`[probe] navigating ${url}`);
 await page.goto(url, { waitUntil: 'domcontentloaded' });
 
-// voice-ui-kit's <ConnectButton> renders "Connect" by default; case-insensitive match
-// keeps this resilient to label tweaks.
-const connectBtn = page.locator('button', { hasText: /^connect$/i }).first();
-await connectBtn.waitFor({ state: 'visible', timeout: 20_000 });
-console.log('[probe] connect button visible');
+if (!existingSessionId) {
+  console.log(`[probe] creating session through UI directory=${PROBE_DIRECTORY}`);
+  await page.locator('button', { hasText: /^new session$/i }).click();
+  if (PROBE_HARNESS) {
+    await page.locator('select').first().selectOption(PROBE_HARNESS);
+  }
+  await page.locator('input[placeholder="optional"]').fill('probe-voice');
+  await page.locator('input[placeholder="/absolute/path"]').fill(PROBE_DIRECTORY);
+  await page.locator('button', { hasText: /^start session$/i }).click();
+  await page.waitForURL(/\/s\/new|\/s\/[^/]+$/, { timeout: 20_000 });
+}
+
+console.log(`[probe] route=${page.url()}`);
 
 const t0 = Date.now();
-console.log('[probe] clicking connect');
-await connectBtn.click();
 
-// Wait a few seconds for audio to start streaming, then tap Send to
-// force ElevenLabs to commit. Without this tap, MANUAL commit mode
-// holds the transcript open forever (see TRANSPORT.md).
-const SEND_AFTER_MS = Number(process.env.SEND_AFTER_MS ?? 6000);
-const sendBtn = page.locator('button', { hasText: /^send turn/i }).first();
-setTimeout(() => {
-  sendBtn
-    .click()
-    .then(() => console.log('[probe] tapped Send turn'))
-    .catch((err) => console.log(`[probe] Send tap failed: ${err.message}`));
-}, SEND_AFTER_MS);
+const sendTap = (async () => {
+  await page.waitForTimeout(SEND_AFTER_MS);
+  await page.getByRole('button', { name: /^Send/i }).click({ timeout: 5000 });
+  console.log('[probe] tapped Send');
+})().catch((err) => {
+  console.log(`[probe] Send tap failed: ${err.message}`);
+});
 
 // Poll status pill + WS event count + activity-feed entries.
 const samples = [];
@@ -114,23 +110,13 @@ const samplesEnd = t0 + HOLD_MS;
 while (Date.now() < samplesEnd) {
   await page.waitForTimeout(sampleEvery);
   const status = await page.evaluate(() => {
-    // <ClientStatus> renders the transport state as plain text inside its
-    // wrapper. We walk the DOM looking for the known state strings.
-    const known = [
-      'ready',
-      'connected',
-      'connecting',
-      'authenticating',
-      'initializing',
-      'disconnected',
-      'error',
-      'authenticated',
-    ];
-    const candidates = Array.from(document.querySelectorAll('div, span'));
-    for (const el of candidates) {
-      const txt = el.textContent?.trim().toLowerCase() ?? '';
-      if (known.includes(txt)) return txt;
+    const text = document.body.innerText.toLowerCase();
+    if (text.includes('client\nready') && text.includes('agent\nready')) return 'ready';
+    if (text.includes('client\nconnecting') || text.includes('agent\nconnecting')) {
+      return 'connecting';
     }
+    if (text.includes('client\nerror') || text.includes('agent\nerror')) return 'error';
+    if (text.includes('client\ndisconnected')) return 'disconnected';
     return null;
   });
   // Live mic level — proves Web Audio is actually capturing samples.
@@ -176,8 +162,11 @@ const finalFeed = await page.evaluate(() => {
 
 await page.screenshot({ path: '/tmp/probe-end.png', fullPage: true });
 
-const result = { sessionId, connectedAt, wsEvents, samples, finalFeed, consoleLog };
+const finalUrl = page.url();
+const sessionId = finalUrl.match(/\/s\/([^/?#]+)/)?.[1] ?? existingSessionId ?? null;
+const result = { sessionId, finalUrl, connectedAt, wsEvents, samples, finalFeed, consoleLog };
 fs.writeFileSync('/tmp/probe-voice-result.json', JSON.stringify(result, null, 2));
+await sendTap;
 
 console.log('--- ws events ---');
 wsEvents.forEach((e) => console.log(e));

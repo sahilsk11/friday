@@ -1,10 +1,14 @@
-"""ProviderSessionProcessor — bridges a ProviderSession into pipecat.
+"""Friday voice processors for bridging ProviderSession into pipecat.
 
-Replaces the LLM slot in a standard pipecat voice stack:
+``UserTranscriptMirror`` preserves Friday's custom UI transcript messages while
+Pipecat owns turn detection.
 
-- Consumes ``TranscriptionFrame(finalized=True)`` → forwards to the
-  provider via ``session.send_turn``. Whether the provider's send_turn is
-  HTTP, an SDK call, or a queued message is not this processor's concern.
+``ProviderSessionProcessor`` replaces the LLM slot in a standard pipecat voice
+stack:
+
+- Receives completed user turns via ``send_user_turn`` → forwards to the
+  provider via ``session.send_turn``. Turn ownership lives in Pipecat's user
+  turn aggregator, not in raw STT frames.
 - Consumes ``InterruptionFrame`` → calls ``session.cancel()`` to abort the
   in-flight turn and resets local streaming state. The frame is also pushed
   downstream by the base class so TTS/STT clear their own buffers. The user
@@ -31,6 +35,7 @@ from typing import Any, override
 from loguru import logger
 from pipecat.frames.frames import (
     Frame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -54,6 +59,83 @@ RTVI_TOOL_STARTED = "tool-started"
 RTVI_ASSISTANT_TEXT_DELTA = "assistant-text-delta"
 RTVI_ASSISTANT_TEXT_FINAL = "assistant-text-final"
 RTVI_AGENT_STATE = "agent-state"
+RTVI_USER_TRANSCRIPT_RUNNING = "user-transcript-running"
+RTVI_USER_TRANSCRIPT_FINAL = "user-transcript-final"
+
+
+class UserTranscriptMirror(FrameProcessor):
+    """Mirror STT text into Friday's custom RTVI transcript messages.
+
+    This processor does not decide when a user turn is done. It only keeps the
+    visible transcript overlay current until Pipecat's turn aggregator emits a
+    completed user turn.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._committed: list[str] = []
+
+    @override
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, InterruptionFrame):
+            had_text = bool(self._committed)
+            self.reset()
+            if had_text:
+                await self.push_frame(
+                    RTVIServerMessageFrame(
+                        data={"type": RTVI_USER_TRANSCRIPT_RUNNING, "text": ""}
+                    )
+                )
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, TranscriptionFrame):
+            text = frame.text.strip()
+            if text:
+                self._committed.append(text)
+                await self._emit_running()
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, InterimTranscriptionFrame):
+            text = self.running_text(frame.text.strip())
+            if text:
+                await self.push_frame(
+                    RTVIServerMessageFrame(
+                        data={"type": RTVI_USER_TRANSCRIPT_RUNNING, "text": text}
+                    )
+                )
+            await self.push_frame(frame, direction)
+            return
+
+        await self.push_frame(frame, direction)
+
+    def reset(self) -> None:
+        self._committed = []
+
+    def running_text(self, tail: str = "") -> str:
+        parts = [*self._committed]
+        if tail:
+            parts.append(tail)
+        return " ".join(parts).strip()
+
+    async def emit_final(self, text: str) -> None:
+        self.reset()
+        await self.push_frame(
+            RTVIServerMessageFrame(
+                data={"type": RTVI_USER_TRANSCRIPT_FINAL, "text": text}
+            )
+        )
+
+    async def _emit_running(self) -> None:
+        text = self.running_text()
+        await self.push_frame(
+            RTVIServerMessageFrame(
+                data={"type": RTVI_USER_TRANSCRIPT_RUNNING, "text": text}
+            )
+        )
 
 
 class ProviderSessionProcessor(FrameProcessor):
@@ -114,21 +196,28 @@ class ProviderSessionProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InterruptionFrame):
-            await self._handle_interruption()
+            await self.cancel_current_turn()
             await self.push_frame(frame, direction)
             return
 
-        if isinstance(frame, TranscriptionFrame) and frame.finalized:
-            logger.info("provider_session_processor: transcription -> {!r}", frame.text)
-            # Consume the model the WS handler stamped from end-turn (if any)
-            # — opencode's per-session stickiness then carries it across
-            # subsequent turns until the user picks again.
-            model = self.next_turn_model
-            self.next_turn_model = None
-            await self._session.send_turn(frame.text, model=model, system=self._system_prompt)
-            return
-
         await self.push_frame(frame, direction)
+
+    async def send_user_turn(self, text: str) -> None:
+        """Forward a completed Pipecat-owned user turn to the provider."""
+        text = text.strip()
+        if not text:
+            return
+        logger.info("provider_session_processor: user turn -> {!r}", text)
+        # Consume the model the WS handler stamped from end-turn (if any) —
+        # opencode's per-session stickiness then carries it across subsequent
+        # turns until the user picks again.
+        model = self.next_turn_model
+        self.next_turn_model = None
+        await self._session.send_turn(text, model=model, system=self._system_prompt)
+
+    async def cancel_current_turn(self) -> None:
+        """Cancel the provider's in-flight turn and reset local response state."""
+        await self._handle_interruption()
 
     @override
     async def cleanup(self) -> None:

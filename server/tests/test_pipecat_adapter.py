@@ -26,8 +26,10 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TTSSpeakFrame,
 )
+from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
+from pipecat.tests.utils import run_test
 from pytest_httpx import HTTPXMock
 
 from friday.core.events import (
@@ -107,16 +109,7 @@ def _make_processor(
     return proc, pushed
 
 
-def _transcription(text: str) -> TranscriptionFrame:
-    return TranscriptionFrame(
-        text=text,
-        user_id="u1",
-        timestamp="2026-01-01T00:00:00Z",
-        finalized=True,
-    )
-
-
-async def test_finalized_transcription_posts_turn_to_opencode(
+async def test_send_user_turn_posts_turn_to_opencode(
     httpx_mock: HTTPXMock, session: OpencodeSession
 ) -> None:
     httpx_mock.add_response(
@@ -126,12 +119,12 @@ async def test_finalized_transcription_posts_turn_to_opencode(
     )
     proc, pushed = _make_processor(session)
 
-    await proc.process_frame(_transcription("hello world"), FrameDirection.DOWNSTREAM)
+    await proc.send_user_turn("hello world")
 
     sent = httpx_mock.get_requests()
     assert len(sent) == 1
     assert sent[0].url.path == f"/session/{SESSION_ID}/prompt_async"
-    # Finalized transcription is consumed (it was the user turn) — not pushed downstream.
+    # Completed user turns enter through send_user_turn, not raw STT frames.
     assert not any(isinstance(f, TranscriptionFrame) for f in pushed)
 
 
@@ -384,13 +377,16 @@ async def test_interruption_aborts_opencode_and_passes_frame_through(
         url=f"{OPENCODE_URL}/session/{SESSION_ID}/abort",
         status_code=204,
     )
-    proc, pushed = _make_processor(session)
+    proc = ProviderSessionProcessor(session, system_prompt=_TEST_SYSTEM_PROMPT)
 
-    await proc.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+    down_frames, _ = await run_test(
+        Pipeline([proc]),
+        frames_to_send=[InterruptionFrame()],
+    )
 
     aborts = [r for r in httpx_mock.get_requests() if r.url.path.endswith("/abort")]
     assert len(aborts) == 1
-    assert any(isinstance(f, InterruptionFrame) for f in pushed)
+    assert any(isinstance(f, InterruptionFrame) for f in down_frames)
 
 
 async def test_stop_speaking_pushes_interruption_without_aborting_opencode(
@@ -414,7 +410,7 @@ async def test_stop_speaking_pushes_interruption_without_aborting_opencode(
     assert aborts == []
 
 
-async def test_two_back_to_back_turns_both_forwarded(
+async def test_two_back_to_back_user_turns_both_forwarded(
     httpx_mock: HTTPXMock, session: OpencodeSession
 ) -> None:
     httpx_mock.add_response(
@@ -429,8 +425,8 @@ async def test_two_back_to_back_turns_both_forwarded(
     )
     proc, _ = _make_processor(session)
 
-    await proc.process_frame(_transcription("alpha"), FrameDirection.DOWNSTREAM)
-    await proc.process_frame(_transcription("beta"), FrameDirection.DOWNSTREAM)
+    await proc.send_user_turn("alpha")
+    await proc.send_user_turn("beta")
 
     requests = httpx_mock.get_requests()
     assert len(requests) == 2
