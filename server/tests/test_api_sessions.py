@@ -1,8 +1,8 @@
 """HTTP + SSE tests for the sessions router.
 
 The router talks to opencode via ``OpencodeProvider.http``. Tests inject a
-non-started OpencodeProvider (no SSE loop) and let pytest-httpx canned
-responses stand in for opencode HTTP.
+non-started OpencodeProvider (no SSE loop) wrapped in a ProviderRegistry and
+let pytest-httpx canned responses stand in for opencode HTTP.
 
 For SSE we drive synthetic events directly into the cached
 ``OpencodeSession`` via ``dispatch()`` — the SSE generator's observers fire
@@ -20,13 +20,14 @@ import pytest
 from httpx import ASGITransport
 from pytest_httpx import HTTPXMock
 
-from friday.api.sessions import get_provider, stream_events
+from friday.api.sessions import get_registry, stream_events
 from friday.core.events import (
     MessagePartDelta,
     MessageUpdated,
     SessionStatus,
 )
 from friday.core.opencode_provider import OpencodeProvider, OpencodeSession
+from friday.core.session_registry import ProviderRegistry
 from friday.main import create_app
 
 OPENCODE_URL = "http://opencode.test"
@@ -41,9 +42,19 @@ async def provider() -> AsyncIterator[OpencodeProvider]:
 
 
 @pytest.fixture
-def client(provider: OpencodeProvider) -> httpx.AsyncClient:
+def registry(provider: OpencodeProvider) -> ProviderRegistry:
+    reg = ProviderRegistry()
+    reg.add(provider)
+    # Pre-register the session id used across most tests so resolve_for_session
+    # returns immediately without probing opencode via HTTP.
+    reg.register_session("ses_a", provider.provider_id)
+    return reg
+
+
+@pytest.fixture
+def client(registry: ProviderRegistry) -> httpx.AsyncClient:
     app = create_app(with_lifespan=False)
-    app.dependency_overrides[get_provider] = lambda: provider
+    app.dependency_overrides[get_registry] = lambda: registry
     transport = ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://friday.test")
 
@@ -225,25 +236,14 @@ async def test_post_turn_forwards_to_opencode(
     assert json.loads(sent.content) == {"parts": [{"type": "text", "text": "hi"}]}
 
 
-async def test_sse_streams_delta_final_and_state(provider: OpencodeProvider) -> None:
-    """Drive the SSE route handler directly and consume its body iterator.
-
-    We bypass ASGITransport here — it buffers streaming responses in-process,
-    which deadlocks the test (the body generator is awaiting events that we
-    can only dispatch after the response context manager opens, but the
-    transport doesn't surface chunks until the generator returns). Calling the
-    route function directly exercises the full observer-registration + queue
-    + frame-packing path with deterministic ordering. The HTTP integration
-    is verified end-to-end against live opencode in
-    ``scripts/probe_api_sessions.py``.
-    """
-    response = await stream_events(session_id="ses_a", provider=provider)
+async def test_sse_streams_delta_final_and_state(
+    provider: OpencodeProvider, registry: ProviderRegistry
+) -> None:
+    """Drive the SSE route handler directly and consume its body iterator."""
+    response = await stream_events(session_id="ses_a", registry=registry)
     assert response.media_type == "text/event-stream"
 
     session = provider.attach("ses_a")
-    # `attach` is typed as ProviderSession (the abstraction); for this test we
-    # need the opencode-specific `dispatch()` to feed canned events through the
-    # observer chain. OpencodeProvider always returns OpencodeSession today.
     assert isinstance(session, OpencodeSession)
     await session.dispatch(SessionStatus(session_id="ses_a", status="busy"))
     await session.dispatch(
