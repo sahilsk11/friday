@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from claude_agent_sdk import (
@@ -63,6 +65,14 @@ class ClaudeCodeSession:
     title: str | None = None
     directory: str | None = None
     current_state: AgentState = AgentState.IDLE
+
+    # SDK-assigned UUID. Empty on pending sessions (before the first query() fires).
+    # For cold-attached sessions, _sdk_id == id from the start.
+    _sdk_id: str = ""
+    # Called once when the SDK fires its first session_id (pending sessions only).
+    _on_sdk_id_assigned: Callable[[str], Awaitable[None]] | None = field(
+        default=None, repr=False
+    )
 
     _delta_handlers: list[TextDeltaHandler] = field(default_factory=list, repr=False)
     _final_handlers: list[TextFinalHandler] = field(default_factory=list, repr=False)
@@ -125,10 +135,13 @@ class ClaudeCodeSession:
                 self.directory = getattr(info, "cwd", None)
         if self.directory is not None:
             opts.cwd = self.directory
-        # resume an existing session when we have its id, otherwise the
-        # SDK creates a fresh session and we capture the id from its first
-        # response.
-        if self.id:
+        # Resume an existing session if we know the SDK-assigned UUID.
+        # For pending new sessions both are empty — the SDK creates a fresh
+        # session and we capture the id from the first response event.
+        # For cold-attached sessions id == _sdk_id, so either works.
+        if self._sdk_id:
+            opts.resume = self._sdk_id
+        elif self.id:
             opts.resume = self.id
 
         async def run_query():
@@ -163,17 +176,24 @@ class ClaudeCodeSession:
             await self._handle_result(msg)
 
     def _capture_session_id(self, msg: Any) -> None:
-        if self.id:
+        if self._sdk_id:
             return
         sid = getattr(msg, "session_id", None)
         if sid:
-            self.id = sid
+            self._assign_sdk_id(sid)
 
     async def _handle_system(self, msg: SystemMessage) -> None:
         if msg.subtype == "init":
             sid = msg.data.get("session_id")
-            if sid:
-                self.id = sid
+            if sid and not self._sdk_id:
+                self._assign_sdk_id(sid)
+
+    def _assign_sdk_id(self, sdk_id: str) -> None:
+        self._sdk_id = sdk_id
+        if not self.id:
+            self.id = sdk_id
+        if self._on_sdk_id_assigned is not None:
+            asyncio.create_task(self._on_sdk_id_assigned(sdk_id))
 
     async def _handle_assistant(self, msg: AssistantMessage) -> None:
         for block in msg.content:
@@ -270,9 +290,14 @@ class ClaudeCodeProvider:
         existing = self._sessions.get(session_id)
         if existing is not None:
             return existing
-        session = ClaudeCodeSession(_http=None, id=session_id)
+        # Cold-attach: session_id IS the SDK UUID.
+        session = ClaudeCodeSession(_http=None, id=session_id, _sdk_id=session_id)
         self._sessions[session_id] = session
         return session
+
+    def register_session_by_sdk_id(self, session: ClaudeCodeSession, sdk_id: str) -> None:
+        """Index a pending session by its SDK-assigned UUID after the first turn fires."""
+        self._sessions[sdk_id] = session
 
     # ── Persistence ────────────────────────────────────────────────────
 
@@ -281,6 +306,26 @@ class ClaudeCodeProvider:
         return [_session_info_from_sdk(row) for row in rows]
 
     async def get_session(self, session_id: str) -> SessionInfo:
+        session = self._sessions.get(session_id)
+        if session is not None:
+            sdk_id = session._sdk_id or session.id
+            if not sdk_id:
+                # Pending session — hasn't had a turn yet; return an in-memory stub.
+                now = datetime.now(UTC)
+                return SessionInfo(
+                    id=session_id,
+                    title=session.title or "",
+                    directory=session.directory or "",
+                    created_at=now,
+                    updated_at=now,
+                )
+            info = await asyncio.to_thread(get_session_info, sdk_id)
+            if info is None:
+                raise SessionNotFound(f"claude-code session not found: {session_id}")
+            result = _session_info_from_sdk(info)
+            # Map the SDK UUID back to the caller's session_id when they differ.
+            return dataclasses.replace(result, id=session_id) if session_id != sdk_id else result
+        # Fallback: session_id is the SDK UUID (not in the live cache).
         info = await asyncio.to_thread(get_session_info, session_id)
         if info is None:
             raise SessionNotFound(f"claude-code session not found: {session_id}")
@@ -290,8 +335,14 @@ class ClaudeCodeProvider:
         # SDK returns parsed, sidechain-filtered messages but strips
         # per-message timestamps. We don't re-parse the raw JSONL to recover
         # them — completed_at stays None, which the UI already handles.
-        # Timestamps aren't worth a disk read on every transcript fetch.
-        sdk_msgs = await asyncio.to_thread(get_session_messages, session_id)
+        session = self._sessions.get(session_id)
+        if session is not None:
+            sdk_id = session._sdk_id or session.id
+            if not sdk_id:
+                return []  # Pending session — no messages yet.
+        else:
+            sdk_id = session_id
+        sdk_msgs = await asyncio.to_thread(get_session_messages, sdk_id)
         return [_message_from_sdk(m) for m in sdk_msgs]
 
     async def list_models(self) -> ModelCatalog:

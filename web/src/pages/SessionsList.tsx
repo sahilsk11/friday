@@ -1,10 +1,10 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 
 import { isApiError } from '@/lib/api';
 import { useSelectedModel } from '@/lib/selectedModel';
-import { createSession, listHarnesses, listModels, listSessions } from '@/lib/sessions';
+import { listHarnesses, listModels, listSessions } from '@/lib/sessions';
 import type { HarnessInfo, ModelInfo, ModelRef } from '@/types/api';
 
 // Plain REST. No voice-ui-kit imports here — per jarvis.md, only the
@@ -105,7 +105,6 @@ export default function SessionsList() {
 }
 
 function NewSessionModal({ onClose }: { onClose: () => void }) {
-  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { model: selectedModel, setModel } = useSelectedModel();
   const [title, setTitle] = useState('');
@@ -157,35 +156,18 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
 
   const currentValue = selectedModel ? modelKey(selectedModel) : '';
 
-  const createMutation = useMutation({
-    mutationFn: ({ t, d, h }: { t: string; d: string; h: string }) =>
-      createSession(d, h, t || undefined),
-    onSuccess: async (row) => {
-      await queryClient.invalidateQueries({ queryKey: ['sessions'] });
-      void navigate(`/s/${row.id}`);
-    },
-  });
-
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !createMutation.isPending) {
-        onClose();
-      }
+      if (e.key === 'Escape') onClose();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [onClose, createMutation.isPending]);
-
-  const errorMessage = createMutation.error
-    ? isApiError(createMutation.error)
-      ? createMutation.error.message
-      : 'failed to create session'
-    : null;
+  }, [onClose]);
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
-      onClick={() => { if (!createMutation.isPending) onClose(); }}
+      onClick={() => onClose()}
     >
       <div
         className="w-full max-w-md rounded-lg border border-neutral-800 bg-neutral-950 p-6 shadow-xl"
@@ -200,7 +182,10 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
             const d = directory.trim();
             if (!d) { directoryRef.current?.focus(); return; }
             if (!harness) return;
-            createMutation.mutate({ t: title.trim(), d, h: harness });
+            navigate('/s/new', {
+              state: { harness, directory: d, title: title.trim() || undefined },
+            });
+            onClose();
           }}
         >
           <label className="flex flex-col gap-1">
@@ -208,7 +193,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
             <select
               value={harness}
               onChange={(e) => setHarness(e.target.value)}
-              disabled={createMutation.isPending || harnessesQuery.isLoading}
+              disabled={harnessesQuery.isLoading}
               className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm focus:border-neutral-500 focus:outline-none disabled:opacity-50"
             >
               {harnessesQuery.isLoading ? (
@@ -231,7 +216,6 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm placeholder:text-neutral-500 focus:border-neutral-500 focus:outline-none"
-              disabled={createMutation.isPending}
               autoFocus
             />
           </label>
@@ -248,7 +232,6 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
               onChange={(e) => setDirectory(e.target.value)}
               required
               className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 font-mono text-sm placeholder:text-neutral-500 focus:border-neutral-500 focus:outline-none"
-              disabled={createMutation.isPending}
             />
             <span className="text-xs text-neutral-500">
               must be an absolute path that exists on the friday host.
@@ -263,9 +246,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
                 const next = parseModelKey(e.target.value);
                 if (next) setModel(next);
               }}
-              disabled={
-                createMutation.isPending || modelsQuery.isLoading || groupedModels.length === 0
-              }
+              disabled={modelsQuery.isLoading || groupedModels.length === 0}
               className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm focus:border-neutral-500 focus:outline-none disabled:opacity-50"
             >
               {modelsQuery.isLoading ? (
@@ -288,27 +269,20 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
             </select>
           </label>
 
-          {errorMessage ? (
-            <div className="rounded-md border border-red-800 bg-red-950/40 px-3 py-2 text-sm text-red-200">
-              {errorMessage}
-            </div>
-          ) : null}
-
           <div className="mt-2 flex justify-end gap-2">
             <button
               type="button"
               onClick={onClose}
-              disabled={createMutation.isPending}
-              className="rounded-md border border-neutral-700 px-4 py-2 text-sm hover:border-neutral-500 disabled:opacity-50"
+              className="rounded-md border border-neutral-700 px-4 py-2 text-sm hover:border-neutral-500"
             >
               cancel
             </button>
             <button
               type="submit"
-              disabled={createMutation.isPending || !directory.trim() || !harness}
+              disabled={!directory.trim() || !harness}
               className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-white disabled:opacity-50"
             >
-              {createMutation.isPending ? 'creating…' : 'create'}
+              start session
             </button>
           </div>
         </form>
