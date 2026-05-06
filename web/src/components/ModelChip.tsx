@@ -34,7 +34,7 @@ export function ModelChip({
 
   const modelsQuery = useQuery({
     queryKey: ['models'],
-    queryFn: listModels,
+    queryFn: () => listModels(),
     staleTime: 5 * 60 * 1000,
     enabled: open,
   });
