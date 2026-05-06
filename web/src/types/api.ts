@@ -39,6 +39,11 @@ export interface SessionDetail {
   agent_state: AgentState;
 }
 
+export interface HarnessInfo {
+  id: string;
+  name: string;
+}
+
 // SSE frame types (see GET /sessions/:id/events in BackendIntegration.md).
 export type SessionEvent =
   | { type: 'state'; state: AgentState }

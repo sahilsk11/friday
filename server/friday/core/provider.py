@@ -219,6 +219,10 @@ class ProviderSession(Protocol):
         ...
 
 
+class SessionNotFound(Exception):
+    """Raised by a provider when a session_id has no matching session."""
+
+
 def subscribe[H](handlers: list[H], handler: H) -> Unsubscribe:
     """Append a handler and return a function that removes it."""
     handlers.append(handler)

@@ -42,8 +42,8 @@ Notes:
 - App data (sessions, transcripts, agent state) flows through REST/SSE in
   ``friday.api.sessions`` — not via RTVI custom messages. RTVI is voice-UI
   state only.
-- ``?session_id=…`` on the WS URL attaches to an existing opencode session;
-  if absent, we create a new one.
+- ``?session_id=…`` on the WS URL is required — create via ``POST /sessions``
+  first. Missing session_id closes the socket immediately with 1003.
 - Auth (Step 6) will accept ``?t=…`` here once it lands; until then the
   endpoint is open and expects to be reachable on localhost.
 """
@@ -79,6 +79,7 @@ from pipecat.transports.websocket.fastapi import (
 )
 
 from friday.core.provider import ModelChoice, Provider
+from friday.core.session_registry import ProviderRegistry
 from friday.voice.elevenlabs_force_commit import ElevenLabsRealtimeSTTServiceForceCommit
 from friday.voice.pipecat_adapter import ProviderSessionProcessor
 from friday.voice.turn_accumulator import TurnAccumulator
@@ -89,10 +90,16 @@ router = APIRouter(tags=["voice"])
 # We can't use the HTTP-flavored ``get_provider`` Depends from
 # ``friday.api.sessions`` here — FastAPI's WebSocket scope doesn't have a
 # ``Request`` to inject. Read straight off ``app.state`` instead.
-def _resolve_provider(websocket: WebSocket) -> Provider:
-    provider: Provider | None = getattr(websocket.app.state, "provider", None)
+async def _resolve_provider_for_session(websocket: WebSocket, session_id: str) -> Provider | None:
+    """Look up which provider owns the session; close the WS with an error if missing."""
+    registry: ProviderRegistry | None = getattr(websocket.app.state, "registry", None)
+    if registry is None:
+        await websocket.close(code=1011, reason="provider not ready")
+        return None
+    provider = await registry.resolve_for_session(session_id)
     if provider is None:
-        raise RuntimeError("provider not ready")
+        await websocket.close(code=1008, reason=f"session not found: {session_id}")
+        return None
     return provider
 
 
@@ -107,21 +114,24 @@ _AUDIO_OUT_SAMPLE_RATE = 24_000
 async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
     """Bidirectional voice stream.
 
-    Accepts ``?session_id=…`` to attach to an existing opencode session.
-    Without it, lazily creates a new session.
+    Requires ``?session_id=…`` — create the session via ``POST /sessions``
+    first. Closes with 1003 if session_id is absent, 1011 if the provider
+    is not ready.
 
     Returns when the client closes the WebSocket; pipecat's PipelineRunner
     tears down its pipeline and closes the underlying ``FastAPIWebsocketClient``.
     """
-    provider = _resolve_provider(websocket)
-    await websocket.accept()
+    if not session_id:
+        await websocket.close(code=1003, reason="session_id required; POST /sessions first")
+        return
 
-    if session_id:
-        session = provider.attach(session_id)
-        logger.info("voice: attached to provider session | id={}", session.id)
-    else:
-        session = await provider.create_session()
-        logger.info("voice: created new provider session | id={}", session.id)
+    await websocket.accept()
+    provider = await _resolve_provider_for_session(websocket, session_id)
+    if provider is None:
+        return
+
+    session = provider.attach(session_id)
+    logger.info("voice: attached to provider session | id={} provider={}", session.id, provider.provider_id)
 
     transport = FastAPIWebsocketTransport(
         websocket=websocket,

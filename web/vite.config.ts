@@ -22,6 +22,7 @@ export default defineConfig({
     proxy: {
       '/sessions': 'http://localhost:8000',
       '/models': 'http://localhost:8000',
+      '/harnesses': 'http://localhost:8000',
       '/api': { target: 'http://localhost:8000', ws: true },
     },
   },

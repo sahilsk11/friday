@@ -1,5 +1,5 @@
 import { apiClient } from './api';
-import type { ModelRef, ModelsResponse, SessionDetail, SessionRow } from '@/types/api';
+import type { HarnessInfo, ModelRef, ModelsResponse, SessionDetail, SessionRow } from '@/types/api';
 
 // Thin typed wrappers around the REST surface. Pages call these
 // directly via TanStack Query — no extra abstraction layer.
@@ -9,10 +9,13 @@ export function listSessions(directory?: string): Promise<SessionRow[]> {
   return apiClient.get<SessionRow[]>(`/sessions${qs}`);
 }
 
-export function createSession(title?: string, directory?: string): Promise<SessionRow> {
-  const body: { title?: string; directory?: string } = {};
+export function createSession(
+  directory: string,
+  harness: string,
+  title?: string,
+): Promise<SessionRow> {
+  const body: { directory: string; harness: string; title?: string } = { directory, harness };
   if (title) body.title = title;
-  if (directory) body.directory = directory;
   return apiClient.post<SessionRow>('/sessions', body);
 }
 
@@ -30,6 +33,11 @@ export function postTurn(
   return apiClient.post<{ session_id: string }>(`/sessions/${id}/turn`, body);
 }
 
-export function listModels(): Promise<ModelsResponse> {
-  return apiClient.get<ModelsResponse>('/models');
+export function listModels(harness?: string): Promise<ModelsResponse> {
+  const qs = harness ? `?harness=${encodeURIComponent(harness)}` : '';
+  return apiClient.get<ModelsResponse>(`/models${qs}`);
+}
+
+export function listHarnesses(): Promise<HarnessInfo[]> {
+  return apiClient.get<HarnessInfo[]>('/harnesses');
 }
