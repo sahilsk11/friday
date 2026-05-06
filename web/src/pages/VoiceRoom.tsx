@@ -75,7 +75,10 @@ export default function VoiceRoom(): React.ReactElement {
   // turns immediately when reopening an existing session.
   const sessionQuery = useQuery({
     queryKey: ['session', resolvedSessionId],
-    queryFn: () => getSession(resolvedSessionId!),
+    queryFn: () => {
+      if (!resolvedSessionId) throw new Error('session id missing');
+      return getSession(resolvedSessionId);
+    },
     enabled: Boolean(resolvedSessionId),
   });
 
@@ -84,7 +87,7 @@ export default function VoiceRoom(): React.ReactElement {
     (newId: string) => {
       setResolvedSessionId(newId);
       // Replace the URL in-place so the back button doesn't return to /s/new.
-      navigate(`/s/${newId}`, { replace: true });
+      void navigate(`/s/${newId}`, { replace: true });
     },
     [navigate],
   );
@@ -126,7 +129,9 @@ export default function VoiceRoom(): React.ReactElement {
     })();
     setClient(pcClient);
     return () => {
-      void pcClient.disconnect().catch(() => {});
+      void pcClient.disconnect().catch((err: unknown) => {
+        console.warn('voice disconnect failed', err);
+      });
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -154,6 +159,7 @@ export default function VoiceRoom(): React.ReactElement {
     <PipecatClientProvider client={client}>
       <VoiceRoomShell
         sessionId={resolvedSessionId ?? ''}
+        harness={sessionQuery.data?.session.harness ?? pendingParams?.harness ?? null}
         initialTranscript={sessionQuery.data?.transcript ?? []}
         initialAgentState={sessionQuery.data?.agent_state ?? 'idle'}
         isPending={!resolvedSessionId}
@@ -165,18 +171,20 @@ export default function VoiceRoom(): React.ReactElement {
 
 function VoiceRoomShell({
   sessionId,
+  harness,
   initialTranscript,
   initialAgentState,
   isPending,
   onSessionCreated,
 }: {
   sessionId: string;
+  harness: string | null;
   initialTranscript: TranscriptEntry[];
   initialAgentState: AgentState;
   isPending: boolean;
   onSessionCreated: (id: string) => void;
 }): React.ReactElement {
-  const { model: selectedModel, setModel } = useSelectedModel();
+  const { model: selectedModel, setModel } = useSelectedModel(harness);
   const { narrateTools, setNarrateTools } = useNarrateTools();
   return (
     <div className="mx-auto flex h-screen max-w-5xl flex-col px-6 py-6">
@@ -187,7 +195,7 @@ function VoiceRoomShell({
         </Link>
         <div className="flex items-center gap-3">
           <NarrateToolsToggle value={narrateTools} onChange={setNarrateTools} />
-          <ModelChip selected={selectedModel} onChange={setModel} />
+          <ModelChip harness={harness} selected={selectedModel} onChange={setModel} />
           {sessionId && !isPending && (
             <Link
               to={`/s/${sessionId}/transcript`}
@@ -249,7 +257,7 @@ function VoiceRoomShell({
               in an input) toggles the same action. ElevenLabs realtime STT
               is in MANUAL commit mode — Send is what actually finalizes
               the transcript. */}
-          <RecordButton />
+          <RecordButton model={selectedModel} />
           {/* Manual barge-in. Stops TTS mid-sentence and aborts the in-flight
               opencode turn without opening the mic. RecordButton already
               interrupts when started mid-narration, so this is for "shut
@@ -311,7 +319,7 @@ function AutoEnableMicOnConnect(): null {
 // Live running transcript — what we've heard so far this turn.
 //
 // Replaces (not appends) on each `user-transcript-running` server message
-// the TurnAccumulator emits per ElevenLabs commit. Clears on
+// the backend emits while mirroring STT text. Clears on
 // `user-transcript-final` (turn ended, locked into the feed) and on a
 // fresh turn's first running message. This is intentionally simple state:
 // one string, one box.
@@ -403,10 +411,9 @@ function useAgentBusy(): boolean {
 // or focused buttons toggles Start/Send. Buttons keep their own native
 // space-to-activate so the global handler skips them and we don't fire
 // the toggle twice.
-function RecordButton(): React.ReactElement {
+function RecordButton({ model }: { model: ModelRef | null }): React.ReactElement {
   const client = usePipecatClient();
   const { enableMic, isMicEnabled } = usePipecatClientMicControl();
-  const { model } = useSelectedModel();
   const { narrateTools } = useNarrateTools();
   const agentBusy = useAgentBusy();
 

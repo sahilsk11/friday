@@ -14,28 +14,18 @@ NAT-traversal ceremony has nothing to do here. WebSocket is sub-second.
 Pipeline shape per connection::
 
     transport.input()
-        → STT (ElevenLabs realtime VAD-mode, or Deepgram)
-        → TurnAccumulator                           # buffers commits → turns
-        → ProviderSessionProcessor                         # replaces the LLM slot
+        → STT (ElevenLabs realtime manual/Pipecat-VAD mode, or Deepgram)
+        → UserTranscriptMirror                 # UI transcript messages only
+        → LLMUserAggregator                    # Pipecat owns turn boundaries
+        → ProviderSessionProcessor             # replaces the LLM slot
         → TTS (ElevenLabs, or Cartesia)
         → transport.output()
         → RTVIProcessor                             # voice-UI state surface
 
-Why a TurnAccumulator: ElevenLabs realtime STT in VAD mode commits
-aggressively (every ~500ms of silence) to keep its own audio buffer small,
-and even in MANUAL mode auto-commits at 90s. Each commit is just an ASR
-buffer flush, not a turn boundary — but every commit produces a
-``TranscriptionFrame`` that the downstream processor would otherwise treat
-as a turn. The accumulator separates the two concerns: it buffers commits
-into the in-progress turn and only emits a synthetic finalized
-``TranscriptionFrame`` downstream when the *real* turn ends (3s of silence
-for hands-free mode, or tap-to-send via ``arm_flush``). See
-``turn_accumulator.py`` for details.
-
-Why no Silero VAD: ElevenLabs realtime STT does its own segmentation in
-VAD mode at the threshold we configure (500ms). A second VAD on top would
-fight ElevenLabs' commit timing. If we ever swap to a STT without built-in
-VAD, add Silero here.
+Pipecat owns turn-taking. STT transcript finalization only means "these
+words were recognized"; ``LLMUserAggregator`` waits for real VAD stop plus a
+coding-assistant pause window before Friday sends a completed turn to the
+provider.
 
 Notes:
 
@@ -50,15 +40,24 @@ Notes:
 
 from __future__ import annotations
 
+import asyncio
 import os
+import pathlib
+from typing import Any
 
 from fastapi import APIRouter, WebSocket
 from loguru import logger
-from pipecat.frames.frames import InterruptionTaskFrame, VADUserStoppedSpeakingFrame
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import InterruptionTaskFrame
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMUserAggregator,
+    LLMUserAggregatorParams,
+)
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.frameworks.rtvi.models import ClientMessage
 from pipecat.processors.frameworks.rtvi.observer import RTVIObserver, RTVIObserverParams
@@ -66,10 +65,7 @@ from pipecat.processors.frameworks.rtvi.processor import RTVIProcessor
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.elevenlabs.stt import (
-    CommitStrategy,
-    ElevenLabsRealtimeSTTSettings,
-)
+from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.stt_service import STTService
 from pipecat.services.tts_service import TTSService
@@ -77,12 +73,13 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
+from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy, VADUserTurnStartStrategy
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from friday.core.provider import ModelChoice, Provider
 from friday.core.session_registry import ProviderRegistry
-from friday.voice.elevenlabs_force_commit import ElevenLabsRealtimeSTTServiceForceCommit
-from friday.voice.pipecat_adapter import ProviderSessionProcessor
-from friday.voice.turn_accumulator import TurnAccumulator
+from friday.voice.pipecat_adapter import ProviderSessionProcessor, UserTranscriptMirror
 
 router = APIRouter(tags=["voice"])
 
@@ -108,10 +105,11 @@ async def _resolve_provider_for_session(websocket: WebSocket, session_id: str) -
 # output). Keeping these aligned avoids resampling on either side.
 _AUDIO_IN_SAMPLE_RATE = 16_000
 _AUDIO_OUT_SAMPLE_RATE = 24_000
+_USER_SPEECH_TIMEOUT_SECS = 1.5
 
 
 @router.websocket("/api/voice")
-async def voice(
+async def voice(  # noqa: PLR0911, PLR0915
     websocket: WebSocket,
     session_id: str | None = None,
     harness: str | None = None,
@@ -151,6 +149,13 @@ async def voice(
         if registry is None:
             await websocket.close(code=1011, reason="provider not ready")
             return
+        path = pathlib.Path(directory)
+        if not path.is_absolute():
+            await websocket.close(code=1008, reason="directory must be absolute")
+            return
+        if not await asyncio.to_thread(path.is_dir):
+            await websocket.close(code=1008, reason=f"directory does not exist: {directory}")
+            return
         provider = registry.get(harness)
         if provider is None:
             await websocket.close(code=1008, reason=f"unknown harness: {harness!r}")
@@ -186,11 +191,16 @@ async def voice(
         ),
     )
 
-    stt = _select_stt()
-    tts = _select_tts()
-    accumulator = TurnAccumulator()
+    services = await _select_voice_services(websocket, session.id)
+    if services is None:
+        return
+    stt, tts = services
+
+    transcript_mirror = UserTranscriptMirror()
+    user_aggregator = _make_user_aggregator()
     agent = ProviderSessionProcessor(session)
     rtvi = RTVIProcessor(transport=transport)
+    _wire_turn_dispatcher(user_aggregator, transcript_mirror, agent)
 
     # Echo client-ready back as bot-ready. Pipecat's RTVIProcessor only
     # sends bot-ready when the app explicitly signals it — the convention
@@ -235,17 +245,10 @@ async def voice(
 
     rtvi.event_handler("on_client_ready")(_on_client_ready)
 
-    # Tap-to-end-turn: client sends {type: "end-turn"} when the user is
-    # done speaking. Two things have to happen, in order:
-    #   1. Arm the TurnAccumulator so it knows the next committed_transcript
-    #      from ElevenLabs is the trailing edge of the turn — flush as soon
-    #      as it lands (with a timeout fallback if it doesn't).
-    #   2. Push VADUserStoppedSpeakingFrame upstream so the STT shim
-    #      (ElevenLabsRealtimeSTTServiceForceCommit) sends {commit: True}
-    #      to ElevenLabs even in VAD mode, capturing the audio between the
-    #      last natural pause and the tap.
-    # Hands-free turn-ends — 3s of silence with no commits arriving — are
-    # handled entirely inside the accumulator; no client message needed.
+    # Tap-to-end-turn: client sends {type: "end-turn"} with Friday metadata
+    # (model choice and tool narration). Turn finalization itself is still
+    # owned by Pipecat's VAD/user-turn aggregator; this path deliberately does
+    # not forge speech-stop frames.
     async def _on_client_message(processor: RTVIProcessor, msg: ClientMessage) -> None:
         if msg.type == "end-turn":
             # Optional ``model`` rides along on end-turn — we stamp it on the
@@ -260,13 +263,11 @@ async def voice(
             if narrate is not None:
                 agent.narrate_tools = narrate
             logger.info(
-                "voice: end-turn received | session={} model={} narrate_tools={}",
+                "voice: end-turn metadata received | session={} model={} narrate_tools={}",
                 session.id,
                 agent.next_turn_model,
                 agent.narrate_tools,
             )
-            accumulator.arm_flush()
-            await processor.push_frame(VADUserStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
         elif msg.type == "interrupt":
             # User tapped the Interrupt button. Push InterruptionTaskFrame
             # upstream — the pipeline task converts it to a downstream
@@ -313,7 +314,8 @@ async def voice(
         [
             transport.input(),
             stt,
-            accumulator,
+            transcript_mirror,
+            user_aggregator,
             agent,
             tts,
             rtvi,
@@ -322,7 +324,7 @@ async def voice(
     )
 
     # Disable the observer's built-in user-transcription auto-emit. The
-    # accumulator owns user-transcript messaging now via two custom RTVI
+    # mirror owns user-transcript messaging now via two custom RTVI
     # server-message types (running and final); without this flag every
     # commit from ElevenLabs would still fan out a duplicate "final=true"
     # transcript to the client. Other observer features (bot speaking,
@@ -374,6 +376,60 @@ def _parse_model(data: object) -> ModelChoice | None:
     return None
 
 
+async def _select_voice_services(
+    websocket: WebSocket, session_id: str
+) -> tuple[STTService, TTSService] | None:
+    try:
+        return _select_stt(), _select_tts()
+    except RuntimeError as exc:
+        logger.error("voice: provider configuration failed | session={} err={}", session_id, exc)
+        await websocket.close(code=1011, reason=str(exc))
+        return None
+
+
+def _make_user_aggregator() -> LLMUserAggregator:
+    """Build the Pipecat user-turn owner for Friday voice turns."""
+    return LLMUserAggregator(
+        LLMContext(),
+        params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+            user_turn_strategies=UserTurnStrategies(
+                start=[
+                    VADUserTurnStartStrategy(enable_interruptions=False),
+                    TranscriptionUserTurnStartStrategy(enable_interruptions=False),
+                ],
+                stop=[
+                    SpeechTimeoutUserTurnStopStrategy(
+                        user_speech_timeout=_USER_SPEECH_TIMEOUT_SECS
+                    )
+                ],
+            ),
+        ),
+    )
+
+
+def _wire_turn_dispatcher(
+    user_aggregator: LLMUserAggregator,
+    transcript_mirror: UserTranscriptMirror,
+    agent: ProviderSessionProcessor,
+) -> None:
+    """Route completed Pipecat user turns into Friday provider sessions."""
+
+    async def on_user_turn_stopped(
+        _aggregator: LLMUserAggregator,
+        _strategy: object,
+        message: Any,
+    ) -> None:
+        text = getattr(message, "content", "").strip()
+        if not text:
+            transcript_mirror.reset()
+            return
+        await transcript_mirror.emit_final(text)
+        await agent.send_user_turn(text)
+
+    user_aggregator.add_event_handler("on_user_turn_stopped", on_user_turn_stopped)
+
+
 async def shutdown() -> None:
     """No-op for compatibility with the old WebRTC handler.
 
@@ -388,13 +444,9 @@ def _select_stt() -> STTService:
     ElevenLabs realtime wins over Deepgram when both are present.
     Override with ``FRIDAY_STT_PROVIDER=elevenlabs`` or ``=deepgram``.
 
-    ElevenLabs is configured for VAD-strategy commits at 500ms silence:
-    early-and-often segmentation keeps ElevenLabs' audio buffer small
-    (lower ASR latency), prevents the 90s force-commit from ever firing,
-    and lets the ``TurnAccumulator`` reason about a steady stream of
-    fragments rather than one giant chunk. We use the force-commit shim
-    so tap-to-send still flushes trailing audio in VAD mode (pipecat's
-    stock service only sends manual commits in MANUAL mode).
+    ElevenLabs uses its default manual commit strategy. In Pipecat terms this
+    means local VAD owns speech stop; the STT service commits only when Pipecat
+    observes a real ``VADUserStoppedSpeakingFrame``.
     """
     forced = os.environ.get("FRIDAY_STT_PROVIDER", "").lower()
     elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY")
@@ -404,11 +456,7 @@ def _select_stt() -> STTService:
     if use_elevenlabs:
         if not elevenlabs_key:
             raise RuntimeError("ELEVENLABS_API_KEY not set")
-        return ElevenLabsRealtimeSTTServiceForceCommit(
-            api_key=elevenlabs_key,
-            commit_strategy=CommitStrategy.VAD,
-            settings=ElevenLabsRealtimeSTTSettings(vad_silence_threshold_secs=0.5),
-        )
+        return ElevenLabsRealtimeSTTService(api_key=elevenlabs_key)
     if not deepgram_key:
         raise RuntimeError("set ELEVENLABS_API_KEY or DEEPGRAM_API_KEY")
     return DeepgramSTTService(api_key=deepgram_key)

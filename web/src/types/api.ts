@@ -5,6 +5,7 @@ export interface SessionRow {
   id: string;
   title: string | null;
   directory: string | null;
+  harness: string;
   created_at: string;
   updated_at: string;
 }

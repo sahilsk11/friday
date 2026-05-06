@@ -1,209 +1,270 @@
-# Friday v2 — Build Plan
+# Pipecat Turn-Taking Migration Plan
 
-A voice interface for `opencode`. Talk to a webpage. Opencode does the work, narrates progress, sessions survive across disconnects.
+## Problem
 
----
+Friday currently uses Pipecat for transport, frame flow, STT, TTS, RTVI, and interruption frames, but it does not use Pipecat's turn-taking layer for the core "when should opencode receive a user turn?" decision.
 
-## Principles
+The current voice pipeline in `server/friday/voice/server.py` is:
 
-- **Pipecat owns audio. Opencode owns the agent. Friday is the bridge.**
-- `core/` and `api/` never import `pipecat.*`. Pipecat lives only in `voice/` so it's swappable.
-- Test against real services. No mocked opencode, no mocked WebRTC for end-to-end checks.
-- Strict types, dead-code lint, ≤700 line files (`make check`).
-- Backend before voice. Voice before frontend. Deploy last.
-
----
-
-## Required behaviors
-
-The bar for "this works." Each derives from a real friday v1 pain point.
-
-1. **Immediate ack.** When the user stops speaking, friday speaks back inside ~500ms (e.g. "on it") *while* opencode is still loading the codebase. Achieved by listening to opencode's SSE — when we see `session.status: busy` for the user's turn but no assistant text deltas yet, push a canned `TTSSpeakFrame` outside the normal LLM path.
-
-2. **Sequential turn queueing — handled by opencode.** When the user speaks mid-turn, friday forwards the new turn directly via `/prompt_async`. Opencode queues it and processes it after the current turn finishes. Friday never calls `/abort` and never queues at our layer. Verified empirically: back-to-back `/prompt_async` calls drain in order, both turns complete cleanly. Cost: "steering" is delayed until the current turn ends. v2 can add an explicit cancel gesture if that latency hurts.
-
-3. **No TTS overlap.** One speech stream at a time. Pipecat handles this for free via its single TTS frame queue. We must not push our own out-of-band TTS while regular text is streaming — verify in tests.
-
-4. **Visible listening state.** RTVI observer surfaces user-speaking / bot-speaking / transcribing to voice-ui-kit so the UI can show mic levels and badges. The user never wonders "is it hearing me?"
-
-5. **Persistent sessions.** Opencode owns session storage (`~/.local/share/opencode/`). Friday is stateless across restarts — list and read sessions via opencode's HTTP API. Phone disconnects → opencode keeps running. Reconnect → re-attach to the same session, see what happened.
-
-6. **Checkpoint narration.** When opencode runs tools (`message.part.updated` with `type: tool`), friday narrates short summaries ("looking at auth.py", "running the tests"). Same TTS path as regular text, gated by a narration policy that skips code blocks and log noise.
-
----
-
-## Architecture
-
-```
-opencode (external HTTP+SSE — owns session + transcript storage)
-        ↑
-   OpencodeClient  ──  one global SSE subscription, fan-out by session_id
-        ↑
-   OpencodeSession (per opencode session, in-memory only)
-        ↑ event observers
-   ┌────┴─────────────────────────┐
-   │                              │
- REST/SSE              voice pipeline (pipecat)
- (api/sessions.py)            ↑
-                          SmallWebRTC ← browser
+```text
+transport.input()
+  -> ElevenLabs STT, CommitStrategy.VAD, 500ms silence
+  -> TurnAccumulator
+  -> ProviderSessionProcessor
+  -> TTS
+  -> RTVI
+  -> transport.output()
 ```
 
-App data flows through REST/SSE. RTVI is used **only** to surface voice-UI state (mic levels, listening badges) — not for sessions, transcripts, or events. That separation is what makes the voice layer swappable.
+`TurnAccumulator` was added because ElevenLabs VAD-mode commits are frequent transcript segments, not conversational turn boundaries. That part is directionally correct, but the implementation still uses "no committed transcript arrived for N seconds" as a proxy for "the user stopped talking." That proxy fails when the user resumes speaking after a short pause and keeps talking for several seconds before ElevenLabs emits the next committed segment.
 
-### Opencode endpoints we hit
+Observed failure:
 
-Opencode owns persistence; friday is a thin façade. The full set of endpoints we use:
-
-| Endpoint | Method | Purpose | Verified |
-|---|---|---|---|
-| `/session` | `POST` | Create a new session. Body `{"title"?: str}` → returns `{id, slug, ...}`. | ✅ |
-| `/session` | `GET` | List all sessions across all directories. | ✅ |
-| `/session/:id` | `GET` | Session metadata (title, directory, created, updated). | ✅ |
-| `/session/:id/message` | `GET` | Full transcript: `[{info: {role, time: {created, completed?}}, parts: [...]}]`. | ✅ |
-| `/session/:id/prompt_async` | `POST` | Send a turn. Body `{"parts":[{"type":"text","text":"..."}]}` → 204. Queued by opencode if a turn is in-flight. | ✅ |
-| `/session/:id/abort` | `POST` | Cancel in-flight turn. Returns `true`. **Not used in v1** — kept available for an explicit "stop" gesture later. | ✅ |
-| `/global/event` | `GET` (SSE) | Stream of all events for all sessions. Wrapped `{directory, project, payload: {type, properties}}`. | ✅ |
-
-Two endpoints we deliberately don't use:
-
-- `POST /session/:id/message` — synchronous prompt that blocks until completion. We use `prompt_async` + SSE instead so we can stream tokens to TTS as they arrive.
-- `DELETE /session/:id` — session deletion. Not exposed in friday v1; can add when there's a UI need.
-
-Auth: opencode 1.14 has no per-request auth on these endpoints. Friday-server itself is auth-protected (Step 7); opencode lives behind it on localhost.
-
----
-
-## Step 1 — OpencodeSession + event parser  ✅ done
-
-Built and tested live against opencode 1.14:
-
-- [`core/events.py`](server/friday/core/events.py) — typed parser for the SSE wire format. Discards `sync` wrappers; surfaces `MessagePartDelta`, `MessageUpdated`, `SessionStatus`, `SessionIdle`, `MessagePartUpdated`, `ServerConnected`.
-- [`core/opencode_session.py`](server/friday/core/opencode_session.py) — `OpencodeClient` (owns httpx + the single SSE loop with reconnect/generation counter) and `OpencodeSession` (per-session: `attach`, `send_turn`, `cancel`).
-- [`core/state.py`](server/friday/core/state.py) — `AgentState` enum.
-- [`scripts/probe_opencode.py`](server/scripts/probe_opencode.py) — live integration probe; verified streaming text deltas, `time.completed` completion detection (opencode 1.14 changed this from `time.end`), state transitions, clean shutdown.
-
-Quirk captured in [opencode_session.py:_fan_out_state](server/friday/core/opencode_session.py): opencode emits the same terminal state multiple times — consumers must be idempotent.
-
----
-
-## Step 2 — SessionManager (opencode is the SoT)  ✅ done
-
-No sqlite, no friday-side persistence. Opencode already stores every session and transcript at `~/.local/share/opencode/`. Friday-server holds an in-memory cache of *live* `OpencodeSession` objects (so observers can attach) and delegates everything else to opencode's HTTP API.
-
-**Typed wrappers** (in `friday/core/session_manager.py` or co-located in `events.py`):
-
-- `SessionInfo(id, title, directory, created_at, updated_at)` — flattened from `GET /session/:id`.
-- `Message(role, text, completed_at, parts)` — flattened from opencode's `{info, parts}` shape returned by `GET /session/:id/message`.
-
-**`SessionManager`**:
-
-- Owns `dict[session_id → OpencodeSession]` — purely runtime cache, lazily populated.
-- `await manager.list_sessions() -> list[SessionInfo]` — wraps `GET /session`. Optionally filters to a working directory.
-- `await manager.get(session_id: str) -> SessionInfo` — wraps `GET /session/:id`.
-- `await manager.get_transcript(session_id: str) -> list[Message]` — wraps `GET /session/:id/message`.
-- `await manager.create(title: str | None = None) -> OpencodeSession` — `POST /session`, register in cache, return live wrapper.
-- `manager.attach(session_id: str) -> OpencodeSession` — return cached wrapper or create one (so observers can subscribe).
-
-**Tests** (`tests/test_session_manager.py`):
-
-- Unit tests with `pytest-httpx`: canned responses for each endpoint; assert manager surfaces typed data correctly.
-- One live integration test asserting `list` and `get_transcript` work against real opencode.
-
-**Deliverable** — `scripts/probe_session_manager.py` against live opencode prints:
-
-```
-[probe] listed N existing sessions
-[probe] created session ses_abc...
-[probe] sent turn: "say hi"
-[probe] transcript after completion:
-  [user]      say hi
-  [assistant] HI
-[probe] PASS
+```text
+user says clause A
+pause ~500ms
+ElevenLabs VAD commits clause A
+user starts clause B and keeps speaking
+no new commit arrives while clause B is ongoing
+TurnAccumulator silence timer fires
+opencode receives clause A
+TTS starts while user is still speaking
+user stops because TTS talked over them
+clause B later commits as the next turn
+loop repeats
 ```
 
-Files: `friday/core/session_manager.py`, `tests/test_session_manager.py`, `scripts/probe_session_manager.py`.
+## Pipecat Findings
 
----
+Pipecat already separates STT finalization from user turn lifecycle.
 
-## Step 3 — REST + SSE API  ✅ done
+- ElevenLabs realtime STT defaults to `CommitStrategy.MANUAL`, described as "Pipecat VAD"; `CommitStrategy.VAD` is "ElevenLabs VAD." See `/Users/sahil.kapur/Projects/pipecat/src/pipecat/services/elevenlabs/stt.py:511`.
+- In manual mode, Pipecat sends ElevenLabs a commit when it receives a real `VADUserStoppedSpeakingFrame`. See `/Users/sahil.kapur/Projects/pipecat/src/pipecat/services/elevenlabs/stt.py:663`.
+- ElevenLabs committed transcripts become `TranscriptionFrame`s, but `finalized=True` is set only for manual mode. See `/Users/sahil.kapur/Projects/pipecat/src/pipecat/services/elevenlabs/stt.py:947` and `/Users/sahil.kapur/Projects/pipecat/src/pipecat/services/elevenlabs/stt.py:991`.
+- Pipecat's `LLMUserAggregatorParams` accepts `vad_analyzer`, `user_turn_strategies`, `user_turn_stop_timeout`, and `user_idle_timeout`. See `/Users/sahil.kapur/Projects/pipecat/src/pipecat/processors/aggregators/llm_response_universal.py:97`.
+- `LLMUserAggregator` wires a `UserTurnController` internally and emits `on_user_turn_stopped` with the aggregated user message. See `/Users/sahil.kapur/Projects/pipecat/src/pipecat/processors/aggregators/llm_response_universal.py:452` and `/Users/sahil.kapur/Projects/pipecat/src/pipecat/processors/aggregators/llm_response_universal.py:770`.
+- `SpeechTimeoutUserTurnStopStrategy` is the built-in "wait after VAD stop, wait for STT finalization/latency, then stop the user turn" strategy. See `/Users/sahil.kapur/Projects/pipecat/src/pipecat/turns/user_stop/speech_timeout_user_turn_stop_strategy.py:26`.
+- That strategy cancels pending stop timers when the user starts speaking again. See `/Users/sahil.kapur/Projects/pipecat/src/pipecat/turns/user_stop/speech_timeout_user_turn_stop_strategy.py:122`.
+- It only triggers stop when the user is not speaking and transcript text exists. See `/Users/sahil.kapur/Projects/pipecat/src/pipecat/turns/user_stop/speech_timeout_user_turn_stop_strategy.py:250`.
 
-The HTTP surface that both the CLI and the voice layer use.
+Canonical Pipecat voice examples use:
 
-- FastAPI app composed in [`friday/main.py`](server/friday/main.py). Lifespan owns the `OpencodeClient` and exposes a `SessionManager` via `app.state`. Mounts:
-  - `GET    /sessions[?directory=…]` — list (optional directory filter)
-  - `POST   /sessions` — create (returns full `SessionRow` after a follow-up `GET`)
-  - `GET    /sessions/:id` — metadata + transcript
-  - `GET    /sessions/:id/events` — SSE stream of `text.delta` / `text.final` / `state` frames, with 15s `: keep-alive` ping
-  - `POST   /sessions/:id/turn` — text turn (voice layer POSTs here after STT)
-- Framework-neutral: no pipecat imports.
-- Tests: 7 cases in [`tests/test_api_sessions.py`](server/tests/test_api_sessions.py) — pytest-httpx canned responses for the opencode side, ASGITransport for HTTP routes, direct route invocation + `body_iterator` for the SSE path (ASGITransport buffers streaming responses, which deadlocks an in-process SSE consumer; the live verification covers the wire side).
-- Verified live against opencode 1.14: `uvicorn friday.main:app` → create session → `POST /turn` → SSE stream emitted `state:thinking → text.delta:"DEL" → text.delta:"TA" → text.final:"DELTA" → state:idle`.
+```text
+transport.input()
+  -> STT
+  -> user_aggregator
+  -> LLM
+  -> TTS
+  -> transport.output()
+  -> assistant_aggregator
+```
 
-Files: [`friday/api/sessions.py`](server/friday/api/sessions.py), [`friday/main.py`](server/friday/main.py), [`tests/test_api_sessions.py`](server/tests/test_api_sessions.py).
+Relevant examples:
 
----
+- `/Users/sahil.kapur/Projects/pipecat/examples/voice/voice-elevenlabs.py`
+- `/Users/sahil.kapur/Projects/pipecat/examples/transports/transports-small-webrtc.py`
+- `/Users/sahil.kapur/Projects/pipecat/examples/features/features-concurrent-llm-rtvi-ignored-sources.py`
+- `/Users/sahil.kapur/Projects/pipecat/examples/voice/voice-assemblyai-turn-detection.py`
 
-## Step 4 — CLI harness  ⏭ skipped
+## Design Goal
 
-Skipped: a long-lived `click` CLI is dead weight when ad-hoc Python scripts against `/sessions/...` already exercise the same surface and get thrown away after use. If we ever need an interactive testbed before voice ships, write a one-off script — don't grow a CLI.
+Use Pipecat for turn-taking. Keep Friday custom code only where the domain is actually Friday-specific:
 
----
+- attaching to an opencode session
+- sending a completed user turn to opencode
+- streaming opencode deltas/tool events back into Pipecat TTS and RTVI
+- controlling Friday-specific UI toggles like model choice, tool narration, and TTS enabled state
 
-## Step 4 — Voice pipeline (pipecat)  ✅ done
+## Target Pipeline
 
-- [`voice/pipecat_adapter.py`](server/friday/voice/pipecat_adapter.py) — `OpencodeProcessor(FrameProcessor)`:
-  - Consumes `TranscriptionFrame(finalized=True)` → POST `/sessions/:id/turn`.
-  - Subscribes to the bound `OpencodeSession`; emits `LLMFullResponseStartFrame → LLMTextFrame* → LLMFullResponseEndFrame` for each assistant response.
-  - Immediate ack: pushes `TTSSpeakFrame("on it")` once when `session.status:busy` arrives before any text deltas. Suppressed if real text starts first or on duplicate busy events.
-- [`voice/server.py`](server/friday/voice/server.py) — mounts `POST/PATCH /voice/api/offer` on the same FastAPI app. Each new connection runs a per-call pipeline: `transport.input() → VADProcessor(Silero) → DeepgramSTT → OpencodeProcessor → CartesiaTTS → transport.output() → RTVIProcessor` with `RTVIObserver`. `request_data.session_id` selects which opencode session to attach to (creates one if absent).
-- 8 unit tests in [`tests/test_pipecat_adapter.py`](server/tests/test_pipecat_adapter.py): `process_frame` + observer-callback paths exercised via `OpencodeSession.dispatch` with `pytest-httpx` for the wire side. `push_frame` is replaced with a capture list so we don't need a full pipecat lifecycle.
+Preferred target:
 
-Files: [`friday/voice/pipecat_adapter.py`](server/friday/voice/pipecat_adapter.py), [`friday/voice/server.py`](server/friday/voice/server.py), [`tests/test_pipecat_adapter.py`](server/tests/test_pipecat_adapter.py).
+```text
+transport.input()
+  -> ElevenLabsRealtimeSTTService(commit_strategy=MANUAL)
+  -> Pipecat user turn aggregation/controller
+  -> ProviderTurnDispatcher
+  -> ProviderSessionProcessor response bridge
+  -> TTS
+  -> RTVI
+  -> transport.output()
+```
 
----
+If `LLMUserAggregator` fits cleanly, use it directly and bind its `on_user_turn_stopped` event to opencode dispatch.
 
-## Step 5 — Narration policy + chunking  ✅ done
+If it does not fit cleanly because Friday does not use `LLMContextFrame` or a Pipecat `LLMService`, write a thin adapter around Pipecat's `UserTurnController`/strategies. Do not reimplement VAD timers or transcript buffering by hand.
 
-- [`core/narration_policy.py`](server/friday/core/narration_policy.py) — three things in one module:
-  - `should_speak(text)` / `filter_for_speaking(text)` — pure rules: skip empty, log-prefix lines (`[tool:`, `[error:`, …), shell-command lines, fenced code blocks.
-  - `StreamingFilter` — stateful per-message fence stripper. Holds short tail buffers across deltas so a fence delimiter split into ``"``"`` + ``"`text"`` is still recognized.
-  - `checkpoint_for_tool(name)` — friendly verb map (`read → "looking at a file"`, `bash → "running a command"`, …). Returns `None` for unknown tools so we stay silent rather than guess.
-- Chunker skipped — pipecat's `TTSService` already does sentence aggregation (`TextAggregationMode.SENTENCE`, NLTK-based) and flushes on the `LLMFullResponseEndFrame` we emit at turn end.
-- [`OpencodeSession`](server/friday/core/opencode_session.py) gained `on_tool_start(name)` observer and `MessagePartUpdated` dispatch. Dedupe by `part_id` since opencode emits repeat events as tool status advances.
-- [`OpencodeProcessor`](server/friday/voice/pipecat_adapter.py) runs every text delta through `StreamingFilter` before pushing `LLMTextFrame`, and pushes a `TTSSpeakFrame(checkpoint_phrase)` on tool-start.
-- Tests: 23 cases in [`tests/test_narration_policy.py`](server/tests/test_narration_policy.py) (rules + streaming + checkpoint), 4 new cases in [`tests/test_pipecat_adapter.py`](server/tests/test_pipecat_adapter.py) (fence stripping, tool checkpoint, dedupe, unknown-tool silence). Total 60 tests, all green.
-- Live behavior probe — [`scripts/probe_narration.py`](server/scripts/probe_narration.py) drives a real opencode session through a prompt designed to produce mixed prose + code fence + a `read` tool call, captures the actual frames `OpencodeProcessor` would push, asserts code never leaks into spoken text, and synthesizes the result via ElevenLabs to `/tmp/friday_narration_probe.mp3`. Verified end-to-end: ack fires, tool checkpoint fires (`"looking at a file"`), code-block bodies stripped, prose intact.
+## Implementation Steps
 
-Files: [`friday/core/narration_policy.py`](server/friday/core/narration_policy.py), [`tests/test_narration_policy.py`](server/tests/test_narration_policy.py), [`scripts/probe_narration.py`](server/scripts/probe_narration.py).
+### 1. Prove the Current Bug with a Probe
 
----
+Add a focused backend probe or test that models this sequence without live credentials:
 
-## Step 6 — Configuration + auth
+```text
+TranscriptionFrame("clause A")
+sleep less than Friday's current flush window
+simulate user speaking again with no new STT commit
+sleep past Friday's current flush window
+assert no provider turn is sent while user is speaking
+```
 
-Ready to deploy.
+This should fail against the current `TurnAccumulator` behavior. Keep this as the regression test before migration.
 
-- `friday/config.py` — `pydantic-settings` reading `FRIDAY_*` env vars (`OPENCODE_BASE_URL`, `DEEPGRAM_API_KEY`, `CARTESIA_API_KEY`, `FRIDAY_AUTH_TOKEN`, `FRIDAY_DB_PATH`).
-- Bearer-token auth middleware on the REST API. Single shared token via `FRIDAY_AUTH_TOKEN` for v1.
-- `/api/offer` accepts the token via `?t=...` query param (browsers can't add Authorization headers to WebRTC offers).
+### 2. Remove ElevenLabs VAD-Mode Commit Ownership
 
-Files: `friday/config.py`, `friday/main.py` (auth wiring), `tests/test_config.py`.
+Change `_select_stt()` in `server/friday/voice/server.py` to use upstream `ElevenLabsRealtimeSTTService` in default/manual mode:
 
----
+```python
+ElevenLabsRealtimeSTTService(api_key=elevenlabs_key)
+```
 
-## Out of scope (for v1)
+Do not use:
 
-- Frontend (separate plan once the backend is solid)
-- Multiple simultaneous voice rooms
-- OAuth / multi-user
-- Mobile native app (browser is the target)
-- Other agent backends (Claude Code, Hermes) — design supports them via the same `OpencodeSession`-shaped interface, but only opencode is wired
+```python
+CommitStrategy.VAD
+ElevenLabsRealtimeSTTSettings(vad_silence_threshold_secs=0.5)
+ElevenLabsRealtimeSTTServiceForceCommit
+```
 
----
+Expected result:
 
-## Open questions to resolve during build
+- local/Pipecat VAD determines speech stop
+- Pipecat sends ElevenLabs commit on real `VADUserStoppedSpeakingFrame`
+- ElevenLabs returns `TranscriptionFrame(finalized=True)`
+- no need to force commits using synthetic VAD frames
 
-- **STT/TTS provider.** Default Deepgram + Cartesia (cloud, ~300ms latency). Revisit if cost or latency forces local (Whisper + Kokoro).
-- **Title generation.** Sync on first turn (slow first reply) vs async after first response (UI shows "Untitled" briefly). Lean async.
-- **Mid-turn cancel UX.** v1 ships without one (rely on opencode queueing). Revisit if "wait for current turn to finish" feels too slow in practice — likely add a "stop" wake-word or button rather than auto-aborting on every barge-in.
-- **Session filtering.** Opencode's `GET /session` returns sessions for *all* directories on this machine. v1 may show all of them; later we may filter to a friday working directory.
-- **UDP port range.** Start 50000–50100 for WebRTC media; adjust based on observed concurrent calls.
+### 3. Introduce Pipecat Turn Ownership
+
+First attempt: use `LLMContextAggregatorPair` or `LLMUserAggregator` with:
+
+```python
+LLMUserAggregatorParams(
+    vad_analyzer=SileroVADAnalyzer(),
+    user_turn_strategies=UserTurnStrategies(
+        stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=...)]
+    ),
+)
+```
+
+The exact `user_speech_timeout` should start conservative, likely `1.2s` to `2.0s`, because this is a coding assistant and users naturally pause while thinking. Pipecat's default `0.6s` is optimized for conversational assistants, not dictating multi-clause engineering requests.
+
+Use Pipecat's `on_user_turn_stopped` event as the sole hands-free trigger for opencode.
+
+### 4. Replace `TurnAccumulator`
+
+Delete or retire `server/friday/voice/turn_accumulator.py` once the Pipecat path owns turn end.
+
+The replacement should have one of these shapes:
+
+Option A, preferred:
+
+```text
+STT -> LLMUserAggregator -> ProviderTurnDispatcher
+```
+
+`ProviderTurnDispatcher` receives the aggregated user message from the aggregator event and calls `session.send_turn(...)`.
+
+Option B, if `LLMUserAggregator` is too coupled to `LLMContextFrame`:
+
+```text
+STT -> VADProcessor -> UserTurnProcessor -> ProviderTurnAggregator
+```
+
+`ProviderTurnAggregator` should consume `TranscriptionFrame`s and flush only on `UserStoppedSpeakingFrame` produced by Pipecat's `UserTurnProcessor`. This still delegates VAD and turn stop timing to Pipecat.
+
+### 5. Rework Manual Send
+
+Current manual Send sends an `end-turn` client message, calls `accumulator.arm_flush()`, and pushes a synthetic `VADUserStoppedSpeakingFrame`.
+
+Replace that with an explicit Friday control path that does not lie to Pipecat's VAD state.
+
+Acceptable options:
+
+- If using manual mic mode, disabling the mic should allow real audio/VAD idle handling to close the turn. Verify this with an audio probe.
+- If a hard "send now" action is needed, add a dedicated Friday control frame or method on the turn adapter that flushes the current Pipecat aggregation. Do not synthesize `VADUserStoppedSpeakingFrame` unless the user actually stopped speaking according to VAD.
+
+The subagent finding is important: a synthetic `VADUserStoppedSpeakingFrame` is an anti-pattern because the same frame also affects turn timing, TTFB metrics, reconnect gating, and user-speaking state.
+
+### 6. Preserve UI Transcript Behavior
+
+The UI wants visible partial/running transcript text before opencode receives a turn.
+
+Preserve that by forwarding/interpreting:
+
+- `InterimTranscriptionFrame` for live text where possible
+- `TranscriptionFrame` for finalized utterance text
+- final aggregated user turn from Pipecat as the activity-feed lock-in
+
+Do not use Pipecat's built-in RTVI user transcript event if it still emits per-STT-segment finals that conflict with Friday's feed semantics. It is fine to keep custom RTVI server messages for Friday UI state, but those messages should mirror Pipecat-owned turn events.
+
+### 7. Keep Provider Response Bridge
+
+`ProviderSessionProcessor` remains useful for:
+
+- forwarding opencode text deltas as `LLMTextFrame`
+- bracketing response start/end
+- applying narration filtering
+- emitting tool/assistant RTVI messages
+- honoring `tts_enabled`
+- cancelling opencode on real interruption
+
+But it should no longer consume raw STT `TranscriptionFrame`s as turns. A completed user turn should reach it through a Pipecat turn event or a dedicated provider dispatcher.
+
+### 8. Verification
+
+Required tests/probes before claiming done:
+
+- Unit: current failure sequence does not dispatch while VAD/user-speaking is active.
+- Unit: finalized/manual ElevenLabs-style transcript reaches opencode once per turn.
+- Unit: user resumes speaking during the post-stop timeout cancels pending dispatch.
+- Unit: explicit Interrupt still aborts opencode and clears TTS.
+- Integration: run Pipecat's relevant focused test locally for reference:
+
+```bash
+cd /Users/sahil.kapur/Projects/pipecat
+uv run pytest tests/test_user_turn_stop_strategy.py -q
+```
+
+Previous exploration result: `24 passed`.
+
+- Friday backend tests:
+
+```bash
+cd /Users/sahil.kapur/Projects/friday-pipecat-turn-plan/server
+uv run pytest tests/test_turn_accumulator.py tests/test_pipecat_adapter.py -q
+```
+
+These tests will need updates as `TurnAccumulator` is retired.
+
+- Live voice behavior: open the voice room, talk with a short pause mid-sentence, continue talking for several seconds, and verify opencode does not start until the true turn end.
+
+## Non-Goals
+
+- Do not swap transport back to WebRTC as part of this change.
+- Do not change opencode provider/session persistence.
+- Do not redesign the ActivityFeed UI.
+- Do not introduce a second queue in Friday; opencode still owns provider-side queuing.
+- Do not keep both `TurnAccumulator` and Pipecat turn aggregation long-term. That would preserve the same ambiguity under two names.
+
+## Expected Deletions
+
+- `server/friday/voice/elevenlabs_force_commit.py`
+- most or all of `server/friday/voice/turn_accumulator.py`
+- tests that assert commit-based flush semantics
+- server comments claiming "Why no Silero VAD"
+
+## Expected New/Changed Files
+
+- `server/friday/voice/server.py`
+- `server/friday/voice/pipecat_adapter.py`
+- a new small provider turn adapter if `LLMUserAggregator` cannot call opencode directly
+- `server/tests/test_pipecat_turn_integration.py` or equivalent
+- updated frontend send/control behavior in `web/src/pages/VoiceRoom.tsx` only if manual Send cannot be expressed cleanly through the backend turn adapter
+
+## Open Questions
+
+1. Can `LLMUserAggregator` be used without an actual Pipecat `LLMService`, by listening to `on_user_turn_stopped` and preventing downstream `LLMContextFrame` from triggering anything?
+2. Should Friday use `SpeechTimeoutUserTurnStopStrategy` or Pipecat's default smart-turn analyzer? Start with `SpeechTimeoutUserTurnStopStrategy`; evaluate smart turn only after the basic migration is correct.
+3. What is the right `user_speech_timeout` for coding dictation? Test `1.2s`, `1.5s`, and `2.0s` with real voice.
+4. Should the Start/Send UI remain, or should voice mode become always-listening with explicit Interrupt? Decide after the backend turn fix is proven.
+
