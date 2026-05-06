@@ -10,7 +10,7 @@ import type { TranscriptEntry } from '@/types/api';
 // (see TRANSPORT.md):
 //
 //   - serverMessage (custom emissions from server):
-//       From TurnAccumulator (turn_accumulator.py):
+//       From UserTranscriptMirror (pipecat_adapter.py):
 //         { type: "user-transcript-running", text }   # ignored here, see RunningUserTranscript
 //         { type: "user-transcript-final",   text }   # locks a user entry
 //       From OpencodeProcessor (pipecat_adapter.py):
@@ -20,12 +20,10 @@ import type { TranscriptEntry } from '@/types/api';
 //         { type: "agent-state",         state }
 //
 // Why a custom user-transcript-final instead of pipecat's built-in
-// userTranscript event: ElevenLabs realtime STT in VAD mode commits every
-// ~500ms of silence, and pipecat fans each commit out as a "final=true"
-// userTranscript message. That would fragment one spoken thought across
-// multiple feed entries. The TurnAccumulator on the server consolidates
-// commits into a single per-turn final message; the observer's built-in
-// emit is disabled in server.py.
+// userTranscript event: Friday locks user text into the feed only when
+// Pipecat's user-turn aggregator says the whole turn is complete. The
+// observer's built-in emit is disabled in server.py so STT segments do not
+// become separate feed entries.
 //
 // We append deltas onto the trailing assistant entry as they stream so
 // the UI feels alive while opencode generates. ``assistant-text-final``

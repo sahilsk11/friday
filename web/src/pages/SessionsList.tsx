@@ -106,7 +106,6 @@ export default function SessionsList() {
 
 function NewSessionModal({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate();
-  const { model: selectedModel, setModel } = useSelectedModel();
   const [title, setTitle] = useState('');
   const [directory, setDirectory] = useState(DEFAULT_DIRECTORY);
   const directoryRef = useRef<HTMLInputElement>(null);
@@ -119,6 +118,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
 
   // Default to the first available harness once loaded.
   const [harness, setHarness] = useState<string>('');
+  const { model: selectedModel, setModel } = useSelectedModel(harness || null);
   useEffect(() => {
     if (harness === '' && harnessesQuery.data && harnessesQuery.data.length > 0) {
       setHarness(harnessesQuery.data[0].id);
@@ -147,12 +147,20 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
     return [...out.entries()];
   }, [modelsQuery.data]);
 
-  // When the harness changes, reset model to the new default.
+  // Seed the harness model once, but don't overwrite a valid user choice.
   useEffect(() => {
-    if (modelsQuery.data?.default) {
-      setModel(modelsQuery.data.default);
+    if (!modelsQuery.data?.default) return;
+    if (
+      selectedModel &&
+      modelsQuery.data.models.some(
+        (m) =>
+          m.providerID === selectedModel.providerID && m.modelID === selectedModel.modelID,
+      )
+    ) {
+      return;
     }
-  }, [modelsQuery.data?.default, setModel]);
+    setModel(modelsQuery.data.default);
+  }, [modelsQuery.data, selectedModel, setModel]);
 
   const currentValue = selectedModel ? modelKey(selectedModel) : '';
 
@@ -180,9 +188,12 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
           onSubmit={(e) => {
             e.preventDefault();
             const d = directory.trim();
-            if (!d) { directoryRef.current?.focus(); return; }
+            if (!d) {
+              directoryRef.current?.focus();
+              return;
+            }
             if (!harness) return;
-            navigate('/s/new', {
+            void navigate('/s/new', {
               state: { harness, directory: d, title: title.trim() || undefined },
             });
             onClose();

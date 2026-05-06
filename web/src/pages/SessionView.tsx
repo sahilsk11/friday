@@ -41,7 +41,8 @@ export default function SessionView() {
   });
 
   const live = useSessionEvents(id);
-  const { model: selectedModel, setModel } = useSelectedModel();
+  const harness = sessionQuery.data?.session.harness ?? null;
+  const { model: selectedModel, setModel } = useSelectedModel(harness);
 
   const turnMutation = useMutation({
     mutationFn: (text: string) => {
@@ -86,7 +87,7 @@ export default function SessionView() {
           </h1>
         </div>
         <div className="flex items-center gap-3">
-          <ModelChip selected={selectedModel} onChange={setModel} />
+          <ModelChip harness={harness} selected={selectedModel} onChange={setModel} />
           <StatePill state={live.state} />
           <Link
             to={`/s/${id}`}

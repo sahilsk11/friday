@@ -2,7 +2,7 @@
 
 Voice and transcript UI for friday. Three routes:
 
-- `/` — `SessionsList`. REST against `GET /sessions`, `POST /sessions`.
+- `/` — `SessionsList`. REST against `GET /sessions`; new voice sessions start via `/s/new`.
 - `/s/:id` — `VoiceRoom`. **Only page that imports `@pipecat-ai/voice-ui-kit`.**
 - `/s/:id/transcript` — `SessionView`. REST + SSE for live transcript and state.
 

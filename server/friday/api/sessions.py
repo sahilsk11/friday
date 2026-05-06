@@ -5,7 +5,6 @@ Endpoints:
 - ``GET    /harnesses``               — list available provider backends
 - ``GET    /models?harness=<id>``     — model catalog for a specific harness
 - ``GET    /sessions``                — list, optional ``?directory=`` filter
-- ``POST   /sessions``                — create new (harness + directory required)
 - ``GET    /sessions/{id}``           — metadata + transcript
 - ``POST   /sessions/{id}/turn``      — text turn
 - ``GET    /sessions/{id}/events``    — SSE stream of live deltas + state
@@ -53,7 +52,7 @@ class ModelRef(BaseModel):
         return ModelChoice(provider_id=self.providerID, model_id=self.modelID)
 
     @classmethod
-    def from_choice(cls, choice: ModelChoice) -> "ModelRef":
+    def from_choice(cls, choice: ModelChoice) -> ModelRef:
         return cls(providerID=choice.provider_id, modelID=choice.model_id)
 
 
@@ -83,15 +82,17 @@ class SessionRow(BaseModel):
     id: str
     title: str
     directory: str
+    harness: str
     created_at: str
     updated_at: str
 
     @classmethod
-    def from_info(cls, info: SessionInfo) -> "SessionRow":
+    def from_info(cls, info: SessionInfo, *, harness: str) -> SessionRow:
         return cls(
             id=info.id,
             title=info.title,
             directory=info.directory,
+            harness=harness,
             created_at=info.created_at.isoformat(),
             updated_at=info.updated_at.isoformat(),
         )
@@ -103,7 +104,7 @@ class MessageRow(BaseModel):
     completed_at: str | None
 
     @classmethod
-    def from_message(cls, m: Message) -> "MessageRow":
+    def from_message(cls, m: Message) -> MessageRow:
         return cls(
             role=m.role,
             text=m.text,
@@ -204,15 +205,18 @@ async def list_sessions(
     directory: str | None = None,
 ) -> list[SessionRow]:
     """List sessions across all providers, merged and sorted newest-first."""
+    providers = registry.all()
     results = await asyncio.gather(
-        *[p.list_sessions(directory=directory) for p in registry.all()],
+        *[p.list_sessions(directory=directory) for p in providers],
         return_exceptions=True,
     )
     rows: list[SessionRow] = []
-    for r in results:
-        if isinstance(r, Exception):
+    for provider, r in zip(providers, results, strict=True):
+        if isinstance(r, BaseException):
             continue
-        rows.extend(SessionRow.from_info(info) for info in r)
+        rows.extend(
+            SessionRow.from_info(info, harness=provider.provider_id) for info in r
+        )
     rows.sort(key=lambda r: r.updated_at, reverse=True)
     return rows
 
@@ -223,7 +227,9 @@ async def get_session(session_id: str, registry: RegistryDep) -> SessionDetail:
     try:
         info = await provider.get_session(session_id)
     except SessionNotFound:
-        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+        raise HTTPException(
+            status_code=404, detail=f"session not found: {session_id}"
+        ) from None
     transcript = await provider.get_transcript(session_id)
     last_model = next(
         (m.model for m in reversed(transcript) if m.role == "assistant" and m.model is not None),
@@ -231,7 +237,7 @@ async def get_session(session_id: str, registry: RegistryDep) -> SessionDetail:
     )
     session = provider.attach(session_id)
     return SessionDetail(
-        session=SessionRow.from_info(info),
+        session=SessionRow.from_info(info, harness=provider.provider_id),
         transcript=[MessageRow.from_message(m) for m in transcript],
         current_model=ModelRef.from_choice(last_model) if last_model else None,
         agent_state=session.current_state,

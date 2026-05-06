@@ -10,20 +10,22 @@ import type { ModelInfo, ModelRef } from '@/types/api';
 // message). No server PATCH — the chosen model rides along on the next
 // turn from whichever path sends it.
 
-export function modelKey(m: ModelRef): string {
+function modelKey(m: ModelRef): string {
   return `${m.providerID}/${m.modelID}`;
 }
 
-export function parseModelKey(key: string): ModelRef | null {
+function parseModelKey(key: string): ModelRef | null {
   const idx = key.indexOf('/');
   if (idx < 0) return null;
   return { providerID: key.slice(0, idx), modelID: key.slice(idx + 1) };
 }
 
 export function ModelChip({
+  harness,
   selected,
   onChange,
 }: {
+  harness?: string | null;
   /** Current selection. ``null`` hides the chip until the user picks one. */
   selected: ModelRef | null;
   /** Called when the user picks a different model from the popover. */
@@ -33,8 +35,8 @@ export function ModelChip({
   const popoverRef = useRef<HTMLDivElement>(null);
 
   const modelsQuery = useQuery({
-    queryKey: ['models'],
-    queryFn: listModels,
+    queryKey: ['models', harness ?? 'default'],
+    queryFn: () => listModels(harness ?? undefined),
     staleTime: 5 * 60 * 1000,
     enabled: open,
   });
