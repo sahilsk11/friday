@@ -9,7 +9,7 @@ import { ClientStatus, VoiceVisualizer } from '@pipecat-ai/voice-ui-kit';
 import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
 import { useQuery } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router';
+import { Link, useLocation, useNavigate, useParams } from 'react-router';
 
 import { ActivityFeed } from '@/components/ActivityFeed';
 import { ModelChip } from '@/components/ModelChip';
@@ -19,6 +19,12 @@ import { useNarrateTools } from '@/lib/narrateTools';
 import { useSelectedModel } from '@/lib/selectedModel';
 import { getSession } from '@/lib/sessions';
 import type { AgentState, ModelRef, TranscriptEntry } from '@/types/api';
+
+interface PendingSessionState {
+  harness: string;
+  directory: string;
+  title?: string;
+}
 
 // THE ONLY PAGE THAT IMPORTS @pipecat-ai/*.
 //
@@ -40,68 +46,76 @@ import type { AgentState, ModelRef, TranscriptEntry } from '@/types/api';
 
 function buildWsUrl(sessionId: string): string {
   const base = fridayBaseUrl.replace(/^http/, 'ws');
-  const sp = new URLSearchParams({ session_id: sessionId });
-  return `${base}/api/voice?${sp.toString()}`;
+  return `${base}/api/voice?${new URLSearchParams({ session_id: sessionId })}`;
+}
+
+function buildPendingWsUrl(params: PendingSessionState): string {
+  const base = fridayBaseUrl.replace(/^http/, 'ws');
+  const sp = new URLSearchParams({ harness: params.harness, directory: params.directory });
+  if (params.title) sp.set('title', params.title);
+  return `${base}/api/voice?${sp}`;
 }
 
 export default function VoiceRoom(): React.ReactElement {
   const { id } = useParams<{ id: string }>();
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  // id === 'new' means we arrived from the new-session modal with pending params.
+  const isPending = id === 'new';
+  const pendingParams = isPending ? (location.state as PendingSessionState | null) : null;
+
+  // resolvedSessionId is null while the server hasn't confirmed a session_id yet.
+  const [resolvedSessionId, setResolvedSessionId] = useState<string | null>(
+    isPending ? null : (id ?? null),
+  );
   const [client, setClient] = useState<PipecatClient | null>(null);
-  // Tracks which session id this VoiceRoom has already started initializing
-  // a transport for. Without this, React 18 StrictMode runs the setup effect
-  // twice in dev (mount → cleanup → mount), and the first WavRecorder's
-  // begin() is mid-flight when the second mount creates another one. The
-  // websocket-transport SDK silently swallows begin() errors inside
-  // WavMediaManager.initialize() and still sets _initialized=true, so
-  // pcClient.initDevices() resolves successfully even though processor is
-  // null. The next click of Connect then throws "Session ended: please call
-  // .begin() first" from inside _wavRecorder.getStatus(). Gating on the id
-  // here means cleanup runs harmlessly (no-ops while _initialized=false)
-  // and the first init completes uninterrupted.
-  const initStartedFor = useRef<string | null>(null);
 
   // Pre-load the persisted transcript so the activity feed shows past
-  // turns immediately when reopening an existing session. Once mounted,
-  // ActivityFeed only consumes live RTVI events.
+  // turns immediately when reopening an existing session.
   const sessionQuery = useQuery({
-    queryKey: ['session', id],
-    queryFn: () => {
-      if (!id) throw new Error('missing session id');
-      return getSession(id);
-    },
-    enabled: Boolean(id),
+    queryKey: ['session', resolvedSessionId],
+    queryFn: () => getSession(resolvedSessionId!),
+    enabled: Boolean(resolvedSessionId),
   });
 
+  // Called by SessionCreatedListener when the server sends session-created.
+  const onSessionCreated = useCallback(
+    (newId: string) => {
+      setResolvedSessionId(newId);
+      // Replace the URL in-place so the back button doesn't return to /s/new.
+      navigate(`/s/${newId}`, { replace: true });
+    },
+    [navigate],
+  );
+
+  // WS init — runs once on mount regardless of subsequent URL changes.
+  // The ref gate makes it safe under React 18 StrictMode's double-invoke:
+  // cleanup runs before _initialized is set so disconnect() is a no-op,
+  // and the second mount sees the ref already set and returns early.
+  // When the URL later changes from /s/new to /s/<realId> (after
+  // session-created), the effect does NOT re-run — the existing transport
+  // stays connected without interruption.
+  const initRef = useRef(false);
   useEffect(() => {
-    if (!id) return;
-    if (initStartedFor.current === id) return;
-    initStartedFor.current = id;
+    if (isPending && !pendingParams) return; // no params → don't connect
+    if (initRef.current) return;
+    initRef.current = true;
+
+    const wsUrl =
+      isPending && pendingParams ? buildPendingWsUrl(pendingParams) : id ? buildWsUrl(id) : null;
+    if (!wsUrl) return;
+
     // WavMediaManager (Web Audio API) over the default DailyMediaManager
     // — the Daily one pulls in @daily-co/daily-js, which spins up its
-    // own WebRTC call object purely for mic capture. That's heavy and
-    // breaks in headless Chromium. WavMediaManager just calls
-    // getUserMedia + a recorder.
+    // own WebRTC call object purely for mic capture. WavMediaManager just
+    // calls getUserMedia + a recorder.
     const transport = new WebSocketTransport({
-      wsUrl: buildWsUrl(id),
+      wsUrl,
       mediaManager: new WavMediaManager(undefined, 16_000),
     });
-    // Mic starts disabled at construction time so initDevices() can fire
-    // the permission prompt without instantly streaming PCM. AutoEnableMicOnConnect
-    // flips it on once the transport is connected — clicking Connect should
-    // mean "I'm ready to talk," not "now click Start too."
-    const pcClient = new PipecatClient({
-      enableMic: false,
-      enableCam: false,
-      transport,
-    });
-    // Resolve mic device + getUserMedia ahead of connect. Without this,
-    // PipecatClient.connect() opens the WS but never starts pushing
-    // audio frames — STT sits idle. <PipecatAppBase> handles this via
-    // initDevicesOnMount; we have to do it explicitly. We then chain
-    // connect() so the WS opens automatically on page load — the WS is
-    // the event channel, and we want opencode events flowing to the UI
-    // for as long as the page is mounted, regardless of mic/speaker
-    // state. STT is gated by the mic toggle, TTS by the speaker toggle.
+    // Mic starts disabled; AutoEnableMicOnConnect flips it once connected.
+    const pcClient = new PipecatClient({ enableMic: false, enableCam: false, transport });
     void (async () => {
       try {
         await pcClient.initDevices();
@@ -112,16 +126,26 @@ export default function VoiceRoom(): React.ReactElement {
     })();
     setClient(pcClient);
     return () => {
-      void pcClient.disconnect().catch(() => {
-        // Already disconnected — ignore.
-      });
+      void pcClient.disconnect().catch(() => {});
     };
-  }, [id]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (!id) return <p className="p-6 text-sm text-red-300">missing session id</p>;
-  if (!client) return <p className="p-6 text-sm text-neutral-400">initializing client…</p>;
-  // Wait for the transcript fetch so ActivityFeed can seed in one shot —
-  // its initial entries are read on mount and never reconciled later.
+  // Invalid direct navigation to /s/new without params.
+  if (isPending && !pendingParams) {
+    return (
+      <div className="p-6">
+        <p className="mb-2 text-sm text-neutral-400">
+          no session parameters — go back and create a session.
+        </p>
+        <Link to="/" className="text-sm text-neutral-400 hover:text-neutral-200">
+          ← sessions
+        </Link>
+      </div>
+    );
+  }
+
+  if (!client) return <p className="p-6 text-sm text-neutral-400">initializing…</p>;
+  // Wait for the transcript fetch so ActivityFeed can seed in one shot.
   if (sessionQuery.isLoading) {
     return <p className="p-6 text-sm text-neutral-400">loading session…</p>;
   }
@@ -129,9 +153,11 @@ export default function VoiceRoom(): React.ReactElement {
   return (
     <PipecatClientProvider client={client}>
       <VoiceRoomShell
-        sessionId={id}
+        sessionId={resolvedSessionId ?? ''}
         initialTranscript={sessionQuery.data?.transcript ?? []}
         initialAgentState={sessionQuery.data?.agent_state ?? 'idle'}
+        isPending={!resolvedSessionId}
+        onSessionCreated={onSessionCreated}
       />
     </PipecatClientProvider>
   );
@@ -141,15 +167,20 @@ function VoiceRoomShell({
   sessionId,
   initialTranscript,
   initialAgentState,
+  isPending,
+  onSessionCreated,
 }: {
   sessionId: string;
   initialTranscript: TranscriptEntry[];
   initialAgentState: AgentState;
+  isPending: boolean;
+  onSessionCreated: (id: string) => void;
 }): React.ReactElement {
   const { model: selectedModel, setModel } = useSelectedModel();
   const { narrateTools, setNarrateTools } = useNarrateTools();
   return (
     <div className="mx-auto flex h-screen max-w-5xl flex-col px-6 py-6">
+      {isPending && <SessionCreatedListener onSessionCreated={onSessionCreated} />}
       <header className="mb-6 flex items-center justify-between">
         <Link to="/" className="text-sm text-neutral-400 hover:text-neutral-200">
           ← sessions
@@ -157,12 +188,14 @@ function VoiceRoomShell({
         <div className="flex items-center gap-3">
           <NarrateToolsToggle value={narrateTools} onChange={setNarrateTools} />
           <ModelChip selected={selectedModel} onChange={setModel} />
-          <Link
-            to={`/s/${sessionId}/transcript`}
-            className="rounded-md border border-neutral-700 px-3 py-1.5 text-xs hover:border-neutral-500"
-          >
-            transcript
-          </Link>
+          {sessionId && !isPending && (
+            <Link
+              to={`/s/${sessionId}/transcript`}
+              className="rounded-md border border-neutral-700 px-3 py-1.5 text-xs hover:border-neutral-500"
+            >
+              transcript
+            </Link>
+          )}
         </div>
       </header>
 
@@ -240,6 +273,27 @@ function VoiceRoomShell({
       </div>
     </div>
   );
+}
+
+// Listens for the session-created server message the backend sends when a
+// new session's SDK UUID is known. Fires once and triggers URL update.
+function SessionCreatedListener({
+  onSessionCreated,
+}: {
+  onSessionCreated: (id: string) => void;
+}): null {
+  const onServerMessage = useCallback(
+    (raw: unknown) => {
+      const inner: unknown = (raw as { data?: unknown } | null)?.data ?? raw;
+      if (typeof inner !== 'object' || inner === null) return;
+      if ((inner as { type?: unknown }).type !== 'session-created') return;
+      const sid = (inner as { session_id?: unknown }).session_id;
+      if (typeof sid === 'string') onSessionCreated(sid);
+    },
+    [onSessionCreated],
+  );
+  useRTVIClientEvent(RTVIEvent.ServerMessage, onServerMessage);
+  return null;
 }
 
 // Flips the mic on as soon as the transport reports Connected. Lives as

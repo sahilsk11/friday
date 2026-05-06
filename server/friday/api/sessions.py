@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from collections.abc import AsyncIterator
 from typing import Annotated
 
@@ -73,18 +72,6 @@ class ModelsResponse(BaseModel):
 class HarnessInfo(BaseModel):
     id: str
     name: str
-
-
-class CreateSessionBody(BaseModel):
-    """Body for ``POST /sessions``.
-
-    ``directory`` is required — it's the working directory tools resolve
-    paths against. ``harness`` picks which provider backend runs the session;
-    defaults to the first available provider if omitted."""
-
-    directory: str
-    title: str | None = None
-    harness: str | None = None
 
 
 class TurnBody(BaseModel):
@@ -228,21 +215,6 @@ async def list_sessions(
         rows.extend(SessionRow.from_info(info) for info in r)
     rows.sort(key=lambda r: r.updated_at, reverse=True)
     return rows
-
-
-@router.post("", response_model=SessionRow, status_code=201)
-async def create_session(body: CreateSessionBody, registry: RegistryDep) -> SessionRow:
-    if not os.path.isabs(body.directory):
-        raise HTTPException(status_code=400, detail="directory must be an absolute path")
-    if not await asyncio.to_thread(os.path.isdir, body.directory):
-        raise HTTPException(
-            status_code=400, detail=f"directory does not exist: {body.directory}"
-        )
-    provider = _pick_provider(registry, body.harness)
-    session = await provider.create_session(title=body.title, directory=body.directory)
-    registry.register_session(session.id, provider.provider_id)
-    info = await provider.get_session(session.id)
-    return SessionRow.from_info(info)
 
 
 @router.get("/{session_id}", response_model=SessionDetail)

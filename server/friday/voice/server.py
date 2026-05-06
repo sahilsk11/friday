@@ -42,8 +42,8 @@ Notes:
 - App data (sessions, transcripts, agent state) flows through REST/SSE in
   ``friday.api.sessions`` — not via RTVI custom messages. RTVI is voice-UI
   state only.
-- ``?session_id=…`` on the WS URL is required — create via ``POST /sessions``
-  first. Missing session_id closes the socket immediately with 1003.
+- ``?session_id=…`` for existing sessions, or ``?harness=…&directory=…`` to
+  create a new session. Missing params closes the socket with 1003.
 - Auth (Step 6) will accept ``?t=…`` here once it lands; until then the
   endpoint is open and expects to be reachable on localhost.
 """
@@ -111,27 +111,68 @@ _AUDIO_OUT_SAMPLE_RATE = 24_000
 
 
 @router.websocket("/api/voice")
-async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
+async def voice(
+    websocket: WebSocket,
+    session_id: str | None = None,
+    harness: str | None = None,
+    directory: str | None = None,
+    title: str | None = None,
+) -> None:
     """Bidirectional voice stream.
 
-    Requires ``?session_id=…`` — create the session via ``POST /sessions``
-    first. Closes with 1003 if session_id is absent, 1011 if the provider
-    is not ready.
+    Two modes:
+    - Existing session: ``?session_id=…``
+    - New session: ``?harness=<id>&directory=<path>`` (+ optional ``&title=…``)
 
-    Returns when the client closes the WebSocket; pipecat's PipelineRunner
-    tears down its pipeline and closes the underlying ``FastAPIWebsocketClient``.
+    For new sessions the server creates the provider session here; once the
+    SDK assigns a UUID (on the first turn) a ``session-created`` RTVI server
+    message is pushed to the client with the real ``session_id``.
+
+    Closes 1003 if neither form of params is provided, 1008 if the harness or
+    session is unknown, 1011 if the provider registry is not ready.
     """
-    if not session_id:
-        await websocket.close(code=1003, reason="session_id required; POST /sessions first")
-        return
+    registry: ProviderRegistry | None = getattr(websocket.app.state, "registry", None)
+    is_new_session = False
 
-    await websocket.accept()
-    provider = await _resolve_provider_for_session(websocket, session_id)
-    if provider is None:
+    if session_id:
+        # Existing session — resolve via registry.
+        await websocket.accept()
+        provider = await _resolve_provider_for_session(websocket, session_id)
+        if provider is None:
+            return
+        session = provider.attach(session_id)
+        logger.info(
+            "voice: attached to existing session | id={} provider={}",
+            session.id,
+            provider.provider_id,
+        )
+    elif harness and directory:
+        # New session — pick provider by harness and create it lazily.
+        if registry is None:
+            await websocket.close(code=1011, reason="provider not ready")
+            return
+        provider = registry.get(harness)
+        if provider is None:
+            await websocket.close(code=1008, reason=f"unknown harness: {harness!r}")
+            return
+        await websocket.accept()
+        session = await provider.create_session(title=title, directory=directory)
+        is_new_session = True
+        # Providers with an immediate ID (opencode) can be registered now.
+        if session.id:
+            registry.register_session(session.id, provider.provider_id)
+        logger.info(
+            "voice: new session created | harness={} directory={} id={}",
+            harness,
+            directory,
+            session.id or "<pending>",
+        )
+    else:
+        await websocket.close(
+            code=1003,
+            reason="session_id required for existing sessions; harness+directory for new",
+        )
         return
-
-    session = provider.attach(session_id)
-    logger.info("voice: attached to provider session | id={} provider={}", session.id, provider.provider_id)
 
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
@@ -172,6 +213,25 @@ async def voice(websocket: WebSocket, session_id: str | None = None) -> None:
         await processor.send_server_message(
             {"type": "agent-state", "state": session.current_state.value}
         )
+        if is_new_session:
+            if session.id:
+                # Provider already has a real ID (e.g. opencode) — tell client now.
+                await processor.send_server_message(
+                    {"type": "session-created", "session_id": session.id}
+                )
+            elif hasattr(session, "_on_sdk_id_assigned"):
+                # Provider assigns the ID on the first turn (e.g. claude-code).
+                # Set a callback so we notify the client as soon as it arrives.
+                async def _on_sdk_id(sdk_id: str) -> None:
+                    if hasattr(provider, "register_session_by_sdk_id"):
+                        provider.register_session_by_sdk_id(session, sdk_id)  # type: ignore[arg-type]
+                    if registry is not None:
+                        registry.register_session(sdk_id, provider.provider_id)
+                    await processor.send_server_message(
+                        {"type": "session-created", "session_id": sdk_id}
+                    )
+
+                session._on_sdk_id_assigned = _on_sdk_id  # type: ignore[attr-defined]
 
     rtvi.event_handler("on_client_ready")(_on_client_ready)
 
