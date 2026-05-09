@@ -9,11 +9,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-from dataclasses import dataclass, field
-from typing import Any
-
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -30,6 +29,7 @@ from claude_agent_sdk import (
 from loguru import logger
 
 from friday.core.provider import (
+    ErrorHandler,
     Message,
     ModelCatalog,
     ModelChoice,
@@ -60,6 +60,7 @@ class ClaudeCodeSession:
     _http: Any = field(repr=False)
     _query_task: asyncio.Task[None] | None = None
     _cancelled: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _sdk_assignment_tasks: set[asyncio.Future[None]] = field(default_factory=set, repr=False)
 
     id: str = ""
     title: str | None = None
@@ -70,14 +71,13 @@ class ClaudeCodeSession:
     # For cold-attached sessions, _sdk_id == id from the start.
     _sdk_id: str = ""
     # Called once when the SDK fires its first session_id (pending sessions only).
-    _on_sdk_id_assigned: Callable[[str], Awaitable[None]] | None = field(
-        default=None, repr=False
-    )
+    _on_sdk_id_assigned: Callable[[str], Awaitable[None]] | None = field(default=None, repr=False)
 
     _delta_handlers: list[TextDeltaHandler] = field(default_factory=list, repr=False)
     _final_handlers: list[TextFinalHandler] = field(default_factory=list, repr=False)
     _state_handlers: list[StateHandler] = field(default_factory=list, repr=False)
     _tool_start_handlers: list[ToolStartHandler] = field(default_factory=list, repr=False)
+    _error_handlers: list[ErrorHandler] = field(default_factory=list, repr=False)
 
     _text_accumulated: str = ""
     _announced_tools: set[str] = field(default_factory=set, repr=False)
@@ -93,6 +93,13 @@ class ClaudeCodeSession:
 
     def on_tool_start(self, handler: ToolStartHandler) -> Unsubscribe:
         return subscribe(self._tool_start_handlers, handler)
+
+    def on_error(self, handler: ErrorHandler) -> Unsubscribe:
+        return subscribe(self._error_handlers, handler)
+
+    @property
+    def sdk_id(self) -> str:
+        return self._sdk_id
 
     async def send_turn(
         self,
@@ -145,8 +152,15 @@ class ClaudeCodeSession:
             opts.resume = self.id
 
         async def run_query():
-            async for msg in query(prompt=text, options=opts):
-                await self._handle_message(msg)
+            try:
+                async for msg in query(prompt=text, options=opts):
+                    await self._handle_message(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                logger.exception("ClaudeCodeSession: query failed")
+                await self._fan_out_error(str(err) or type(err).__name__)
+                await self._fan_out_state(AgentState.IDLE)
 
         self._query_task = asyncio.create_task(run_query())
         await self._fan_out_state(AgentState.THINKING)
@@ -193,7 +207,9 @@ class ClaudeCodeSession:
         if not self.id:
             self.id = sdk_id
         if self._on_sdk_id_assigned is not None:
-            asyncio.create_task(self._on_sdk_id_assigned(sdk_id))
+            task = asyncio.ensure_future(self._on_sdk_id_assigned(sdk_id))
+            self._sdk_assignment_tasks.add(task)
+            task.add_done_callback(self._sdk_assignment_tasks.discard)
 
     async def _handle_assistant(self, msg: AssistantMessage) -> None:
         for block in msg.content:
@@ -225,6 +241,10 @@ class ClaudeCodeSession:
         self.current_state = state
         for handler in tuple(self._state_handlers):
             await handler(state)
+
+    async def _fan_out_error(self, message: str) -> None:
+        for handler in tuple(self._error_handlers):
+            await handler(message)
 
 
 # Static model catalog. Claude Code's SDK doesn't expose a runtime model
@@ -283,8 +303,7 @@ class ClaudeCodeProvider:
         # No real "create" call — Claude Code spawns the session id on the
         # first SDK query. We materialize a wrapper now and let the id land
         # when send_turn fires its first message.
-        session = ClaudeCodeSession(_http=None, title=title, directory=directory)
-        return session
+        return ClaudeCodeSession(_http=None, title=title, directory=directory)
 
     def attach(self, session_id: str) -> ClaudeCodeSession:
         existing = self._sessions.get(session_id)
@@ -308,7 +327,7 @@ class ClaudeCodeProvider:
     async def get_session(self, session_id: str) -> SessionInfo:
         session = self._sessions.get(session_id)
         if session is not None:
-            sdk_id = session._sdk_id or session.id
+            sdk_id = session.sdk_id or session.id
             if not sdk_id:
                 # Pending session — hasn't had a turn yet; return an in-memory stub.
                 now = datetime.now(UTC)
@@ -337,7 +356,7 @@ class ClaudeCodeProvider:
         # them — completed_at stays None, which the UI already handles.
         session = self._sessions.get(session_id)
         if session is not None:
-            sdk_id = session._sdk_id or session.id
+            sdk_id = session.sdk_id or session.id
             if not sdk_id:
                 return []  # Pending session — no messages yet.
         else:

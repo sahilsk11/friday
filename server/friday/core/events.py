@@ -146,10 +146,14 @@ def _parse_session_idle(props: dict[str, Any]) -> OpencodeEvent:
 
 
 def _parse_session_error(props: dict[str, Any]) -> OpencodeEvent:
-    error = (props.get("error") or {}).get("data") or {}
+    error = props.get("error") or {}
+    data = error.get("data") if isinstance(error, dict) else None
+    if not isinstance(data, dict):
+        data = {}
+    message = data.get("message") or (error.get("message") if isinstance(error, dict) else None)
     return SessionError(
         session_id=props["sessionID"],
-        message=error.get("message", "Unknown error"),
+        message=message or "Unknown error",
     )
 
 

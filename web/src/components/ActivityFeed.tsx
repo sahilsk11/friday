@@ -18,6 +18,7 @@ import type { TranscriptEntry } from '@/types/api';
 //         { type: "assistant-text-delta", text }
 //         { type: "assistant-text-final", text }
 //         { type: "agent-state",         state }
+//         { type: "assistant-error",     message }
 //
 // Why a custom user-transcript-final instead of pipecat's built-in
 // userTranscript event: Friday locks user text into the feed only when
@@ -65,12 +66,13 @@ const nextId = (): string => `e${(++entrySeq).toString()}`;
 
 function transcriptToEntries(transcript: TranscriptEntry[]): FeedEntry[] {
   return transcript
-    .filter((e) => e.text.trim().length > 0)
-    .map((e) =>
-      e.role === 'user'
+    .filter((e) => e.text.trim().length > 0 || Boolean(e.error))
+    .map((e) => {
+      if (e.error) return { kind: 'error', id: nextId(), message: e.error };
+      return e.role === 'user'
         ? { kind: 'user', id: nextId(), text: e.text }
-        : { kind: 'assistant', id: nextId(), text: e.text, final: true },
-    );
+        : { kind: 'assistant', id: nextId(), text: e.text, final: true };
+    });
 }
 
 export function ActivityFeed({
@@ -128,6 +130,7 @@ export function ActivityFeed({
           return [...prev, { kind: 'assistant', id: nextId(), text: inner.text, final: true }];
         }
         case 'assistant-error':
+          if (!inner.message) return prev;
           return [...prev, { kind: 'error', id: nextId(), message: inner.message }];
         case 'agent-state':
           // Surfaced by the StatusPill via its own subscription; nothing

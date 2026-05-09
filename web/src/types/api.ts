@@ -14,6 +14,7 @@ export interface TranscriptEntry {
   role: 'user' | 'assistant';
   text: string;
   completed_at: string | null;
+  error?: string | null;
 }
 
 export interface ModelRef {
@@ -49,4 +50,5 @@ export interface HarnessInfo {
 export type SessionEvent =
   | { type: 'state'; state: AgentState }
   | { type: 'text.delta'; text: string }
-  | { type: 'text.final'; text: string };
+  | { type: 'text.final'; text: string }
+  | { type: 'error'; message: string };

@@ -315,19 +315,15 @@ class ProviderSessionProcessor(FrameProcessor):
         )
 
     async def _on_error(self, message: str) -> None:
+        self._narration.reset()
+        if self._in_response:
+            self._in_response = False
+            await self.push_frame(LLMFullResponseEndFrame())
         await self.push_frame(
             RTVIServerMessageFrame(data={"type": RTVI_ASSISTANT_ERROR, "message": message})
         )
-        # Read the error out loud if TTS is enabled
         if self.tts_enabled and message:
-            error_text = f"Error: {message}"
-            if not self._in_response:
-                self._in_response = True
-                await self.push_frame(LLMFullResponseStartFrame())
-            await self.push_frame(LLMTextFrame(error_text))
-            if self._in_response:
-                self._in_response = False
-                await self.push_frame(LLMFullResponseEndFrame())
+            await self.push_frame(TTSSpeakFrame(f"Error: {message}"))
 
     async def _on_tool_start(self, tool_name: str, tool_input: dict[str, Any]) -> None:
         # Spawn narration as a background task so the SSE loop isn't blocked

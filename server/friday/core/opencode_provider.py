@@ -410,8 +410,11 @@ class OpencodeSession:
             await handler(state)
 
     async def _handle_error(self, event: SessionError) -> None:
+        self._accumulated.clear()
+        self._reasoning_parts.clear()
         for handler in tuple(self._error_handlers):
             await handler(event.message)
+        await self._fan_out_state(AgentState.IDLE)
 
 
 def _state_from_status(status: str) -> AgentState:
