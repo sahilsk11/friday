@@ -16,6 +16,7 @@ and the voice pipeline (Step 5) drive the agent through this surface.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from typing import Annotated
@@ -265,24 +266,40 @@ async def stream_events(
     session = provider.attach(session_id)
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=_SSE_QUEUE_LIMIT)
 
+    def enqueue(chunk: str) -> None:
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(chunk)
+
     async def on_delta(text: str) -> None:
-        await queue.put(_pack("text.delta", {"text": text}))
+        enqueue(_pack("text.delta", {"text": text}))
 
     async def on_final(text: str) -> None:
-        await queue.put(_pack("text.final", {"text": text}))
+        enqueue(_pack("text.final", {"text": text}))
 
     async def on_state(state: AgentState) -> None:
-        await queue.put(_pack("state", {"state": state.value}))
+        enqueue(_pack("state", {"state": state.value}))
 
     async def on_error(message: str) -> None:
-        await queue.put(_pack("error", {"message": message}))
+        enqueue(_pack("error", {"message": message}))
 
-    session.on_text_delta(on_delta)
-    session.on_text_final(on_final)
-    session.on_state(on_state)
-    session.on_error(on_error)
+    unsubscribers = [
+        session.on_text_delta(on_delta),
+        session.on_text_final(on_final),
+        session.on_state(on_state),
+        session.on_error(on_error),
+    ]
 
-    return StreamingResponse(_sse_stream(queue), media_type="text/event-stream")
+    enqueue(_pack("state", {"state": session.current_state.value}))
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in _sse_stream(queue):
+                yield chunk
+        finally:
+            for unsubscribe in unsubscribers:
+                unsubscribe()
+
+    return StreamingResponse(body(), media_type="text/event-stream")
 
 
 async def _sse_stream(queue: asyncio.Queue[str]) -> AsyncIterator[bytes]:

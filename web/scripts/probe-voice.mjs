@@ -11,41 +11,16 @@
 // the app's new-session modal and WebSocket flow.
 
 import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
+import {
+  createSessionThroughUi,
+  FE_BASE,
+  launchFakeMicBrowser,
+} from './probe-lib.mjs';
 
-const FE_BASE = process.env.FE_BASE_URL ?? 'http://localhost:5173';
-const FAKE_AUDIO = process.env.FAKE_AUDIO_PATH ?? '/tmp/voice-test-input.wav';
 const HOLD_MS = Number(process.env.HOLD_MS ?? 25_000);
 const SEND_AFTER_MS = Number(process.env.SEND_AFTER_MS ?? 6000);
-const DEFAULT_PROBE_DIRECTORY = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '../..',
-);
-const PROBE_DIRECTORY = process.env.PROBE_DIRECTORY ?? DEFAULT_PROBE_DIRECTORY;
-const PROBE_HARNESS = process.env.PROBE_HARNESS;
 
-if (!fs.existsSync(FAKE_AUDIO)) {
-  console.error(`fake audio file missing: ${FAKE_AUDIO}`);
-  console.error(
-    'regenerate with: say "hey friday what does this code do" -o /tmp/voice-test-input.wav --data-format=LEI16@16000',
-  );
-  process.exit(2);
-}
-
-const browser = await chromium.launch({
-  headless: true,
-  args: [
-    '--use-fake-ui-for-media-stream',
-    '--use-fake-device-for-media-stream',
-    `--use-file-for-fake-audio-capture=${FAKE_AUDIO}`,
-    '--autoplay-policy=no-user-gesture-required',
-  ],
-});
-
-const ctx = await browser.newContext({ permissions: ['microphone'] });
-await ctx.grantPermissions(['microphone'], { origin: FE_BASE });
+const { browser, ctx } = await launchFakeMicBrowser();
 const page = await ctx.newPage();
 
 const consoleLog = [];
@@ -79,15 +54,7 @@ console.log(`[probe] navigating ${url}`);
 await page.goto(url, { waitUntil: 'domcontentloaded' });
 
 if (!existingSessionId) {
-  console.log(`[probe] creating session through UI directory=${PROBE_DIRECTORY}`);
-  await page.locator('button', { hasText: /^new session$/i }).click();
-  if (PROBE_HARNESS) {
-    await page.locator('select').first().selectOption(PROBE_HARNESS);
-  }
-  await page.locator('input[placeholder="optional"]').fill('probe-voice');
-  await page.locator('input[placeholder="/absolute/path"]').fill(PROBE_DIRECTORY);
-  await page.locator('button', { hasText: /^start session$/i }).click();
-  await page.waitForURL(/\/s\/new|\/s\/[^/]+$/, { timeout: 20_000 });
+  await createSessionThroughUi(page);
 }
 
 console.log(`[probe] route=${page.url()}`);

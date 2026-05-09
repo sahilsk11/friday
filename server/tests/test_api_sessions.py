@@ -209,11 +209,11 @@ async def test_sse_streams_delta_final_and_state(
             break
 
     types = [c["type"] for c in collected]
-    assert types == ["state", "text.delta", "text.final", "state"]
-    assert collected[0] == {"type": "state", "state": "thinking"}
-    assert collected[1] == {"type": "text.delta", "text": "Hi"}
-    assert collected[2] == {"type": "text.final", "text": "Hi"}
-    assert collected[3] == {"type": "state", "state": "idle"}
+    assert types == ["state", "state", "text.delta", "text.final"]
+    assert collected[0] == {"type": "state", "state": "idle"}
+    assert collected[1] == {"type": "state", "state": "thinking"}
+    assert collected[2] == {"type": "text.delta", "text": "Hi"}
+    assert collected[3] == {"type": "text.final", "text": "Hi"}
 
 
 async def test_sse_streams_provider_errors(
@@ -236,8 +236,8 @@ async def test_sse_streams_provider_errors(
             break
 
     assert collected == [
-        {"type": "error", "message": "model cannot read images"},
         {"type": "state", "state": "idle"},
+        {"type": "error", "message": "model cannot read images"},
     ]
 
 
