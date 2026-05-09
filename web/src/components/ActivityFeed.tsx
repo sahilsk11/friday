@@ -64,6 +64,17 @@ function isServerMessage(value: unknown): value is ServerMessageData {
 let entrySeq = 0;
 const nextId = (): string => `e${(++entrySeq).toString()}`;
 
+function dedupeDelta(current: string, delta: string): string {
+  // Defensive: some providers send cumulative deltas or corrected text.
+  // If the delta is already a suffix of current, it's a duplicate.
+  // If the delta starts with current, only append the new suffix.
+  if (current.endsWith(delta)) return '';
+  if (delta.startsWith(current)) return delta.slice(current.length);
+  // Rare: delta is a substring somewhere in current.
+  if (current.includes(delta)) return '';
+  return delta;
+}
+
 function transcriptToEntries(transcript: TranscriptEntry[]): FeedEntry[] {
   return transcript
     .filter((e) => e.text.trim().length > 0 || Boolean(e.error))
@@ -111,7 +122,9 @@ export function ActivityFeed({
         case 'assistant-text-delta': {
           const last = prev[prev.length - 1];
           if (last?.kind === 'assistant' && !last.final) {
-            const updated: FeedEntry = { ...last, text: last.text + inner.text };
+            const deltaText = dedupeDelta(last.text, inner.text);
+            if (!deltaText) return prev;
+            const updated: FeedEntry = { ...last, text: last.text + deltaText };
             return [...prev.slice(0, -1), updated];
           }
           return [...prev, { kind: 'assistant', id: nextId(), text: inner.text, final: false }];
