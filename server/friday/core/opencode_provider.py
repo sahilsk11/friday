@@ -160,7 +160,7 @@ class OpencodeProvider:
     # ── Persistence ────────────────────────────────────────────────────
 
     async def list_sessions(self, *, directory: str | None = None) -> list[SessionInfo]:
-        resp = await self._http.get("/session")
+        resp = await self._http.get("/experimental/session")
         resp.raise_for_status()
         rows: list[dict[str, Any]] = resp.json()
         sessions = [_parse_session_info(row) for row in rows]
