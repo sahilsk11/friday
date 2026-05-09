@@ -74,13 +74,15 @@ class Message:
     backend-native shape so callers that care about tool invocations or
     structured parts can introspect. ``model`` is set on assistant messages
     when the backend records which model ran the turn — None for user
-    messages or backends that don't track this."""
+    messages or backends that don't track this. ``error`` is set when the
+    backend reports a failure (e.g., API errors, rate limits)."""
 
     role: str
     text: str
     completed_at: datetime | None
     parts: list[dict[str, Any]] = field(default_factory=list)
     model: ModelChoice | None = None
+    error: str | None = None
 
 
 EventHandler = Callable[[Any], Awaitable[None]]

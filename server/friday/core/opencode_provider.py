@@ -435,12 +435,15 @@ def _parse_message(row: dict[str, Any]) -> Message:
         if model_id and provider_id
         else None
     )
+    error_info = info.get("error") or {}
+    error_msg = error_info.get("data", {}).get("message") if error_info else None
     return Message(
         role=info.get("role", ""),
         text=text,
         completed_at=_ms_to_datetime(completed_ms) if completed_ms else None,
         parts=parts,
         model=model,
+        error=error_msg,
     )
 
 
