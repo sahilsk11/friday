@@ -39,6 +39,7 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from friday.api.sessions import harnesses_router, models_router, router as sessions_router
+from friday.api.config import router as config_router
 from friday.core.claude_code_provider import ClaudeCodeProvider
 from friday.core.codex_provider import CodexProvider
 from friday.core.opencode_provider import OpencodeProvider
@@ -128,6 +129,7 @@ def create_app(*, with_lifespan: bool = True) -> FastAPI:
     app.include_router(models_router)
     app.include_router(harnesses_router)
     app.include_router(voice_router)
+    app.include_router(config_router)
     _mount_spa(app)
     return app
 

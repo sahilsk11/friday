@@ -31,3 +31,11 @@ export function listModels(harness?: string): Promise<ModelsResponse> {
 export function listHarnesses(): Promise<HarnessInfo[]> {
   return apiClient.get<HarnessInfo[]>('/harnesses');
 }
+
+export interface ClientConfig {
+  defaultDirectory: string;
+}
+
+export function getConfig(): Promise<ClientConfig> {
+  return apiClient.get<ClientConfig>('/config');
+}
