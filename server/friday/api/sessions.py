@@ -102,6 +102,7 @@ class MessageRow(BaseModel):
     role: str
     text: str
     completed_at: str | None
+    error: str | None = None
 
     @classmethod
     def from_message(cls, m: Message) -> MessageRow:
@@ -109,6 +110,7 @@ class MessageRow(BaseModel):
             role=m.role,
             text=m.text,
             completed_at=m.completed_at.isoformat() if m.completed_at else None,
+            error=m.error,
         )
 
 
