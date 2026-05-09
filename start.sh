@@ -36,7 +36,7 @@ kill_port 4096
 
 # ── opencode server (port 4096) ───────────────────────────────────────────────
 echo "[opencode] Starting on :4096..."
-opencode serve --port 4096 2>&1 | sed 's/^/[opencode] /' &
+env -u OPENCODE_SERVER_USERNAME -u OPENCODE_SERVER_PASSWORD opencode serve --port 4096 2>&1 | sed 's/^/[opencode] /' &
 PIDS+=($!)
 
 # ── Backend / FastAPI (port 8000) ─────────────────────────────────────────────

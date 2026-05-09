@@ -1,24 +1,9 @@
 // Step-by-step probe to find where the connect flow stalls.
-import { chromium } from 'playwright';
 import fs from 'node:fs';
+import { createSessionThroughUi, FE_BASE, launchFakeMicBrowser } from './probe-lib.mjs';
 
-const FE = 'http://localhost:5173';
-const FAKE_AUDIO = '/tmp/voice-test-input.wav';
-if (!fs.existsSync(FAKE_AUDIO)) throw new Error('missing fake audio');
-
-const browser = await chromium.launch({
-  headless: true,
-  args: [
-    '--use-fake-ui-for-media-stream',
-    '--use-fake-device-for-media-stream',
-    `--use-file-for-fake-audio-capture=${FAKE_AUDIO}`,
-    '--autoplay-policy=no-user-gesture-required',
-    '--disable-features=WebRtcHideLocalIpsWithMdns',
-  ],
-});
-
-const ctx = await browser.newContext({ permissions: ['microphone'] });
-await ctx.grantPermissions(['microphone'], { origin: FE });
+const existingSessionId = process.argv[2];
+const { browser, ctx } = await launchFakeMicBrowser();
 
 // Inject RTCPC tracker BEFORE first navigation.
 await ctx.addInitScript(() => {
@@ -42,20 +27,15 @@ const log = [];
 page.on('console', (m) => log.push(`[${m.type()}] ${m.text()}`));
 page.on('pageerror', (e) => log.push(`[pageerror] ${e.message}`));
 
-// Create a session via REST.
-const r = await fetch('http://localhost:8765/sessions', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ title: 'probe-step' }),
-});
-const sess = await r.json();
-console.log('session', sess.id);
+const url = existingSessionId ? `${FE_BASE}/s/${existingSessionId}` : FE_BASE;
+await page.goto(url, { waitUntil: 'domcontentloaded' });
+if (!existingSessionId) {
+  await createSessionThroughUi(page, 'probe-step');
+}
+console.log('route', page.url());
 
-await page.goto(`${FE}/s/${sess.id}`, { waitUntil: 'domcontentloaded' });
-
-// Wait for ConnectButton to appear, then poll for client readiness.
-await page.locator('button:has-text("Connect")').first().waitFor({ state: 'visible', timeout: 20_000 });
-console.log('connect button visible');
+await page.waitForLoadState('networkidle');
+console.log('voice room loaded');
 
 // Test 1: can we run getUserMedia ourselves?
 const gum = await page.evaluate(async () => {
@@ -98,9 +78,7 @@ const btnState = await page.evaluate(() => {
 });
 console.log('button state:', JSON.stringify(btnState, null, 2));
 
-console.log('clicking connect...');
 const t0 = Date.now();
-await page.locator('button:has-text("Connect")').first().click();
 
 // Sample for 20s.
 for (let i = 0; i < 10; i++) {
@@ -113,7 +91,7 @@ for (let i = 0; i < 10; i++) {
       connectionState: pc.connectionState,
     }));
     const btn = Array.from(document.querySelectorAll('button')).find((b) =>
-      /connect|disconnect/i.test(b.textContent ?? ''),
+      /start|send|interrupt/i.test(b.textContent ?? ''),
     );
     return { pcs: out, btnText: btn?.textContent };
   });
