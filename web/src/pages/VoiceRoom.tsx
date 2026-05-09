@@ -162,6 +162,7 @@ export default function VoiceRoom(): React.ReactElement {
         harness={sessionQuery.data?.session.harness ?? pendingParams?.harness ?? null}
         initialTranscript={sessionQuery.data?.transcript ?? []}
         initialAgentState={sessionQuery.data?.agent_state ?? 'idle'}
+        currentModel={sessionQuery.data?.current_model}
         isPending={!resolvedSessionId}
         onSessionCreated={onSessionCreated}
       />
@@ -174,6 +175,7 @@ function VoiceRoomShell({
   harness,
   initialTranscript,
   initialAgentState,
+  currentModel,
   isPending,
   onSessionCreated,
 }: {
@@ -181,10 +183,24 @@ function VoiceRoomShell({
   harness: string | null;
   initialTranscript: TranscriptEntry[];
   initialAgentState: AgentState;
+  currentModel?: ModelRef | null;
   isPending: boolean;
   onSessionCreated: (id: string) => void;
 }): React.ReactElement {
   const { model: selectedModel, setModel } = useSelectedModel(harness);
+
+  useEffect(() => {
+    if (!currentModel) return;
+    if (
+      selectedModel &&
+      selectedModel.providerID === currentModel.providerID &&
+      selectedModel.modelID === currentModel.modelID
+    ) {
+      return;
+    }
+    setModel(currentModel);
+  }, [currentModel, selectedModel, setModel]);
+
   const { narrateTools, setNarrateTools } = useNarrateTools();
   return (
     <div className="mx-auto flex h-screen max-w-5xl flex-col px-6 py-6">
@@ -309,10 +325,13 @@ function SessionCreatedListener({
 // its own component so it can use usePipecatClientMicControl — that hook
 // only works inside <PipecatClientProvider>.
 function AutoEnableMicOnConnect(): null {
-  const { enableMic } = usePipecatClientMicControl();
+  const { enableMic, isMicEnabled } = usePipecatClientMicControl();
+  const firedRef = useRef(false);
   const onConnected = useCallback(() => {
-    enableMic(true);
-  }, [enableMic]);
+    if (firedRef.current) return;
+    firedRef.current = true;
+    if (!isMicEnabled) enableMic(true);
+  }, [enableMic, isMicEnabled]);
   useRTVIClientEvent(RTVIEvent.Connected, onConnected);
   return null;
 }

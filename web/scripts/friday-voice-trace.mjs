@@ -185,7 +185,7 @@ function summarizeUi(ui) {
   };
 }
 
-async function sampleLoop(page, label, durationMs, intervalMs = 1000) {
+async function sampleLoop(page, label, durationMs, intervalMs = 1000, minFeedLength = 0) {
   const deadline = Date.now() + durationMs;
   let previous = null;
   while (Date.now() < deadline) {
@@ -202,7 +202,7 @@ async function sampleLoop(page, label, durationMs, intervalMs = 1000) {
     } else {
       trace('ui-sample', { label, ...summarizeUi(ui) });
     }
-    if (ui.feed.length >= 2) return ui;
+    if (ui.feed.length > minFeedLength) return ui;
   }
   return readUi(page);
 }
@@ -250,7 +250,7 @@ try {
 
   const context = await browser.newContext({
     permissions: ['microphone'],
-    viewport: { width: 1440, height: 1000 },
+    viewport: { width: 390, height: 844 },
   });
   await context.grantPermissions(['microphone'], { origin: FE_BASE });
   await context.addInitScript(() => {
@@ -438,7 +438,8 @@ try {
     trace('recording-auto-started', summarizeUi(await readUi(page)));
   }
 
-  const preSendUi = await sampleLoop(page, 'recording-before-send', WAIT_AFTER_START_MS);
+  const uiBeforeRecording = await readUi(page);
+  const preSendUi = await sampleLoop(page, 'recording-before-send', WAIT_AFTER_START_MS, 1000, uiBeforeRecording.feed.length);
   await screenshot(page, 'before-send');
 
   trace('click-send-start', summarizeUi(preSendUi));
@@ -452,7 +453,8 @@ try {
     });
   }
 
-  const finalUi = await sampleLoop(page, 'after-send', WAIT_AFTER_SEND_MS);
+  const uiBeforeSend = await readUi(page);
+  const finalUi = await sampleLoop(page, 'after-send', WAIT_AFTER_SEND_MS, 1000, uiBeforeSend.feed.length);
   await screenshot(page, 'final');
   const model = modelParts(MODEL);
   finalSummary = {
