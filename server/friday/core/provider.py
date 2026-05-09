@@ -90,6 +90,7 @@ TextDeltaHandler = Callable[[str], Awaitable[None]]
 TextFinalHandler = Callable[[str], Awaitable[None]]
 StateHandler = Callable[[AgentState], Awaitable[None]]
 ToolStartHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
+ErrorHandler = Callable[[str], Awaitable[None]]
 Unsubscribe = Callable[[], None]
 
 T = TypeVar("T")

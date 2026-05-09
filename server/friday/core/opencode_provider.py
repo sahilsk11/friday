@@ -36,11 +36,13 @@ from friday.core.events import (
     MessagePartUpdated,
     MessageUpdated,
     OpencodeEvent,
+    SessionError,
     SessionIdle,
     SessionStatus,
     parse_event,
 )
 from friday.core.provider import (
+    ErrorHandler,
     Message,
     ModelCatalog,
     ModelChoice,
@@ -269,6 +271,7 @@ class OpencodeSession:
         self._final_handlers: list[TextFinalHandler] = []
         self._state_handlers: list[StateHandler] = []
         self._tool_start_handlers: list[ToolStartHandler] = []
+        self._error_handlers: list[ErrorHandler] = []
         # Accumulated text per (sessionID, messageID) for on_text_final.
         self._accumulated: dict[str, str] = {}
         # Track which assistant messages we've already finalized.
@@ -304,6 +307,10 @@ class OpencodeSession:
     def on_tool_start(self, handler: ToolStartHandler) -> Unsubscribe:
         """Fires once per tool invocation, with the tool name."""
         return subscribe(self._tool_start_handlers, handler)
+
+    def on_error(self, handler: ErrorHandler) -> Unsubscribe:
+        """Fires when the session encounters an error (e.g., API failure)."""
+        return subscribe(self._error_handlers, handler)
 
     @property
     def current_state(self) -> AgentState:
@@ -348,6 +355,8 @@ class OpencodeSession:
             await self._fan_out_state(_state_from_status(event.status))
         elif isinstance(event, SessionIdle):
             await self._fan_out_state(AgentState.IDLE)
+        elif isinstance(event, SessionError):
+            await self._handle_error(event)
 
     async def _handle_delta(self, event: MessagePartDelta) -> None:
         if event.field != "text":
@@ -399,6 +408,10 @@ class OpencodeSession:
         # doesn't mutate the list we're iterating.
         for handler in tuple(self._state_handlers):
             await handler(state)
+
+    async def _handle_error(self, event: SessionError) -> None:
+        for handler in tuple(self._error_handlers):
+            await handler(event.message)
 
 
 def _state_from_status(status: str) -> AgentState:

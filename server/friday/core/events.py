@@ -45,6 +45,15 @@ class SessionIdle:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionError:
+    """Session encountered an error (e.g., API failure, model not found)."""
+
+    session_id: str
+    message: str
+    type: Literal["session.error"] = "session.error"
+
+
+@dataclass(frozen=True, slots=True)
 class MessageUpdated:
     """A message's metadata changed — start, update, or completion.
 
@@ -101,6 +110,7 @@ OpencodeEvent = (
     ServerConnected
     | SessionStatus
     | SessionIdle
+    | SessionError
     | MessageUpdated
     | MessagePartUpdated
     | MessagePartDelta
@@ -133,6 +143,14 @@ def _parse_session_status(props: dict[str, Any]) -> OpencodeEvent:
 
 def _parse_session_idle(props: dict[str, Any]) -> OpencodeEvent:
     return SessionIdle(session_id=props["sessionID"])
+
+
+def _parse_session_error(props: dict[str, Any]) -> OpencodeEvent:
+    error = (props.get("error") or {}).get("data") or {}
+    return SessionError(
+        session_id=props["sessionID"],
+        message=error.get("message", "Unknown error"),
+    )
 
 
 def _parse_message_part_delta(props: dict[str, Any]) -> OpencodeEvent:
@@ -177,6 +195,7 @@ def _parse_message_part_updated(props: dict[str, Any]) -> OpencodeEvent:
 _PARSERS: dict[str, _Parser] = {
     "session.status": _parse_session_status,
     "session.idle": _parse_session_idle,
+    "session.error": _parse_session_error,
     "message.updated": _parse_message_updated,
     "message.part.updated": _parse_message_part_updated,
     "message.part.delta": _parse_message_part_delta,
