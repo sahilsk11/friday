@@ -6,7 +6,8 @@ One abstraction layer supporting multiple backends:
 
 Each provider exposes the same interface: persistence (list/get sessions
 and transcripts, list available models), creating live sessions, and the
-session-level observer API (text deltas, text final, state, tool start).
+session-level observer API (text deltas, text final, state, tool start,
+errors).
 
 Application code (api/, voice/, cli/) only ever holds these protocol
 types. Backend specifics — HTTP wire shapes, SSE multiplexing, SDK calls,
@@ -90,6 +91,7 @@ TextDeltaHandler = Callable[[str], Awaitable[None]]
 TextFinalHandler = Callable[[str], Awaitable[None]]
 StateHandler = Callable[[AgentState], Awaitable[None]]
 ToolStartHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
+ErrorHandler = Callable[[str], Awaitable[None]]
 Unsubscribe = Callable[[], None]
 
 T = TypeVar("T")
@@ -202,6 +204,11 @@ class ProviderSession(Protocol):
     @abstractmethod
     def on_tool_start(self, handler: ToolStartHandler) -> Unsubscribe:
         """Subscribe to tool invocations."""
+        ...
+
+    @abstractmethod
+    def on_error(self, handler: ErrorHandler) -> Unsubscribe:
+        """Subscribe to provider-reported turn errors."""
         ...
 
     @abstractmethod

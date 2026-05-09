@@ -45,7 +45,7 @@ async def test_list_sessions_parses_rows(
     httpx_mock: HTTPXMock, provider: OpencodeProvider
 ) -> None:
     httpx_mock.add_response(
-        url=f"{BASE_URL}/session",
+        url=f"{BASE_URL}/experimental/session",
         json=[
             _row(sid="ses_a", title="alpha", directory="/x", created=1_700_000_000_000),
             _row(sid="ses_b", title="beta", directory="/y", created=1_700_000_500_000),
@@ -76,7 +76,7 @@ async def test_list_sessions_filters_by_directory(
     httpx_mock: HTTPXMock, provider: OpencodeProvider
 ) -> None:
     httpx_mock.add_response(
-        url=f"{BASE_URL}/session",
+        url=f"{BASE_URL}/experimental/session",
         json=[_row(sid="ses_a", directory="/keep"), _row(sid="ses_b", directory="/skip")],
     )
 

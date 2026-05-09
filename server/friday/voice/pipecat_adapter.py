@@ -61,6 +61,7 @@ RTVI_ASSISTANT_TEXT_FINAL = "assistant-text-final"
 RTVI_AGENT_STATE = "agent-state"
 RTVI_USER_TRANSCRIPT_RUNNING = "user-transcript-running"
 RTVI_USER_TRANSCRIPT_FINAL = "user-transcript-final"
+RTVI_ASSISTANT_ERROR = "assistant-error"
 
 
 class UserTranscriptMirror(FrameProcessor):
@@ -189,6 +190,7 @@ class ProviderSessionProcessor(FrameProcessor):
             session.on_text_final(self._on_final),
             session.on_state(self._on_state),
             session.on_tool_start(self._on_tool_start),
+            session.on_error(self._on_error),
         ]
 
     @override
@@ -311,6 +313,17 @@ class ProviderSessionProcessor(FrameProcessor):
         await self.push_frame(
             RTVIServerMessageFrame(data={"type": RTVI_ASSISTANT_TEXT_FINAL, "text": text})
         )
+
+    async def _on_error(self, message: str) -> None:
+        self._narration.reset()
+        if self._in_response:
+            self._in_response = False
+            await self.push_frame(LLMFullResponseEndFrame())
+        await self.push_frame(
+            RTVIServerMessageFrame(data={"type": RTVI_ASSISTANT_ERROR, "message": message})
+        )
+        if self.tts_enabled and message:
+            await self.push_frame(TTSSpeakFrame(f"Error: {message}"))
 
     async def _on_tool_start(self, tool_name: str, tool_input: dict[str, Any]) -> None:
         # Spawn narration as a background task so the SSE loop isn't blocked

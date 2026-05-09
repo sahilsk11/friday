@@ -16,6 +16,8 @@ export interface LiveTranscript {
   finals: string[];
   /** Currently streaming assistant text — empty between turns. */
   pending: string;
+  /** Live provider errors, oldest first. */
+  errors: string[];
   /** Wire-level connection state. */
   connection: 'connecting' | 'open' | 'closed';
 }
@@ -24,6 +26,7 @@ const initial: LiveTranscript = {
   state: 'idle',
   finals: [],
   pending: '',
+  errors: [],
   connection: 'connecting',
 };
 
@@ -57,6 +60,8 @@ export function useSessionEvents(sessionId: string | undefined): LiveTranscript 
             return { ...prev, pending: prev.pending + evt.text };
           case 'text.final':
             return { ...prev, finals: [...prev.finals, evt.text], pending: '' };
+          case 'error':
+            return { ...prev, errors: [...prev.errors, evt.message], pending: '' };
         }
       });
     };
