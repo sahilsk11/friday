@@ -4,7 +4,7 @@ import { Link, useNavigate } from 'react-router';
 
 import { isApiError } from '@/lib/api';
 import { useSelectedModel } from '@/lib/selectedModel';
-import { listHarnesses, listModels, listSessions } from '@/lib/sessions';
+import { getConfig, listHarnesses, listModels, listSessions } from '@/lib/sessions';
 import type { HarnessInfo, ModelInfo, ModelRef } from '@/types/api';
 
 // Plain REST. No voice-ui-kit imports here — per jarvis.md, only the
@@ -18,7 +18,7 @@ function formatTimestamp(iso: string): string {
   }
 }
 
-const DEFAULT_DIRECTORY = '/root/projects';
+const DEFAULT_DIRECTORY = '';
 
 function modelKey(m: ModelRef): string {
   return `${m.providerID}/${m.modelID}`;
@@ -109,6 +109,18 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
   const [title, setTitle] = useState('');
   const [directory, setDirectory] = useState(DEFAULT_DIRECTORY);
   const directoryRef = useRef<HTMLInputElement>(null);
+
+  const configQuery = useQuery({
+    queryKey: ['config'],
+    queryFn: getConfig,
+    staleTime: Infinity,
+  });
+
+  useEffect(() => {
+    if (configQuery.data?.defaultDirectory) {
+      setDirectory(configQuery.data.defaultDirectory);
+    }
+  }, [configQuery.data]);
 
   const harnessesQuery = useQuery({
     queryKey: ['harnesses'],
