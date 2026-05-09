@@ -40,11 +40,16 @@ export default function SessionView() {
     enabled: Boolean(id),
   });
 
-  const live = useSessionEvents(id);
+  const live = useSessionEvents(id, sessionQuery.data?.agent_state ?? 'idle');
   const harness = sessionQuery.data?.session.harness ?? null;
   const persistedErrors = new Set(
     (sessionQuery.data?.transcript ?? []).flatMap((entry) => (entry.error ? [entry.error] : [])),
   );
+  const persistedTranscript = sessionQuery.data?.transcript ?? [];
+  const persistedAssistantTexts = persistedTranscript
+    .filter((entry) => entry.role === 'assistant' && !entry.error)
+    .map((entry) => entry.text);
+  const syncedLiveFinals = excludePersistedLiveFinals(live.finals, persistedAssistantTexts);
   const { model: selectedModel, setModel } = useSelectedModel(harness);
 
   const turnMutation = useMutation({
@@ -64,7 +69,7 @@ export default function SessionView() {
   // Auto-scroll on new content.
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [live.finals.length, live.pending, live.errors.length, sessionQuery.data?.transcript.length]);
+  }, [live.pending, syncedLiveFinals.length, live.errors.length, persistedTranscript.length]);
 
   // When the agent returns to idle, the live `pending` buffer has
   // already been flushed via text.final. Refetch the canonical
@@ -112,7 +117,7 @@ export default function SessionView() {
           </p>
         ) : (
           <div className="space-y-4 p-4">
-            {(sessionQuery.data?.transcript ?? []).map((entry, i) =>
+            {persistedTranscript.map((entry, i) =>
               entry.error ? (
                 <ErrorBlock key={i} message={entry.error} />
               ) : (
@@ -120,6 +125,9 @@ export default function SessionView() {
               ),
             )}
             {live.pending ? <TranscriptBlock role="assistant" text={live.pending} pending /> : null}
+            {syncedLiveFinals.map((text, i) => (
+              <TranscriptBlock key={`live-final-${i}`} role="assistant" text={text} />
+            ))}
             {live.errors
               .filter((message) => !persistedErrors.has(message))
               .map((message, i) => (
@@ -157,6 +165,22 @@ export default function SessionView() {
       </form>
     </div>
   );
+}
+
+function excludePersistedLiveFinals(
+  liveFinals: string[],
+  persistedAssistantTexts: string[],
+): string[] {
+  let matchedFromEnd = 0;
+  while (
+    matchedFromEnd < liveFinals.length &&
+    matchedFromEnd < persistedAssistantTexts.length &&
+    liveFinals[liveFinals.length - 1 - matchedFromEnd] ===
+      persistedAssistantTexts[persistedAssistantTexts.length - 1 - matchedFromEnd]
+  ) {
+    matchedFromEnd++;
+  }
+  return liveFinals.slice(0, liveFinals.length - matchedFromEnd);
 }
 
 function StatePill({ state }: { state: AgentState }) {

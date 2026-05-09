@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "friday:conversation": "node scripts/friday-voice-trace.mjs",
+    "friday:voice-trace": "node scripts/friday-voice-trace.mjs",
     "preview": "vite preview",
     "typecheck": "tsc -b",
     "lint": "eslint . --max-warnings 0",

@@ -17,9 +17,10 @@ class ClientConfig(BaseModel):
 
 def _load_config() -> ClientConfig:
     """Load config from file, with fallbacks."""
+    home = Path.home()
     config_paths = [
-        Path.home() / ".config" / "friday" / "config.json",
-        Path.home() / "projects" / ".friday-config.json",
+        home / ".config" / "friday" / "config.json",
+        home / "projects" / ".friday-config.json",
     ]
 
     for path in config_paths:
@@ -32,7 +33,10 @@ def _load_config() -> ClientConfig:
             except (json.JSONDecodeError, OSError):
                 pass
 
-    return ClientConfig(defaultDirectory="/home/sas/projects")
+    projects_dir = home / "projects"
+    if projects_dir.is_dir():
+        return ClientConfig(defaultDirectory=str(projects_dir))
+    return ClientConfig(defaultDirectory=str(home))
 
 
 @router.get("", response_model=ClientConfig)

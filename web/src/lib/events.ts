@@ -12,30 +12,35 @@ import type { AgentState, SessionEvent } from '@/types/api';
 
 export interface LiveTranscript {
   state: AgentState;
-  /** Finalized assistant turns, oldest first. */
-  finals: string[];
   /** Currently streaming assistant text — empty between turns. */
   pending: string;
+  /** Finalized assistant turns received live but not yet reflected in REST. */
+  finals: string[];
   /** Live provider errors, oldest first. */
   errors: string[];
   /** Wire-level connection state. */
   connection: 'connecting' | 'open' | 'closed';
 }
 
-const initial: LiveTranscript = {
-  state: 'idle',
-  finals: [],
-  pending: '',
-  errors: [],
-  connection: 'connecting',
-};
+function buildInitial(state: AgentState = 'idle'): LiveTranscript {
+  return {
+    state,
+    finals: [],
+    pending: '',
+    errors: [],
+    connection: 'connecting',
+  };
+}
 
-export function useSessionEvents(sessionId: string | undefined): LiveTranscript {
-  const [live, setLive] = useState<LiveTranscript>(initial);
+export function useSessionEvents(
+  sessionId: string | undefined,
+  initialState: AgentState = 'idle',
+): LiveTranscript {
+  const [live, setLive] = useState<LiveTranscript>(() => buildInitial(initialState));
 
   useEffect(() => {
     if (!sessionId) return;
-    setLive(initial);
+    setLive(buildInitial(initialState));
 
     const es = new EventSource(apiUrl(`/sessions/${sessionId}/events`));
 
@@ -76,7 +81,7 @@ export function useSessionEvents(sessionId: string | undefined): LiveTranscript 
       es.close();
       setLive((prev) => ({ ...prev, connection: 'closed' }));
     };
-  }, [sessionId]);
+  }, [initialState, sessionId]);
 
   return live;
 }
