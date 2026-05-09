@@ -42,6 +42,9 @@ export default function SessionView() {
 
   const live = useSessionEvents(id);
   const harness = sessionQuery.data?.session.harness ?? null;
+  const persistedErrors = new Set(
+    (sessionQuery.data?.transcript ?? []).flatMap((entry) => (entry.error ? [entry.error] : [])),
+  );
   const { model: selectedModel, setModel } = useSelectedModel(harness);
 
   const turnMutation = useMutation({
@@ -61,7 +64,7 @@ export default function SessionView() {
   // Auto-scroll on new content.
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [live.finals.length, live.pending, sessionQuery.data?.transcript.length]);
+  }, [live.finals.length, live.pending, live.errors.length, sessionQuery.data?.transcript.length]);
 
   // When the agent returns to idle, the live `pending` buffer has
   // already been flushed via text.final. Refetch the canonical
@@ -109,10 +112,19 @@ export default function SessionView() {
           </p>
         ) : (
           <div className="space-y-4 p-4">
-            {(sessionQuery.data?.transcript ?? []).map((entry, i) => (
-              <TranscriptBlock key={i} role={entry.role} text={entry.text} />
-            ))}
+            {(sessionQuery.data?.transcript ?? []).map((entry, i) =>
+              entry.error ? (
+                <ErrorBlock key={i} message={entry.error} />
+              ) : (
+                <TranscriptBlock key={i} role={entry.role} text={entry.text} />
+              ),
+            )}
             {live.pending ? <TranscriptBlock role="assistant" text={live.pending} pending /> : null}
+            {live.errors
+              .filter((message) => !persistedErrors.has(message))
+              .map((message, i) => (
+                <ErrorBlock key={`live-error-${i}`} message={message} />
+              ))}
             <div ref={transcriptEndRef} />
           </div>
         )}
@@ -153,6 +165,17 @@ function StatePill({ state }: { state: AgentState }) {
       <span className={`h-2 w-2 rounded-full ${STATE_COLORS[state]}`} />
       {STATE_LABELS[state]}
     </span>
+  );
+}
+
+function ErrorBlock({ message }: { message: string }) {
+  return (
+    <div className="flex flex-col items-start">
+      <span className="mb-1 text-xs uppercase tracking-wide text-red-500">error</span>
+      <div className="max-w-[90%] whitespace-pre-wrap rounded-lg border border-red-800 bg-red-950/50 px-3 py-2 text-sm text-red-300">
+        {message}
+      </div>
+    </div>
   );
 }
 

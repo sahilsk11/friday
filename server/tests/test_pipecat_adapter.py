@@ -32,15 +32,19 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.tests.utils import run_test
 from pytest_httpx import HTTPXMock
 
+from friday.core.claude_code_provider import ClaudeCodeSession
+from friday.core.codex_provider import CodexSession
 from friday.core.events import (
     MessagePartDelta,
     MessagePartUpdated,
     MessageUpdated,
+    SessionError,
     SessionStatus,
 )
 from friday.core.opencode_provider import OpencodeProvider, OpencodeSession
 from friday.voice.pipecat_adapter import (
     RTVI_AGENT_STATE,
+    RTVI_ASSISTANT_ERROR,
     RTVI_ASSISTANT_TEXT_DELTA,
     RTVI_ASSISTANT_TEXT_FINAL,
     RTVI_TOOL_STARTED,
@@ -362,6 +366,27 @@ async def test_state_changes_emit_rtvi_agent_state(session: OpencodeSession) -> 
 
     states = _rtvi_messages_of_type(pushed, RTVI_AGENT_STATE)
     assert [s["state"] for s in states] == ["thinking", "idle"]
+
+
+async def test_session_error_emits_rtvi_speaks_and_returns_idle(
+    session: OpencodeSession,
+) -> None:
+    _, pushed = _make_processor(session)
+
+    await session.dispatch(SessionStatus(session_id=SESSION_ID, status="busy"))
+    await session.dispatch(SessionError(session_id=SESSION_ID, message="model cannot read images"))
+
+    errors = _rtvi_messages_of_type(pushed, RTVI_ASSISTANT_ERROR)
+    assert errors == [{"type": RTVI_ASSISTANT_ERROR, "message": "model cannot read images"}]
+    speak_frames = [f for f in pushed if isinstance(f, TTSSpeakFrame)]
+    assert [f.text for f in speak_frames] == ["Error: model cannot read images"]
+    states = _rtvi_messages_of_type(pushed, RTVI_AGENT_STATE)
+    assert states[-1] == {"type": RTVI_AGENT_STATE, "state": "idle"}
+
+
+async def test_provider_processor_accepts_all_provider_sessions() -> None:
+    ProviderSessionProcessor(ClaudeCodeSession(_http=None), system_prompt=_TEST_SYSTEM_PROMPT)
+    ProviderSessionProcessor(CodexSession(), system_prompt=_TEST_SYSTEM_PROMPT)
 
 
 async def test_interruption_aborts_opencode_and_passes_frame_through(

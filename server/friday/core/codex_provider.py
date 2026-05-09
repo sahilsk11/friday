@@ -23,6 +23,7 @@ from typing import Any
 from loguru import logger
 
 from friday.core.provider import (
+    ErrorHandler,
     Message,
     ModelCatalog,
     ModelChoice,
@@ -68,6 +69,7 @@ class CodexSession:
     _final_handlers: list[TextFinalHandler] = field(default_factory=list, repr=False)
     _state_handlers: list[StateHandler] = field(default_factory=list, repr=False)
     _tool_start_handlers: list[ToolStartHandler] = field(default_factory=list, repr=False)
+    _error_handlers: list[ErrorHandler] = field(default_factory=list, repr=False)
 
     _text_accumulated: str = ""
     _announced_tools: set[str] = field(default_factory=set, repr=False)
@@ -83,6 +85,9 @@ class CodexSession:
 
     def on_tool_start(self, handler: ToolStartHandler) -> Unsubscribe:
         return subscribe(self._tool_start_handlers, handler)
+
+    def on_error(self, handler: ErrorHandler) -> Unsubscribe:
+        return subscribe(self._error_handlers, handler)
 
     async def send_turn(
         self,
@@ -104,10 +109,7 @@ class CodexSession:
         if model is not None and model.model_id:
             cmd.extend(["--model", model.model_id])
 
-        if system:
-            prompt = f"{system}\n\n{text}"
-        else:
-            prompt = text
+        prompt = f"{system}\n\n{text}" if system else text
 
         logger.debug("codex exec cmd: {}", cmd)
 
@@ -119,11 +121,12 @@ class CodexSession:
         )
 
         async def run():
-            if self._process:
-                self._process.stdin.write(prompt.encode())
-                await self._process.stdin.drain()
-                self._process.stdin.close()
-                await self._process.wait()
+            if self._process is None or self._process.stdin is None:
+                return
+            self._process.stdin.write(prompt.encode())
+            await self._process.stdin.drain()
+            self._process.stdin.close()
+            await self._process.wait()
 
         async def read_output():
             if self._process:
@@ -159,7 +162,7 @@ class CodexSession:
                 line = await asyncio.wait_for(stdout.readline(), timeout=60.0)
             except asyncio.CancelledError:
                 break
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break
             if not line:
                 break
@@ -181,7 +184,6 @@ class CodexSession:
             await self._fan_out_state(AgentState.THINKING)
 
         elif event_type == "turn.completed":
-            usage = event.get("usage", {})
             self._turn_id = None
             if self._text_accumulated:
                 for handler in tuple(self._final_handlers):
@@ -230,6 +232,10 @@ class CodexSession:
         self.current_state = state
         for handler in tuple(self._state_handlers):
             await handler(state)
+
+    async def _fan_out_error(self, message: str) -> None:
+        for handler in tuple(self._error_handlers):
+            await handler(message)
 
 
 _CODEX_MODELS: list[ModelInfo] = [
@@ -295,8 +301,7 @@ class CodexProvider:
         *,
         directory: str | None = None,
     ) -> CodexSession:
-        session = CodexSession(title=title, directory=directory)
-        return session
+        return CodexSession(title=title, directory=directory)
 
     def attach(self, session_id: str) -> CodexSession:
         existing = self._sessions.get(session_id)
@@ -311,7 +316,7 @@ class CodexProvider:
     async def list_sessions(self, *, directory: str | None = None) -> list[SessionInfo]:
         if not _CODEX_SESSION_DIR.exists():
             return []
-        sessions = []
+        sessions: list[SessionInfo] = []
         for year_dir in _CODEX_SESSION_DIR.iterdir():
             if not year_dir.is_dir():
                 continue
@@ -395,7 +400,9 @@ class CodexProvider:
                                     text=text,
                                     completed_at=datetime.fromtimestamp(
                                         record.get("timestamp", 0) / 1000, tz=UTC
-                                    ) if record.get("timestamp") else None,
+                                    )
+                                    if record.get("timestamp")
+                                    else None,
                                 )
                             )
         return messages

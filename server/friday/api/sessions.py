@@ -7,7 +7,7 @@ Endpoints:
 - ``GET    /sessions``                — list, optional ``?directory=`` filter
 - ``GET    /sessions/{id}``           — metadata + transcript
 - ``POST   /sessions/{id}/turn``      — text turn
-- ``GET    /sessions/{id}/events``    — SSE stream of live deltas + state
+- ``GET    /sessions/{id}/events``    — SSE stream of live deltas + state + errors
 
 The router is framework-neutral: **no pipecat imports.** Both the CLI (Step 4)
 and the voice pipeline (Step 5) drive the agent through this surface.
@@ -274,9 +274,13 @@ async def stream_events(
     async def on_state(state: AgentState) -> None:
         await queue.put(_pack("state", {"state": state.value}))
 
+    async def on_error(message: str) -> None:
+        await queue.put(_pack("error", {"message": message}))
+
     session.on_text_delta(on_delta)
     session.on_text_final(on_final)
     session.on_state(on_state)
+    session.on_error(on_error)
 
     return StreamingResponse(_sse_stream(queue), media_type="text/event-stream")
 

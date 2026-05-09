@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from pathlib import Path
 
 import httpx
 import pytest
@@ -24,6 +23,7 @@ from friday.api.sessions import get_registry, stream_events
 from friday.core.events import (
     MessagePartDelta,
     MessageUpdated,
+    SessionError,
     SessionStatus,
 )
 from friday.core.opencode_provider import OpencodeProvider, OpencodeSession
@@ -61,7 +61,7 @@ def client(registry: ProviderRegistry) -> httpx.AsyncClient:
 
 async def test_list_sessions_returns_rows(httpx_mock: HTTPXMock, client: httpx.AsyncClient) -> None:
     httpx_mock.add_response(
-        url=f"{OPENCODE_URL}/session",
+        url=f"{OPENCODE_URL}/experimental/session",
         json=[
             {
                 "id": "ses_a",
@@ -87,7 +87,7 @@ async def test_list_sessions_passes_directory_filter(
     httpx_mock: HTTPXMock, client: httpx.AsyncClient
 ) -> None:
     httpx_mock.add_response(
-        url=f"{OPENCODE_URL}/session",
+        url=f"{OPENCODE_URL}/experimental/session",
         json=[
             {
                 "id": "ses_a",
@@ -108,7 +108,6 @@ async def test_list_sessions_passes_directory_filter(
         resp = await client.get("/sessions", params={"directory": "/keep"})
 
     assert [r["id"] for r in resp.json()] == ["ses_a"]
-
 
 
 async def test_get_session_returns_metadata_and_transcript(
@@ -215,6 +214,31 @@ async def test_sse_streams_delta_final_and_state(
     assert collected[1] == {"type": "text.delta", "text": "Hi"}
     assert collected[2] == {"type": "text.final", "text": "Hi"}
     assert collected[3] == {"type": "state", "state": "idle"}
+
+
+async def test_sse_streams_provider_errors(
+    provider: OpencodeProvider, registry: ProviderRegistry
+) -> None:
+    response = await stream_events(session_id="ses_a", registry=registry)
+    session = provider.attach("ses_a")
+
+    await session.dispatch(SessionError(session_id="ses_a", message="model cannot read images"))
+
+    collected: list[dict[str, str]] = []
+    async for raw in response.body_iterator:
+        chunk = bytes(raw) if isinstance(raw, bytes | memoryview) else raw.encode("utf-8")
+        collected.extend(
+            json.loads(line[len(b"data:") :].strip())
+            for line in chunk.splitlines()
+            if line.startswith(b"data:")
+        )
+        if len(collected) >= 2:
+            break
+
+    assert collected == [
+        {"type": "error", "message": "model cannot read images"},
+        {"type": "state", "state": "idle"},
+    ]
 
 
 async def test_get_provider_503_when_unset() -> None:
