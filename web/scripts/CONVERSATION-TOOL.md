@@ -25,12 +25,15 @@ Terminal 2, from `web/`:
 npm run friday:conversation -- --task "Friday, can you hear me? Please reply with exactly one short sentence." --headless --wait-after-send-ms 120000
 ```
 
-Success means the command prints JSON with `"ok": true` and `finalUi.feed` contains both a `you...` entry and a `friday...` entry.
-
-If it succeeds, the most important fields are:
+Success means the command prints JSON with `"ok": true`. Key fields:
 
 | Field | Meaning |
 |------|---------|
+| `ok` | Overall pass/fail |
+| `okReason` | Human-readable explanation |
+| `heardUser` | User speech was detected |
+| `assistantResponded` | Assistant produced a response |
+| `hasErrors` | Error entries found in feed |
 | `sessionId` | Friday/OpenCode session created or reused |
 | `artifactsDir` | Screenshots, audio, and summaries for the run |
 | `tracePath` | Full timeline for debugging |
@@ -137,6 +140,12 @@ Key event types:
 | `click-*` | Button interactions |
 | `recording-auto-started` | Voice recording was already active after bot-ready |
 | `click-send-skipped` | VAD already finalized the turn before the runner clicked Send |
+| `speech-detected` | User speech was detected in the feed during recording |
+| `no-speech-detected` | Recording was active but no speech event fired |
+| `select-model-for-existing-session` | Model was changed for an existing session |
+| `model-already-correct` | Requested model was already selected |
+| `mic-confirmed-on` | Mic state confirmed active after clicking Start |
+| `mic-still-off-after-start` | Mic remained off after clicking Start (investigate) |
 | `screenshot` | Screenshot captured |
 | `run-error` | Top-level failure |
 
@@ -144,15 +153,17 @@ To answer "did Send happen before or after VAD finalized the user turn?", grep f
 
 ### Fast Artifact Check
 
-Open `summary.json` first. If `ok` is `false`, inspect these in order:
+Open `summary.json` first. If `ok` is `false`, check `okReason` and then inspect these in order:
 
 | Check | What It Means |
 |------|---------------|
 | `error` exists | The runner failed before completing the browser flow |
-| `finalUi.feed` has no `you` entry | Fake microphone audio was not captured or transcribed |
-| `finalUi.feed` has `you` but no `friday` | OpenCode or the voice backend did not produce a response before timeout |
+| `heardUser: false` | Fake microphone audio was not captured or transcribed |
+| `heardUser: true` but `assistantResponded: false` | Voice backend or LLM did not produce a response before timeout |
+| `hasErrors: true` | Assistant returned an error (e.g. unsupported model) |
 | `timeline.jsonl` has `browser-pageerror` | The frontend threw an exception |
 | `timeline.jsonl` has no `bot-ready-console` | Pipecat/voice connection did not become ready |
+| `timeline.jsonl` has `no-speech-detected` | Recording was active but no speech event fired |
 | screenshots stop before `final` | The browser flow failed mid-run |
 
 ## Known Product Behaviors
@@ -161,7 +172,8 @@ Open `summary.json` first. If `ok` is `false`, inspect these in order:
 - **Recording auto-starts after bot-ready**: The runner does not click `Start`; clicking can race the transport and throw `Already recording`.
 - **"Client DISCONNECTED" while active**: The UI status shows `DISCONNECTED` even though the session is running. Cosmetic.
 - **Reconnecting session auto-starts recording**: When re-entering an existing session, the bot can auto-start recording before the tool clicks Start. The script handles this by checking if recording is already active.
-- **The first visible transcript may be only the user turn**: Keep waiting for a second feed item. A successful full run has both user and Friday entries.
+- **Model persistence**: The server derives `current_model` from the last assistant message in the transcript. The UI seeds from this on page load, falling back to the harness default if no transcript model is available. Client-side localStorage still applies for user overrides.
+- **TTS/STT transcription degrades numbers and short phrases**: The Linux TTS path (flite) misrecognizes numeric prompts. Avoid arithmetic and exact-token tests for fake-mic smoke tests.
 
 ## Troubleshooting
 
