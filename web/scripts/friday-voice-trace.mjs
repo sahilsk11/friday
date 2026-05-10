@@ -432,9 +432,13 @@ try {
 
     // Fix 1: Ensure mic is actually on before proceeding
     const startBtn = page.getByRole('button', { name: /^Start/i });
-    const startVisible = await startBtn.isVisible({ timeout: 5000 }).catch(() => false);
+    const startVisible = await startBtn.isVisible().catch(() => false);
+    if (!startVisible) {
+      try { await startBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch { /* not visible */ }
+    }
+    const startActuallyVisible = await startBtn.isVisible().catch(() => false);
 
-    if (startVisible) {
+    if (startActuallyVisible) {
       const uiBeforeStart = await readUi(page);
       if (uiBeforeStart.status.mic !== 'on') {
         trace('click-start-for-existing-session', { micState: uiBeforeStart.status.mic });
@@ -442,7 +446,9 @@ try {
         await page.waitForTimeout(2000);
         const uiAfterStart = await readUi(page);
         if (uiAfterStart.status.mic !== 'on') {
-          const sendVisible = await page.getByRole('button', { name: /^Send/i }).isVisible({ timeout: 3000 }).catch(() => false);
+          const sendBtn = page.getByRole('button', { name: /^Send/i });
+          try { await sendBtn.waitFor({ state: 'visible', timeout: 3000 }); } catch { /* not visible */ }
+          const sendVisible = await sendBtn.isVisible().catch(() => false);
           if (!sendVisible) {
             trace('mic-still-off-after-start', { micState: uiAfterStart.status.mic });
           } else {
@@ -455,7 +461,9 @@ try {
         trace('mic-already-on', { micState: uiBeforeStart.status.mic });
       }
     } else {
-      const sendVisible = await page.getByRole('button', { name: /^Send/i }).isVisible({ timeout: 3000 }).catch(() => false);
+      const sendBtn = page.getByRole('button', { name: /^Send/i });
+      try { await sendBtn.waitFor({ state: 'visible', timeout: 3000 }); } catch { /* not visible */ }
+      const sendVisible = await sendBtn.isVisible().catch(() => false);
       if (sendVisible) {
         trace('recording-confirmed-via-send-button');
       } else {
@@ -527,9 +535,10 @@ try {
 
   const preSendUi = await sampleLoop(page, 'recording-before-send', WAIT_AFTER_START_MS, 1000, initialFeedLength);
 
-  // Check if speech was detected by looking at feed changes and RTVI events
-  const feedGrew = preSendUi.feed.length > initialFeedLength;
-  const hasUserTranscript = preSendUi.feed.some((item) => /^you[:\s]/i.test(item) || /^you$/i.test(item));
+  // Check if speech was detected by looking at feed changes since recording started
+  const newFeedEntries = preSendUi.feed.slice(initialFeedLength);
+  const feedGrew = newFeedEntries.length > 0;
+  const hasUserTranscript = newFeedEntries.some((item) => /^you[:\s]/i.test(item) || /^you$/i.test(item));
 
   if (!feedGrew && !hasUserTranscript) {
     trace('no-speech-detected', {
@@ -574,10 +583,14 @@ try {
   await screenshot(page, 'final');
   const model = modelParts(MODEL);
 
-  // Fix 4: Correct success criteria
-  const heardUser = speechDetected || finalUi.feed.some((item) => /^you[:\s]/i.test(item) || /^you$/i.test(item));
-  const assistantResponded = finalUi.feed.some((item) => /^friday[:\s]/i.test(item));
-  const hasErrors = finalUi.feed.some((item) => /error|unsupported|not supported/i.test(item));
+  // Fix 4: Correct success criteria — scope checks to entries added during this run
+  // Use preSendUi as baseline because VAD auto-dispatches before Send, so the
+  // assistant response may already be in the feed by the time we read uiBeforeSend.
+  const baselineFeedLength = preSendUi.feed.length;
+  const newFeedAfterSend = finalUi.feed.slice(baselineFeedLength);
+  const heardUser = speechDetected || newFeedAfterSend.some((item) => /^you[:\s]/i.test(item) || /^you$/i.test(item));
+  const assistantResponded = newFeedAfterSend.some((item) => /^friday[:\s]/i.test(item));
+  const hasErrors = newFeedAfterSend.some((item) => /error|unsupported|not supported/i.test(item));
   let okReason = '';
   let ok = false;
 
