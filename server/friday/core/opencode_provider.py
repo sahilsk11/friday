@@ -127,6 +127,8 @@ class OpencodeProvider:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._sse_task
             self._sse_task = None
+        for session in tuple(self._sessions.values()):
+            await session.aclose()
         await self._http.aclose()
 
     # ── Live sessions ──────────────────────────────────────────────────
@@ -283,10 +285,12 @@ class OpencodeSession:
         self._text_parts: dict[str, dict[str, str]] = {}
         # Track which assistant messages we've already finalized.
         self._completed: set[str] = set()
-        # Message keys touched by the current busy turn. If the watchdog has
-        # to recover, these keys are marked completed so late SSE events from
-        # the stuck turn cannot leak stale text into a retry.
-        self._active_message_keys: set[str] = set()
+        # Set by the turn watchdog when it recovers a stuck session. All
+        # subsequent SSE events from the dead turn are silently dropped until
+        # the next send_turn clears it. This handles the case where the
+        # watchdog fires before any message.part.* event arrives, unlike a
+        # generation counter or per-key tracking.
+        self._turn_suppressed = False
         # Track tool parts we've already announced to avoid replays — opencode
         # emits MessagePartUpdated repeatedly as tool state advances.
         self._announced_tools: set[str] = set()
@@ -353,6 +357,7 @@ class OpencodeSession:
             body["system"] = system
         resp = await self._http.post(f"/session/{self.id}/prompt_async", json=body)
         resp.raise_for_status()
+        self._turn_suppressed = False
 
     async def cancel(self) -> None:
         resp = await self._http.post(f"/session/{self.id}/abort", json={})
@@ -360,13 +365,16 @@ class OpencodeSession:
         # Drop in-flight accumulators so a late MessageUpdated for the aborted
         # turn doesn't fire on_text_final / on_state(IDLE) into a fresh turn.
         self._text_parts.clear()
-        self._active_message_keys.clear()
         self._reasoning_parts.clear()
         self._cancel_turn_watchdog()
+        self._turn_suppressed = True
 
     # ── Inbound (called by OpencodeProvider._dispatch) ────────────────────────
 
     async def dispatch(self, event: OpencodeEvent) -> None:
+        if isinstance(event, (MessagePartDelta, MessageUpdated, MessagePartUpdated)):
+            if self._turn_suppressed:
+                return
         if isinstance(event, MessagePartDelta):
             await self._handle_delta(event)
         elif isinstance(event, MessageUpdated):
@@ -388,7 +396,6 @@ class OpencodeSession:
         key = f"{event.session_id}:{event.message_id}"
         if key in self._completed:
             return
-        self._active_message_keys.add(key)
         parts = self._text_parts.setdefault(key, {})
         parts[event.part_id] = parts.get(event.part_id, "") + event.delta
         self._reset_turn_watchdog()
@@ -405,7 +412,6 @@ class OpencodeSession:
                 key = f"{event.session_id}:{event.message_id}"
                 if key in self._completed:
                     return
-                self._active_message_keys.add(key)
                 self._text_parts.setdefault(key, {})[event.part_id] = event.text
                 self._reset_turn_watchdog()
             return
@@ -417,7 +423,6 @@ class OpencodeSession:
         key = f"{event.session_id}:{event.message_id}"
         if key in self._completed:
             return
-        self._active_message_keys.add(key)
         if event.tool_status != "running":
             return
         if event.part_id in self._announced_tools:
@@ -434,7 +439,6 @@ class OpencodeSession:
         if key in self._completed:
             return
         self._completed.add(key)
-        self._active_message_keys.discard(key)
         parts = self._text_parts.pop(key, {})
         text = "".join(parts.values())
         if text:
@@ -461,7 +465,6 @@ class OpencodeSession:
 
     async def _handle_error(self, event: SessionError) -> None:
         self._text_parts.clear()
-        self._active_message_keys.clear()
         self._reasoning_parts.clear()
         self._cancel_turn_watchdog()
         for handler in tuple(self._error_handlers):
@@ -491,8 +494,7 @@ class OpencodeSession:
             await asyncio.sleep(self._turn_watchdog_seconds)
             if self._current_state != AgentState.THINKING:
                 return
-            self._completed.update(self._active_message_keys)
-            self._active_message_keys.clear()
+            self._turn_suppressed = True
             self._text_parts.clear()
             self._reasoning_parts.clear()
             message = "The last response did not finish. You can retry or interrupt the turn."
