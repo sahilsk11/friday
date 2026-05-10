@@ -232,6 +232,7 @@ async function sampleLoop(page, label, durationMs, intervalMs = 1000, minFeedLen
 
 let traceIndex = 0;
 let browser;
+let speechDetected = false;
 let finalSummary = {
   ok: false,
   artifactsDir,
@@ -399,12 +400,72 @@ try {
     });
   });
 
+  let skipCommonWait = false;
+
   if (EXISTING_SESSION) {
     const url = `${FE_BASE}/s/${EXISTING_SESSION}`;
     trace('navigate-existing-session', { url });
     await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
     trace('navigate-complete', summarizeUi(await readUi(page)));
     await screenshot(page, 'existing-session');
+
+    // Fix 2: Select model using stable data-testid selectors
+    const modelChip = page.getByTestId('model-chip');
+    await modelChip.waitFor({ timeout: 15_000 });
+    await modelChip.click();
+    await page.waitForTimeout(500);
+
+    const modelSelect = page.getByTestId('model-select');
+    await modelSelect.waitFor({ timeout: 10_000 });
+    const currentModelValue = await modelSelect.inputValue().catch(() => '');
+    if (currentModelValue !== MODEL) {
+      trace('select-model-for-existing-session', { model: MODEL, current: currentModelValue });
+      await modelSelect.selectOption(MODEL);
+      await page.waitForTimeout(500);
+      const chipLabel = page.getByTestId('model-chip-label');
+      const selectedLabel = await chipLabel.textContent().catch(() => '');
+      trace('select-model-for-existing-session-complete', { confirmedLabel: selectedLabel });
+    } else {
+      trace('model-already-correct', { model: MODEL });
+    }
+
+    // Fix 1: Ensure mic is actually on before proceeding
+    const startBtn = page.getByRole('button', { name: /^Start/i });
+    const startVisible = await startBtn.isVisible({ timeout: 5000 }).catch(() => false);
+
+    if (startVisible) {
+      const uiBeforeStart = await readUi(page);
+      if (uiBeforeStart.status.mic !== 'on') {
+        trace('click-start-for-existing-session', { micState: uiBeforeStart.status.mic });
+        await startBtn.click();
+        await page.waitForTimeout(2000);
+        const uiAfterStart = await readUi(page);
+        if (uiAfterStart.status.mic !== 'on') {
+          const sendVisible = await page.getByRole('button', { name: /^Send/i }).isVisible({ timeout: 3000 }).catch(() => false);
+          if (!sendVisible) {
+            trace('mic-still-off-after-start', { micState: uiAfterStart.status.mic });
+          } else {
+            trace('recording-confirmed-via-send-button');
+          }
+        } else {
+          trace('mic-confirmed-on', { micState: uiAfterStart.status.mic });
+        }
+      } else {
+        trace('mic-already-on', { micState: uiBeforeStart.status.mic });
+      }
+    } else {
+      const sendVisible = await page.getByRole('button', { name: /^Send/i }).isVisible({ timeout: 3000 }).catch(() => false);
+      if (sendVisible) {
+        trace('recording-confirmed-via-send-button');
+      } else {
+        trace('no-start-or-send-visible', summarizeUi(await readUi(page)));
+      }
+    }
+
+    await page.waitForTimeout(1000);
+    await screenshot(page, 'before-record-start');
+    skipCommonWait = true;
   } else {
     trace('navigate-start', { url: FE_BASE });
     await page.goto(FE_BASE, { waitUntil: 'domcontentloaded' });
@@ -438,24 +499,52 @@ try {
     trace('click-start-session-complete', summarizeUi(await readUi(page)));
   }
 
-  trace('wait-record-start-button-start');
-  await page.getByRole('button', { name: /^Start/i }).waitFor({ timeout: 25_000 });
-  trace('wait-record-start-button-complete', summarizeUi(await readUi(page)));
-  trace('wait-bot-ready-start');
-  await Promise.race([
-    botReady,
-    page.waitForTimeout(15_000).then(() => {
-      throw new Error('Timed out waiting for Pipecat bot-ready');
-    }),
-  ]);
-  const uiAtBotReady = await readUi(page);
-  trace('wait-bot-ready-complete', summarizeUi(uiAtBotReady));
-  await screenshot(page, 'before-record-start');
-
-  trace('recording-auto-started', summarizeUi(uiAtBotReady));
+  if (!skipCommonWait) {
+    trace('wait-record-start-button-start');
+    await page.getByRole('button', { name: /^Start/i }).waitFor({ timeout: 25_000 });
+    trace('wait-record-start-button-complete', summarizeUi(await readUi(page)));
+    trace('wait-bot-ready-start');
+    await Promise.race([
+      botReady,
+      page.waitForTimeout(15_000).then(() => {
+        throw new Error('Timed out waiting for Pipecat bot-ready');
+      }),
+    ]);
+    const uiAtBotReady = await readUi(page);
+    trace('wait-bot-ready-complete', summarizeUi(uiAtBotReady));
+    await screenshot(page, 'before-record-start');
+  
+    trace('recording-auto-started', summarizeUi(uiAtBotReady));
+  } else {
+    await page.waitForTimeout(2000);
+    const uiAtBotReady = await readUi(page);
+    trace('existing-session-ready', summarizeUi(uiAtBotReady));
+    await screenshot(page, 'before-record-start');
+  }
 
   const uiBeforeRecording = await readUi(page);
-  const preSendUi = await sampleLoop(page, 'recording-before-send', WAIT_AFTER_START_MS, 1000, uiBeforeRecording.feed.length);
+  const initialFeedLength = uiBeforeRecording.feed.length;
+
+  const preSendUi = await sampleLoop(page, 'recording-before-send', WAIT_AFTER_START_MS, 1000, initialFeedLength);
+
+  // Check if speech was detected by looking at feed changes and RTVI events
+  const feedGrew = preSendUi.feed.length > initialFeedLength;
+  const hasUserTranscript = preSendUi.feed.some((item) => /^you[:\s]/i.test(item) || /^you$/i.test(item));
+
+  if (!feedGrew && !hasUserTranscript) {
+    trace('no-speech-detected', {
+      feedLength: preSendUi.feed.length,
+      feedTail: preSendUi.feed.slice(-3),
+      waitedMs: WAIT_AFTER_START_MS,
+    });
+  } else {
+    speechDetected = true;
+    trace('speech-detected', {
+      feedLength: preSendUi.feed.length,
+      hasUserTranscript,
+    });
+  }
+
   await screenshot(page, 'before-send');
 
   trace('click-send-start', summarizeUi(preSendUi));
@@ -484,8 +573,32 @@ try {
   );
   await screenshot(page, 'final');
   const model = modelParts(MODEL);
+
+  // Fix 4: Correct success criteria
+  const heardUser = speechDetected || finalUi.feed.some((item) => /^you[:\s]/i.test(item) || /^you$/i.test(item));
+  const assistantResponded = finalUi.feed.some((item) => /^friday[:\s]/i.test(item));
+  const hasErrors = finalUi.feed.some((item) => /error|unsupported|not supported/i.test(item));
+  let okReason = '';
+  let ok = false;
+
+  if (!heardUser) {
+    okReason = 'No user speech detected';
+  } else if (hasErrors) {
+    okReason = 'Assistant returned an error';
+    ok = false;
+  } else if (!assistantResponded) {
+    okReason = 'No assistant response';
+  } else {
+    ok = true;
+    okReason = 'User heard and assistant responded';
+  }
+
   finalSummary = {
-    ok: finalUi.feed.length >= 2,
+    ok,
+    okReason,
+    heardUser,
+    assistantResponded,
+    hasErrors,
     artifactsDir,
     tracePath,
     url: finalUi.url,
@@ -495,11 +608,15 @@ try {
     model,
     finalUi,
   };
-  trace('run-complete', { ok: finalSummary.ok, ...summarizeUi(finalUi) });
+  trace('run-complete', { ok: finalSummary.ok, okReason, ...summarizeUi(finalUi) });
 } catch (err) {
   trace('run-error', { message: err.message, stack: err.stack });
   finalSummary = {
     ok: false,
+    okReason: err.message,
+    heardUser: speechDetected,
+    assistantResponded: false,
+    hasErrors: true,
     artifactsDir,
     tracePath,
     error: err.message,

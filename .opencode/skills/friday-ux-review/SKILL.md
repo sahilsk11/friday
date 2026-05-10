@@ -48,8 +48,8 @@ npm run friday:conversation -- \
   --wait-after-send-ms 120000
 ```
 
-The output is JSON. Success means `"ok": true` and `finalUi.feed`
-has both a `you` entry and a `friday` entry.
+The output is JSON. Success means `"ok": true`. Check `okReason`, `heardUser`,
+`assistantResponded`, and `hasErrors` for details.
 
 ## Multi-turn conversations
 
@@ -78,13 +78,17 @@ Look for `browser-pageerror` in the timeline. It is a real frontend error.
 Expected trace events that are NOT failures:
 - `recording-auto-started` — Friday auto-starts recording after bot-ready
 - `click-send-skipped` — VAD finalized the turn before manual Send
+- `speech-detected` — User speech was detected in the feed
+- `model-already-correct` — Requested model was already selected
+- `mic-confirmed-on` — Mic state confirmed active
 
 ## Known product behaviors
 
 - Recording auto-starts after bot-ready. Do not click Start.
 - VAD often commits the turn before Send is clickable.
 - `Client DISCONNECTED` in the UI while the session is working is cosmetic.
-- The first visible feed item is the user turn. Wait for a second item.
+- The model is seeded from the server's `current_model` (derived from the last assistant response) on page load, falling back to the harness default.
+- TTS/STT on Linux degrades numbers and short phrases — avoid arithmetic prompts in smoke tests.
 
 ## Troubleshooting
 
@@ -93,7 +97,9 @@ Expected trace events that are NOT failures:
 | `Executable doesn't exist ... chromium_headless_shell` | `npx playwright install chromium` from `web/` |
 | `curl http://localhost:5173` fails | Start `./start.sh` |
 | `:4096` already in use | Normal. The script reuses it. |
-| Only one feed item (`you` but no `friday`) | Rerun with `--wait-after-send-ms 120000` |
+| `heardUser: false` | Fake mic audio not captured — check ffmpeg and Playwright |
+| `assistantResponded: false` | Rerun with `--wait-after-send-ms 120000` |
+| `hasErrors: true` | Check `okReason` and timeline for model/harness errors |
 | `run-error` before browser launch | Check ffmpeg and Playwright Chromium |
 
 ## After running conversations

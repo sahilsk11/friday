@@ -82,9 +82,11 @@ export function ModelChip({
         onClick={() => setOpen((v) => !v)}
         className="inline-flex items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900 px-3 py-1 text-xs hover:border-neutral-500"
         title={`${selected.providerID}/${selected.modelID}`}
+        data-testid="model-chip"
+        aria-label="model"
       >
         <span className="text-neutral-400">model</span>
-        <span className="font-medium text-neutral-100">{labelFor(selected)}</span>
+        <span className="font-medium text-neutral-100" data-testid="model-chip-label">{labelFor(selected)}</span>
       </button>
       {open ? (
         <div className="absolute right-0 z-20 mt-2 w-72 rounded-md border border-neutral-800 bg-neutral-950 p-3 shadow-xl">
@@ -98,6 +100,7 @@ export function ModelChip({
             }}
             disabled={modelsQuery.isLoading || grouped.length === 0}
             className="w-full rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm focus:border-neutral-500 focus:outline-none disabled:opacity-50"
+            data-testid="model-select"
           >
             {modelsQuery.isLoading ? (
               <option value="">loading…</option>

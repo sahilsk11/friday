@@ -42,6 +42,7 @@ export default function SessionView() {
 
   const live = useSessionEvents(id, sessionQuery.data?.agent_state ?? 'idle');
   const harness = sessionQuery.data?.session.harness ?? null;
+  const serverModel = sessionQuery.data?.current_model ?? null;
   const persistedErrors = new Set(
     (sessionQuery.data?.transcript ?? []).flatMap((entry) => (entry.error ? [entry.error] : [])),
   );
@@ -50,7 +51,7 @@ export default function SessionView() {
     .filter((entry) => entry.role === 'assistant' && !entry.error)
     .map((entry) => entry.text);
   const syncedLiveFinals = excludePersistedLiveFinals(live.finals, persistedAssistantTexts);
-  const { model: selectedModel, setModel } = useSelectedModel(harness);
+  const { model: selectedModel, setModel } = useSelectedModel(harness, serverModel);
 
   const turnMutation = useMutation({
     mutationFn: (text: string) => {

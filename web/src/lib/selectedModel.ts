@@ -35,7 +35,7 @@ function write(key: string, m: ModelRef): void {
   }
 }
 
-export function useSelectedModel(harness?: string | null): {
+export function useSelectedModel(harness?: string | null, serverModel?: ModelRef | null): {
   model: ModelRef | null;
   setModel: (m: ModelRef) => void;
 } {
@@ -52,11 +52,15 @@ export function useSelectedModel(harness?: string | null): {
     }
   }, [state.key, storageKey]);
 
-  // First mount: if nothing was saved, seed from the harness default.
-  // We only fire this when ``model`` is still null so the user's choice is
-  // never overwritten.
+  // First mount: if nothing was saved, seed from server-derived current_model
+  // if available, otherwise from the harness default.
   useEffect(() => {
     if (model !== null) return;
+    if (serverModel) {
+      setState({ key: storageKey, model: serverModel });
+      write(storageKey, serverModel);
+      return;
+    }
     let cancelled = false;
     void listModels(harness ?? undefined).then((resp) => {
       if (cancelled || !resp.default) return;
@@ -70,7 +74,7 @@ export function useSelectedModel(harness?: string | null): {
     return () => {
       cancelled = true;
     };
-  }, [harness, model, storageKey]);
+  }, [harness, model, storageKey, serverModel]);
 
   // Listen for changes from other tabs so a switch in tab A propagates to
   // tab B without a reload. ``storage`` events only fire in *other* tabs,
