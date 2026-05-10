@@ -11,6 +11,7 @@ and frames flow out the response stream.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 
@@ -239,6 +240,34 @@ async def test_sse_streams_provider_errors(
         {"type": "state", "state": "idle"},
         {"type": "error", "message": "model cannot read images"},
     ]
+
+
+async def test_turn_watchdog_emits_error_and_returns_idle(
+    provider: OpencodeProvider, registry: ProviderRegistry
+) -> None:
+    response = await stream_events(session_id="ses_a", registry=registry)
+    session = provider.attach("ses_a")
+    session._turn_watchdog_seconds = 0.01  # pyright: ignore[reportPrivateUsage]
+
+    await session.dispatch(SessionStatus(session_id="ses_a", status="busy"))
+    await asyncio.sleep(0.03)
+
+    collected: list[dict[str, str]] = []
+    async for raw in response.body_iterator:
+        chunk = bytes(raw) if isinstance(raw, bytes | memoryview) else raw.encode("utf-8")
+        collected.extend(
+            json.loads(line[len(b"data:") :].strip())
+            for line in chunk.splitlines()
+            if line.startswith(b"data:")
+        )
+        if len(collected) >= 4:
+            break
+
+    assert collected[0] == {"type": "state", "state": "idle"}
+    assert collected[1] == {"type": "state", "state": "thinking"}
+    assert collected[2]["type"] == "error"
+    assert "did not finish" in collected[2]["message"]
+    assert collected[3] == {"type": "state", "state": "idle"}
 
 
 async def test_get_provider_503_when_unset() -> None:

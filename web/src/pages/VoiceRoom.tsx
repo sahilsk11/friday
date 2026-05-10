@@ -5,7 +5,7 @@ import {
   usePipecatClient,
   usePipecatClientMicControl,
 } from '@pipecat-ai/client-react';
-import { ClientStatus, VoiceVisualizer } from '@pipecat-ai/voice-ui-kit';
+import { VoiceVisualizer } from '@pipecat-ai/voice-ui-kit';
 import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
 import { useQuery } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -202,16 +202,29 @@ function VoiceRoomShell({
   }, [currentModel, selectedModel, setModel]);
 
   const { narrateTools, setNarrateTools } = useNarrateTools();
+  const handleModelChange = useCallback(
+    (next: ModelRef) => {
+      setModel(next);
+    },
+    [setModel],
+  );
+  const handleNarrateToolsChange = useCallback(
+    (next: boolean) => {
+      setNarrateTools(next);
+    },
+    [setNarrateTools],
+  );
   return (
     <div className="mx-auto flex h-screen max-w-5xl flex-col px-6 py-6">
       {isPending && <SessionCreatedListener onSessionCreated={onSessionCreated} />}
+      <StickyVoiceSettings model={selectedModel} narrateTools={narrateTools} />
       <header className="mb-6 flex items-center justify-between">
         <Link to="/" className="text-sm text-neutral-400 hover:text-neutral-200">
           ← sessions
         </Link>
         <div className="flex items-center gap-3">
-          <NarrateToolsToggle value={narrateTools} onChange={setNarrateTools} />
-          <ModelChip harness={harness} selected={selectedModel} onChange={setModel} />
+          <NarrateToolsToggle value={narrateTools} onChange={handleNarrateToolsChange} />
+          <ModelChip harness={harness} selected={selectedModel} onChange={handleModelChange} />
           {sessionId && !isPending && (
             <Link
               to={`/s/${sessionId}/transcript`}
@@ -225,9 +238,7 @@ function VoiceRoomShell({
 
       <div className="grid flex-1 gap-6 overflow-hidden md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
         <section className="flex flex-col items-stretch gap-4 rounded-2xl border border-neutral-800 bg-neutral-950 p-5">
-          <div className="flex items-center justify-center text-xs text-neutral-400">
-            <ClientStatus />
-          </div>
+          <FridayStatus initialAgentState={initialAgentState} />
 
           <AutoEnableMicOnConnect />
 
@@ -319,6 +330,98 @@ function SessionCreatedListener({
   );
   useRTVIClientEvent(RTVIEvent.ServerMessage, onServerMessage);
   return null;
+}
+
+// Asserts voice-session settings independently of Send. VAD can finalize a
+// turn before the click handler runs, so model and tool narration must be
+// sticky server-side before speech starts.
+function StickyVoiceSettings({
+  model,
+  narrateTools,
+}: {
+  model: ModelRef | null;
+  narrateTools: boolean;
+}): null {
+  const client = usePipecatClient();
+  const [connected, setConnected] = useState(() => Boolean(client?.connected));
+
+  const onConnected = useCallback(() => setConnected(true), []);
+  const onDisconnected = useCallback(() => setConnected(false), []);
+  useRTVIClientEvent(RTVIEvent.Connected, onConnected);
+  useRTVIClientEvent(RTVIEvent.Disconnected, onDisconnected);
+
+  useEffect(() => {
+    if (!client || !connected) return;
+    if (model) client.sendClientMessage('set-model', { model });
+  }, [client, connected, model]);
+
+  useEffect(() => {
+    if (!client || !connected) return;
+    client.sendClientMessage('set-narrate-tools', { enabled: narrateTools });
+  }, [client, connected, narrateTools]);
+
+  return null;
+}
+
+function FridayStatus({ initialAgentState }: { initialAgentState: AgentState }): React.ReactElement {
+  const client = usePipecatClient();
+  const { isMicEnabled } = usePipecatClientMicControl();
+  const [connected, setConnected] = useState(() => Boolean(client?.connected));
+  const [agentState, setAgentState] = useState<AgentState>(initialAgentState);
+  const [speaking, setSpeaking] = useState(false);
+
+  const onConnected = useCallback(() => setConnected(true), []);
+  const onDisconnected = useCallback(() => setConnected(false), []);
+  const onSpeaking = useCallback(() => setSpeaking(true), []);
+  const onStoppedSpeaking = useCallback(() => setSpeaking(false), []);
+  const onServerMessage = useCallback((raw: unknown) => {
+    const inner: unknown = (raw as { data?: unknown } | null)?.data ?? raw;
+    if (
+      typeof inner !== 'object' ||
+      inner === null ||
+      (inner as { type?: unknown }).type !== 'agent-state'
+    ) {
+      return;
+    }
+    const state = (inner as { state?: unknown }).state;
+    if (state === 'idle' || state === 'thinking') setAgentState(state);
+  }, []);
+
+  useRTVIClientEvent(RTVIEvent.Connected, onConnected);
+  useRTVIClientEvent(RTVIEvent.Disconnected, onDisconnected);
+  useRTVIClientEvent(RTVIEvent.BotStartedSpeaking, onSpeaking);
+  useRTVIClientEvent(RTVIEvent.BotStoppedSpeaking, onStoppedSpeaking);
+  useRTVIClientEvent(RTVIEvent.ServerMessage, onServerMessage);
+
+  const displayedAgentState = speaking ? 'speaking' : agentState;
+  return (
+    <div className="grid grid-cols-3 gap-2 text-center text-[11px] uppercase tracking-wide text-neutral-500">
+      <StatusPill label="transport" value={connected ? 'connected' : 'connecting'} active={connected} />
+      <StatusPill label="mic" value={isMicEnabled ? 'on' : 'muted'} active={isMicEnabled} />
+      <StatusPill
+        label="agent"
+        value={displayedAgentState}
+        active={displayedAgentState !== 'idle'}
+      />
+    </div>
+  );
+}
+
+function StatusPill({
+  label,
+  value,
+  active,
+}: {
+  label: string;
+  value: string;
+  active: boolean;
+}): React.ReactElement {
+  return (
+    <div className="rounded-lg border border-neutral-800 bg-black/30 px-2 py-2">
+      <div>{label}</div>
+      <div className={active ? 'mt-1 text-neutral-100' : 'mt-1 text-neutral-500'}>{value}</div>
+    </div>
+  );
 }
 
 // Flips the mic on as soon as the transport reports Connected. Lives as

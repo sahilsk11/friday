@@ -161,17 +161,18 @@ class ProviderSessionProcessor(FrameProcessor):
         # responses so a turn that opens a fence and never closes (model
         # interrupted) doesn't poison the next turn.
         self._narration = StreamingFilter()
+        self._saw_response_delta = False
         # Strong references to background tasks — prevents GC before the
         # event loop runs them (loop only keeps weak refs to tasks).
         self._bg_tasks: set[asyncio.Task[None]] = set()
-        # Model the WS handler stamped from the most recent ``end-turn``
-        # client message. Consumed (and cleared) by the next finalized
-        # transcription. ``None`` means "let opencode use its default."
-        self.next_turn_model: ModelChoice | None = None
+        # Current model selected by the client. Sticky across turns so VAD
+        # finalization does not depend on a later manual end-turn message.
+        # ``None`` means "let opencode use its default."
+        self.current_model: ModelChoice | None = None
         # Speak each tool start out loud as it happens. Off by default —
         # tool narration is chatty and most users just want it in the
         # activity feed. The WS handler flips this from the client toggle
-        # carried on ``end-turn``. Sticky across turns until changed.
+        # carried by ``set-narrate-tools``. Sticky across turns until changed.
         self.narrate_tools: bool = False
         # Master TTS gate. Off by default so a fresh page load (or a
         # mid-turn refresh) doesn't suddenly start talking — the user
@@ -210,11 +211,7 @@ class ProviderSessionProcessor(FrameProcessor):
         if not text:
             return
         logger.info("provider_session_processor: user turn -> {!r}", text)
-        # Consume the model the WS handler stamped from end-turn (if any) —
-        # opencode's per-session stickiness then carries it across subsequent
-        # turns until the user picks again.
-        model = self.next_turn_model
-        self.next_turn_model = None
+        model = self.current_model
         await self._session.send_turn(text, model=model, system=self._system_prompt)
 
     async def cancel_current_turn(self) -> None:
@@ -246,6 +243,7 @@ class ProviderSessionProcessor(FrameProcessor):
         """
         logger.info("provider_session_processor: interruption — cancelling turn")
         self._in_response = False
+        self._saw_response_delta = False
         self._narration.reset()
         try:
             await self._session.cancel()
@@ -279,6 +277,7 @@ class ProviderSessionProcessor(FrameProcessor):
         )
 
     async def _on_delta(self, text: str) -> None:
+        self._saw_response_delta = True
         # Stream the *raw* delta to the UI regardless of whether it's
         # speakable text or inside a fenced code block. The UI wants to
         # render markdown faithfully; only TTS needs the StreamingFilter
@@ -303,7 +302,16 @@ class ProviderSessionProcessor(FrameProcessor):
         await self.push_frame(LLMTextFrame(speakable))
 
     async def _on_final(self, text: str) -> None:
+        saw_delta = self._saw_response_delta
+        self._saw_response_delta = False
         self._narration.reset()
+        if self.tts_enabled and text and not saw_delta:
+            speakable = self._narration.feed(text)
+            self._narration.reset()
+            if speakable:
+                await self.push_frame(LLMFullResponseStartFrame())
+                await self.push_frame(LLMTextFrame(speakable))
+                await self.push_frame(LLMFullResponseEndFrame())
         if self._in_response:
             self._in_response = False
             await self.push_frame(LLMFullResponseEndFrame())
@@ -315,6 +323,7 @@ class ProviderSessionProcessor(FrameProcessor):
         )
 
     async def _on_error(self, message: str) -> None:
+        self._saw_response_delta = False
         self._narration.reset()
         if self._in_response:
             self._in_response = False
