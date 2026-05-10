@@ -245,29 +245,43 @@ async def voice(  # noqa: PLR0911, PLR0915
 
     rtvi.event_handler("on_client_ready")(_on_client_ready)
 
-    # Tap-to-end-turn: client sends {type: "end-turn"} with Friday metadata
-    # (model choice and tool narration). Turn finalization itself is still
-    # owned by Pipecat's VAD/user-turn aggregator; this path deliberately does
-    # not forge speech-stop frames.
+    # Client messages carry sticky Friday settings plus manual controls. Turn
+    # finalization itself is still owned by Pipecat's VAD/user-turn aggregator;
+    # end-turn deliberately does not forge speech-stop frames.
     async def _on_client_message(processor: RTVIProcessor, msg: ClientMessage) -> None:
         if msg.type == "end-turn":
-            # Optional ``model`` rides along on end-turn — we stamp it on the
-            # ProviderSessionProcessor so the next finalized transcription forwards
-            # it to opencode. No server-side stickiness; the client owns the
-            # selection and re-sends it whenever it changes.
-            agent.next_turn_model = _parse_model(msg.data)
-            # Tool narration toggle also rides along — sticky on the
-            # processor (unlike model). Client re-sends it each turn so a
-            # toggle flip propagates without its own message type.
+            # Backward-compatible metadata handling for older clients. New
+            # clients assert these as sticky settings before speech starts.
+            model = _parse_model(msg.data)
+            if model is not None:
+                agent.current_model = model
             narrate = _parse_narrate_tools(msg.data)
             if narrate is not None:
                 agent.narrate_tools = narrate
             logger.info(
                 "voice: end-turn metadata received | session={} model={} narrate_tools={}",
                 session.id,
-                agent.next_turn_model,
+                agent.current_model,
                 agent.narrate_tools,
             )
+        elif msg.type == "set-model":
+            model = _parse_model(msg.data)
+            if model is not None:
+                agent.current_model = model
+                logger.info(
+                    "voice: set-model | session={} model={}",
+                    session.id,
+                    agent.current_model,
+                )
+        elif msg.type == "set-narrate-tools":
+            narrate = _parse_narrate_tools(msg.data)
+            if narrate is not None:
+                agent.narrate_tools = narrate
+                logger.info(
+                    "voice: set-narrate-tools | session={} enabled={}",
+                    session.id,
+                    agent.narrate_tools,
+                )
         elif msg.type == "interrupt":
             # User tapped the Interrupt button. Push InterruptionTaskFrame
             # upstream — the pipeline task converts it to a downstream
@@ -341,10 +355,10 @@ async def voice(  # noqa: PLR0911, PLR0915
 
 
 def _parse_narrate_tools(data: object) -> bool | None:
-    """Extract the ``narrateTools`` flag from an end-turn payload, if any."""
+    """Extract the tool narration flag from a client-message payload, if any."""
     if not isinstance(data, dict):
         return None
-    val = data.get("narrateTools")
+    val = data.get("narrateTools", data.get("enabled"))
     if isinstance(val, bool):
         return val
     return None
@@ -367,6 +381,8 @@ def _parse_model(data: object) -> ModelChoice | None:
     if not isinstance(data, dict):
         return None
     model = data.get("model")
+    if model is None and "providerID" in data and "modelID" in data:
+        model = data
     if not isinstance(model, dict):
         return None
     provider_id = model.get("providerID")

@@ -42,6 +42,7 @@ from friday.core.events import (
     SessionStatus,
 )
 from friday.core.opencode_provider import OpencodeProvider, OpencodeSession
+from friday.core.provider import ModelChoice
 from friday.voice.pipecat_adapter import (
     RTVI_AGENT_STATE,
     RTVI_ASSISTANT_ERROR,
@@ -132,6 +133,30 @@ async def test_send_user_turn_posts_turn_to_opencode(
     assert not any(isinstance(f, TranscriptionFrame) for f in pushed)
 
 
+async def test_send_user_turn_uses_sticky_current_model(
+    httpx_mock: HTTPXMock, session: OpencodeSession
+) -> None:
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
+        status_code=204,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{OPENCODE_URL}/session/{SESSION_ID}/prompt_async",
+        status_code=204,
+    )
+    proc, _ = _make_processor(session)
+    proc.current_model = ModelChoice(provider_id="openrouter", model_id="mistral-small")
+
+    await proc.send_user_turn("first")
+    await proc.send_user_turn("second")
+
+    bodies = [httpx.Request.read(r) for r in httpx_mock.get_requests()]
+    assert all(b'"providerID":"openrouter"' in body for body in bodies)
+    assert all(b'"modelID":"mistral-small"' in body for body in bodies)
+
+
 async def test_text_deltas_emit_bracketed_llm_frames(session: OpencodeSession) -> None:
     _, pushed = _make_processor(session)
 
@@ -167,7 +192,7 @@ async def test_text_deltas_emit_bracketed_llm_frames(session: OpencodeSession) -
     assert [f.text for f in text_frames] == ["He", "llo"]
 
 
-async def test_final_without_deltas_emits_no_llm_end_frame(session: OpencodeSession) -> None:
+async def test_final_without_text_emits_no_llm_end_frame(session: OpencodeSession) -> None:
     _, pushed = _make_processor(session)
 
     await session.dispatch(
@@ -183,6 +208,69 @@ async def test_final_without_deltas_emits_no_llm_end_frame(session: OpencodeSess
     # message lets the UI clear its "thinking" indicator.
     state_msgs = _rtvi_messages_of_type(pushed, RTVI_AGENT_STATE)
     assert state_msgs == [{"type": RTVI_AGENT_STATE, "state": "idle"}]
+
+
+async def test_text_part_update_finalizes_without_deltas(session: OpencodeSession) -> None:
+    _, pushed = _make_processor(session)
+
+    await session.dispatch(
+        MessagePartUpdated(
+            session_id=SESSION_ID,
+            message_id="m1",
+            part_id="p1",
+            part_type="text",
+            text="final only",
+            tool_name=None,
+            tool_status=None,
+        )
+    )
+    await session.dispatch(
+        MessageUpdated(session_id=SESSION_ID, message_id="m1", role="assistant", time_end=1_000)
+    )
+
+    finals = _rtvi_messages_of_type(pushed, RTVI_ASSISTANT_TEXT_FINAL)
+    assert finals == [{"type": RTVI_ASSISTANT_TEXT_FINAL, "text": "final only"}]
+    llm_frames = [
+        f for f in pushed if isinstance(f, (LLMFullResponseStartFrame, LLMTextFrame, LLMFullResponseEndFrame))
+    ]
+    assert [type(f).__name__ for f in llm_frames] == [
+        "LLMFullResponseStartFrame",
+        "LLMTextFrame",
+        "LLMFullResponseEndFrame",
+    ]
+    assert isinstance(llm_frames[1], LLMTextFrame)
+    assert llm_frames[1].text == "final only"
+
+
+async def test_watchdog_suppresses_late_stale_final(session: OpencodeSession) -> None:
+    session._turn_watchdog_seconds = 0.01  # pyright: ignore[reportPrivateUsage]
+    _, pushed = _make_processor(session)
+
+    await session.dispatch(SessionStatus(session_id=SESSION_ID, status="busy"))
+    await session.dispatch(
+        MessagePartDelta(
+            session_id=SESSION_ID, message_id="m1", part_id="p1", field="text", delta="stale"
+        )
+    )
+    await asyncio.sleep(0.03)
+    await session.dispatch(
+        MessagePartDelta(
+            session_id=SESSION_ID, message_id="m1", part_id="p1", field="text", delta=" late"
+        )
+    )
+    await session.dispatch(
+        MessageUpdated(session_id=SESSION_ID, message_id="m1", role="assistant", time_end=1_000)
+    )
+
+    errors = _rtvi_messages_of_type(pushed, RTVI_ASSISTANT_ERROR)
+    assert errors == [
+        {
+            "type": RTVI_ASSISTANT_ERROR,
+            "message": "The last response did not finish. You can retry or interrupt the turn.",
+        }
+    ]
+    finals = _rtvi_messages_of_type(pushed, RTVI_ASSISTANT_TEXT_FINAL)
+    assert finals == []
 
 
 async def test_fenced_code_blocks_are_not_pushed_as_text(session: OpencodeSession) -> None:
