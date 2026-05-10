@@ -190,6 +190,16 @@ class CodexSession:
                     await handler(self._text_accumulated)
             await self._fan_out_state(AgentState.IDLE)
 
+        elif event_type in ("error", "turn.failed"):
+            message = event.get("message", "")
+            if not message:
+                error_data = event.get("error", {})
+                if isinstance(error_data, dict):
+                    message = error_data.get("message", "") or str(error_data)
+            if message:
+                await self._fan_out_error(message)
+            await self._fan_out_state(AgentState.IDLE)
+
         elif event_type == "item.started":
             item = event.get("item", {})
             item_type = item.get("type", "")
