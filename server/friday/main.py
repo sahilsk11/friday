@@ -23,14 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
-
-from dotenv import load_dotenv
-
-# Repo root is two levels up from server/friday/main.py
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,8 +35,15 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
-from friday.api.sessions import harnesses_router, models_router, router as sessions_router
 from friday.api.config import router as config_router
+from friday.api.sessions import harnesses_router, models_router
+from friday.api.sessions import router as sessions_router
+from friday.config import (
+    FRIDAY_LOG_FILE,
+    FRIDAY_LOG_LEVEL,
+    FRIDAY_LOG_RETENTION,
+    FRIDAY_LOG_ROTATION,
+)
 from friday.core.claude_code_provider import ClaudeCodeProvider
 from friday.core.codex_provider import CodexProvider
 from friday.core.opencode_provider import OpencodeProvider
@@ -61,6 +65,36 @@ WEB_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
 _OPENCODE_CONNECT_TIMEOUT = 5.0
 
 
+def _log_format(record: Any) -> str:
+    extra = record["extra"]
+    session_id = extra.get("session_id", "-")
+    turn_id = extra.get("turn_id", "-")
+    item_id = extra.get("item_id", "-")
+    return (
+        "{time:YYYY-MM-DDTHH:mm:ss.SSSZZ} | {level} | {name}:{function}:{line} | "
+        f"session={session_id} turn={turn_id} item={item_id} | "
+        "{message}\n{exception}"
+    )
+
+
+def configure_logging() -> None:
+    """Configure durable logs with IDs that can be matched to provider traces."""
+    logger.remove()
+    logger.add(sys.stderr, level=FRIDAY_LOG_LEVEL, format=_log_format)
+    FRIDAY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        FRIDAY_LOG_FILE,
+        level=FRIDAY_LOG_LEVEL,
+        format=_log_format,
+        rotation=FRIDAY_LOG_ROTATION,
+        retention=FRIDAY_LOG_RETENTION,
+        enqueue=True,
+    )
+
+
+configure_logging()
+
+
 @asynccontextmanager
 async def default_lifespan(app: FastAPI) -> AsyncGenerator[None]:
     registry = ProviderRegistry()
@@ -72,7 +106,7 @@ async def default_lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await asyncio.wait_for(opencode.start(), timeout=_OPENCODE_CONNECT_TIMEOUT)
         registry.add(opencode)
         logger.info("opencode provider started | url={}", base_url)
-    except (asyncio.TimeoutError, Exception) as err:
+    except (TimeoutError, Exception) as err:
         logger.warning("opencode provider unavailable, skipping | err={}", err)
         await opencode.aclose()
         opencode = None  # type: ignore[assignment]
