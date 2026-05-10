@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start friday dev stack. Stays alive; Ctrl+C kills everything.
+# Start local Friday backend/frontend. Stays alive; Ctrl+C kills everything.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
@@ -29,15 +29,19 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── Kill existing processes ───────────────────────────────────────────────────
+# ── Kill existing local Friday dev processes ──────────────────────────────────
 kill_port 5173
 kill_port 8000
-kill_port 4096
 
-# ── opencode server (port 4096) ───────────────────────────────────────────────
-echo "[opencode] Starting on :4096..."
-env -u OPENCODE_SERVER_USERNAME -u OPENCODE_SERVER_PASSWORD opencode serve --port 4096 2>&1 | sed 's/^/[opencode] /' &
-PIDS+=($!)
+# ── OpenCode server (port 4096) ───────────────────────────────────────────────
+if is_port_open 4096; then
+  echo "[opencode] Reusing existing server on :4096."
+else
+  echo "[opencode] Nothing listening on :4096; starting local server..."
+  env -u OPENCODE_SERVER_USERNAME -u OPENCODE_SERVER_PASSWORD \
+    opencode serve --hostname 127.0.0.1 --port 4096 2>&1 | sed 's/^/[opencode] /' &
+  PIDS+=($!)
+fi
 
 # ── Backend / FastAPI (port 8000) ─────────────────────────────────────────────
 echo "[backend]  Starting on :8000..."
@@ -54,6 +58,7 @@ echo "[frontend] Starting on :5173..."
 PIDS+=($!)
 
 echo ""
+echo "  OC  → http://localhost:4096 (shared)"
 echo "  BE  → http://localhost:8000"
 echo "  FE  → http://localhost:5173"
 echo ""
