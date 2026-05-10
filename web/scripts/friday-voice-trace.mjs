@@ -106,26 +106,49 @@ async function screenshot(page, name) {
 
 async function makeInputAudio() {
   const aiff = path.join(artifactsDir, 'input.aiff');
+  const taskText = path.join(artifactsDir, 'input.txt');
   const speechWav = path.join(artifactsDir, 'speech.wav');
   const inputWav = path.join(artifactsDir, 'input.wav');
+  const ffmpeg = fs.existsSync('/opt/homebrew/bin/ffmpeg') ? '/opt/homebrew/bin/ffmpeg' : 'ffmpeg';
   trace('audio-generate-start', { task: TASK, leadingSilenceSeconds: LEADING_SILENCE_SECONDS });
-  await execFileP('/usr/bin/say', ['-v', 'Samantha', '-o', aiff, TASK]);
-  await execFileP('/opt/homebrew/bin/ffmpeg', [
-    '-y',
-    '-hide_banner',
-    '-loglevel',
-    'error',
-    '-i',
-    aiff,
-    '-ac',
-    '2',
-    '-ar',
-    '44100',
-    '-sample_fmt',
-    's16',
-    speechWav,
-  ]);
-  await execFileP('/opt/homebrew/bin/ffmpeg', [
+  if (fs.existsSync('/usr/bin/say')) {
+    await execFileP('/usr/bin/say', ['-v', 'Samantha', '-o', aiff, TASK]);
+    await execFileP(ffmpeg, [
+      '-y',
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-i',
+      aiff,
+      '-ac',
+      '2',
+      '-ar',
+      '44100',
+      '-sample_fmt',
+      's16',
+      speechWav,
+    ]);
+  } else {
+    await fsp.writeFile(taskText, TASK);
+    await execFileP(ffmpeg, [
+      '-y',
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      `flite=textfile=${taskText}:voice=slt`,
+      '-ac',
+      '2',
+      '-ar',
+      '44100',
+      '-sample_fmt',
+      's16',
+      speechWav,
+    ]);
+  }
+  await execFileP(ffmpeg, [
     '-y',
     '-hide_banner',
     '-loglevel',
@@ -146,7 +169,7 @@ async function makeInputAudio() {
     's16',
     inputWav,
   ]);
-  trace('audio-generate-complete', { aiff, speechWav, inputWav });
+  trace('audio-generate-complete', { aiff, taskText, speechWav, inputWav });
   return inputWav;
 }
 
@@ -425,36 +448,40 @@ try {
       throw new Error('Timed out waiting for Pipecat bot-ready');
     }),
   ]);
-  trace('wait-bot-ready-complete', summarizeUi(await readUi(page)));
+  const uiAtBotReady = await readUi(page);
+  trace('wait-bot-ready-complete', summarizeUi(uiAtBotReady));
   await screenshot(page, 'before-record-start');
 
-  const startBtnCount = await page.getByRole('button', { name: /^Start/i }).count();
-  if (startBtnCount > 0) {
-    trace('click-record-start-start');
-    await page.getByRole('button', { name: /^Start/i }).click();
-    trace('click-record-start-complete', summarizeUi(await readUi(page)));
-    await screenshot(page, 'after-record-start');
-  } else {
-    trace('recording-auto-started', summarizeUi(await readUi(page)));
-  }
+  trace('recording-auto-started', summarizeUi(uiAtBotReady));
 
   const uiBeforeRecording = await readUi(page);
   const preSendUi = await sampleLoop(page, 'recording-before-send', WAIT_AFTER_START_MS, 1000, uiBeforeRecording.feed.length);
   await screenshot(page, 'before-send');
 
   trace('click-send-start', summarizeUi(preSendUi));
-  try {
-    await page.getByRole('button', { name: /^Send/i }).click({ timeout: 5_000 });
-    trace('click-send-complete', summarizeUi(await readUi(page)));
-  } catch (err) {
-    trace('click-send-error', {
-      message: err.message,
-      visibleUi: summarizeUi(await readUi(page)),
-    });
+  const sendBtnCount = await page.getByRole('button', { name: /^Send/i }).count();
+  if (sendBtnCount > 0) {
+    try {
+      await page.getByRole('button', { name: /^Send/i }).click({ timeout: 5_000 });
+      trace('click-send-complete', summarizeUi(await readUi(page)));
+    } catch (err) {
+      trace('click-send-error', {
+        message: err.message,
+        visibleUi: summarizeUi(await readUi(page)),
+      });
+    }
+  } else {
+    trace('click-send-skipped', summarizeUi(await readUi(page)));
   }
 
   const uiBeforeSend = await readUi(page);
-  const finalUi = await sampleLoop(page, 'after-send', WAIT_AFTER_SEND_MS, 1000, uiBeforeSend.feed.length);
+  const finalUi = await sampleLoop(
+    page,
+    'after-send',
+    WAIT_AFTER_SEND_MS,
+    1000,
+    uiBeforeSend.feed.length,
+  );
   await screenshot(page, 'final');
   const model = modelParts(MODEL);
   finalSummary = {
