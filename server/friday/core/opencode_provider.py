@@ -264,7 +264,13 @@ class OpencodeProvider:
 class OpencodeSession:
     """One opencode session. Observers attach to receive text deltas + state."""
 
-    def __init__(self, http: httpx.AsyncClient, session_id: str) -> None:
+    def __init__(
+        self,
+        http: httpx.AsyncClient,
+        session_id: str,
+        *,
+        turn_watchdog_seconds: float = 45.0,
+    ) -> None:
         self._http = http
         self.id = session_id
         self._delta_handlers: list[TextDeltaHandler] = []
@@ -272,10 +278,15 @@ class OpencodeSession:
         self._state_handlers: list[StateHandler] = []
         self._tool_start_handlers: list[ToolStartHandler] = []
         self._error_handlers: list[ErrorHandler] = []
-        # Accumulated text per (sessionID, messageID) for on_text_final.
-        self._accumulated: dict[str, str] = {}
+        # Assistant text per (sessionID, messageID), then per text part. Deltas
+        # append; final part updates replace the part, avoiding double-counting.
+        self._text_parts: dict[str, dict[str, str]] = {}
         # Track which assistant messages we've already finalized.
         self._completed: set[str] = set()
+        # Message keys touched by the current busy turn. If the watchdog has
+        # to recover, these keys are marked completed so late SSE events from
+        # the stuck turn cannot leak stale text into a retry.
+        self._active_message_keys: set[str] = set()
         # Track tool parts we've already announced to avoid replays — opencode
         # emits MessagePartUpdated repeatedly as tool state advances.
         self._announced_tools: set[str] = set()
@@ -288,6 +299,8 @@ class OpencodeSession:
         # consumers (a fresh ProviderSessionProcessor, a REST GET) can read the
         # current value without waiting for the next opencode transition.
         self._current_state: AgentState = AgentState.IDLE
+        self._turn_watchdog_seconds = turn_watchdog_seconds
+        self._turn_watchdog_task: asyncio.Task[None] | None = None
 
     # ── Observer registration ───────────────────────────────────────────────
     #
@@ -317,6 +330,13 @@ class OpencodeSession:
         """Latest agent state seen on the SSE stream. Defaults to IDLE."""
         return self._current_state
 
+    async def aclose(self) -> None:
+        task = self._turn_watchdog_task
+        self._cancel_turn_watchdog()
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     # ── Outbound ────────────────────────────────────────────────────────────
 
     async def send_turn(
@@ -339,8 +359,10 @@ class OpencodeSession:
         resp.raise_for_status()
         # Drop in-flight accumulators so a late MessageUpdated for the aborted
         # turn doesn't fire on_text_final / on_state(IDLE) into a fresh turn.
-        self._accumulated.clear()
+        self._text_parts.clear()
+        self._active_message_keys.clear()
         self._reasoning_parts.clear()
+        self._cancel_turn_watchdog()
 
     # ── Inbound (called by OpencodeProvider._dispatch) ────────────────────────
 
@@ -364,7 +386,12 @@ class OpencodeSession:
         if event.part_id in self._reasoning_parts:
             return
         key = f"{event.session_id}:{event.message_id}"
-        self._accumulated[key] = self._accumulated.get(key, "") + event.delta
+        if key in self._completed:
+            return
+        self._active_message_keys.add(key)
+        parts = self._text_parts.setdefault(key, {})
+        parts[event.part_id] = parts.get(event.part_id, "") + event.delta
+        self._reset_turn_watchdog()
         for handler in tuple(self._delta_handlers):
             await handler(event.delta)
 
@@ -373,15 +400,30 @@ class OpencodeSession:
             self._reasoning_parts.add(event.part_id)
             return
 
+        if event.part_type == "text":
+            if event.text is not None:
+                key = f"{event.session_id}:{event.message_id}"
+                if key in self._completed:
+                    return
+                self._active_message_keys.add(key)
+                self._text_parts.setdefault(key, {})[event.part_id] = event.text
+                self._reset_turn_watchdog()
+            return
+
         # Announce on "running" (not "pending") — the input args aren't
         # populated until the tool actually starts executing.
         if event.part_type != "tool" or not event.tool_name:
             return
+        key = f"{event.session_id}:{event.message_id}"
+        if key in self._completed:
+            return
+        self._active_message_keys.add(key)
         if event.tool_status != "running":
             return
         if event.part_id in self._announced_tools:
             return
         self._announced_tools.add(event.part_id)
+        self._reset_turn_watchdog()
         for handler in tuple(self._tool_start_handlers):
             await handler(event.tool_name, event.tool_input)
 
@@ -392,7 +434,9 @@ class OpencodeSession:
         if key in self._completed:
             return
         self._completed.add(key)
-        text = self._accumulated.pop(key, "")
+        self._active_message_keys.discard(key)
+        parts = self._text_parts.pop(key, {})
+        text = "".join(parts.values())
         if text:
             for handler in tuple(self._final_handlers):
                 await handler(text)
@@ -403,18 +447,61 @@ class OpencodeSession:
         # succession (``session.status:idle`` + ``session.idle`` + a stray
         # busy→idle flip). Consumers must be idempotent on repeat states —
         # don't restart TTS or replay UI transitions on a duplicate.
+        previous_state = self._current_state
         self._current_state = state
+        if state == AgentState.THINKING:
+            if previous_state != AgentState.THINKING:
+                self._reset_turn_watchdog()
+        else:
+            self._cancel_turn_watchdog()
         # Snapshot to a tuple so a handler that unsubscribes itself mid-loop
         # doesn't mutate the list we're iterating.
         for handler in tuple(self._state_handlers):
             await handler(state)
 
     async def _handle_error(self, event: SessionError) -> None:
-        self._accumulated.clear()
+        self._text_parts.clear()
+        self._active_message_keys.clear()
         self._reasoning_parts.clear()
+        self._cancel_turn_watchdog()
         for handler in tuple(self._error_handlers):
             await handler(event.message)
         await self._fan_out_state(AgentState.IDLE)
+
+    def _reset_turn_watchdog(self) -> None:
+        if self._current_state != AgentState.THINKING:
+            return
+        if self._turn_watchdog_seconds <= 0:
+            return
+        self._cancel_turn_watchdog()
+        self._turn_watchdog_task = asyncio.create_task(
+            self._run_turn_watchdog(),
+            name=f"opencode-turn-watchdog:{self.id}",
+        )
+
+    def _cancel_turn_watchdog(self) -> None:
+        task = self._turn_watchdog_task
+        if task is not None:
+            self._turn_watchdog_task = None
+            if task is not asyncio.current_task():
+                task.cancel()
+
+    async def _run_turn_watchdog(self) -> None:
+        try:
+            await asyncio.sleep(self._turn_watchdog_seconds)
+            if self._current_state != AgentState.THINKING:
+                return
+            self._completed.update(self._active_message_keys)
+            self._active_message_keys.clear()
+            self._text_parts.clear()
+            self._reasoning_parts.clear()
+            message = "The last response did not finish. You can retry or interrupt the turn."
+            logger.warning("opencode turn watchdog timed out | session={}", self.id)
+            for handler in tuple(self._error_handlers):
+                await handler(message)
+            await self._fan_out_state(AgentState.IDLE)
+        except asyncio.CancelledError:
+            raise
 
 
 def _state_from_status(status: str) -> AgentState:
