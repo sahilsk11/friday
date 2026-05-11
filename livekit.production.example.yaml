@@ -1,0 +1,14 @@
+port: 7880
+bind_addresses:
+  - "0.0.0.0"
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  use_external_ip: true
+
+# The sas Ansible role should template production values from
+# /etc/sas/secrets.env instead of committing real keys here.
+keys:
+  replace-with-livekit-api-key: replace-with-livekit-api-secret

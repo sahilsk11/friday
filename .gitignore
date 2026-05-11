@@ -1,7 +1,12 @@
-*.log
 .DS_Store
 .env
-.env.local
-code-map/
-.claude/
+.friday/
+.mypy_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.py[cod]
+
 artifacts/
+web/dist/
+web/node_modules/
