@@ -1,231 +1,187 @@
-# AGENTS.md — Friday
+# Friday LiveKit PoC
 
-Voice interface for opencode. Talk to a webpage, opencode does the work, sessions persist across disconnects.
+Minimal greenfield LiveKit proof of concept for Friday voice sessions.
 
-## Repository layout
+## Architecture
 
-```
-friday/
-├── server/
-│   ├── friday/
-│   │   ├── core/          # zero pipecat imports — survives any framework swap
-│   │   ├── api/           # framework-neutral FastAPI REST + SSE
-│   │   └── voice/         # pipecat-specific: throwaway on framework swap
-│   ├── tests/
-│   └── pyproject.toml
-└── web/                   # Vite + React
-    └── src/
-        ├── pages/
-        ├── hooks/
-        └── api/
-```
+- LiveKit media server runs as a separate service.
+- Friday FastAPI backend creates Friday sessions and LiveKit room tokens.
+- Each Friday session maps to one LiveKit room.
+- Browser joins the room with `livekit-client`, publishes microphone audio, and sends push-to-talk commands to the agent over LiveKit RPC.
+- Python LiveKit agent joins each room through LiveKit Agents automatic dispatch.
+- Agent uses ElevenLabs STT with provider-side VAD commits and logs Friday turn commits.
+- FastAPI owns the narrator bridge, persists Friday's spoken transcript, forwards
+  every user turn to the selected coding provider, and relays provider events
+  back to the room for speech.
 
-## The one rule that governs all structure decisions
+## Run
 
-**`core/` and `api/` must never import `pipecat.*`.** Everything that could survive swapping pipecat for LiveKit lives there. The only pipecat imports allowed are in `voice/`. Violating this makes a future framework swap a rewrite instead of a weekend.
-
-If you are about to import a pipecat symbol outside `voice/`, stop and ask whether the concept belongs in a framework-neutral abstraction instead.
-
----
-
-## Module responsibilities
-
-### `core/opencode_session.py`
-
-Wraps the opencode HTTP API and SSE event stream. One `OpencodeSession` object per opencode session — lives in the registry, not on a pipeline.
-
-Key behaviors ported from `~/Projects/friday/backend/src/agent/opencodeAdapter.ts`:
-- Single global SSE subscription that fans out to all attached observers
-- Watchdog timer (90s idle → force reconnect): the stream can go half-closed silently
-- Generation counter to bail stale reconnect loops
-- `message.updated` fires `onTextFinal` — without this, queued turns get stuck because `message.part.delta` alone never signals completion
-- Exponential backoff on reconnect, capped at 30s
-
-Attach/detach API:
-```python
-session.attach(observer: VoiceObserver) -> None
-session.detach(observer: VoiceObserver) -> None
-```
-Multiple observers can be attached simultaneously (CLI harness + active voice pipeline).
-
-### `core/session_registry.py`
-
-In-memory `dict[id → OpencodeSession]` backed by sqlite.
-
-Tables:
-```sql
-sessions(id, opencode_session_id, title, created_at, last_activity)
-messages(id, session_id, role, text, ts)
+```bash
+cp .env.example .env
+docker compose up -d livekit
+uv sync
+uv run uvicorn server.app.main:app --host 0.0.0.0 --port 8000
 ```
 
-On server startup: rehydrate from sqlite, re-subscribe to opencode SSE for any session that was running.
+In a second terminal:
 
-### `core/voice_observer.py`
-
-Protocol that every voice adapter implements. No framework imports.
-
-```python
-class VoiceObserver(Protocol):
-    async def say(self, text: str) -> SpeechHandle: ...
-    async def interrupt_current_speech(self) -> None: ...
-    async def on_user_transcript(self, text: str, final: bool) -> None: ...
-    async def on_state_change(self, state: AgentState) -> None: ...
-
-class SpeechHandle(Protocol):
-    @property
-    def interrupted(self) -> bool: ...
-    async def wait_for_done(self) -> None: ...
+```bash
+uv run python -m agent.main dev
 ```
 
-Shape mirrors LiveKit's `session.say()` / `SpeechHandle` API intentionally. The pipecat adapter implements via `TTSSpeakFrame` + frame observers.
+In a third terminal:
 
-### `core/narration_policy.py`
-
-Pure function. Decides whether an opencode text delta should be forwarded to TTS.
-
-Port from `~/Projects/friday/backend/src/pipelines/speakingPolicy.ts`. Rules:
-- Empty after trim → skip
-- Opens a code fence (` ``` ` or `~~~`) → skip
-- Shell prompt line (`$ ` or `# `) → skip
-- Tool/log prefix (`[tool:`, `[system:`, `[error:`) → skip
-- Also strip fenced code blocks from full text before speaking
-
-### `core/speech_chunker.py`
-
-Buffers incoming text deltas, emits TTS-sized chunks.
-
-Port from `~/Projects/friday/backend/src/pipelines/ttsChunker.ts`. Flush triggers:
-1. Buffer exceeds `max_chars` (default 200)
-2. Buffer ends at sentence boundary (`.!?\n`) when `sentence_boundary=True`
-3. `max_delay_ms` timer fires (default 250ms)
-
-Check first whether pipecat's own text aggregation already handles this adequately before porting. Only port if pipecat's chunking is coarser than needed.
-
-### `core/events.py`
-
-Typed event schema. All events flowing through the system are defined here.
-
-### `core/state.py`
-
-`AgentState` enum: `IDLE | LISTENING | THINKING | SPEAKING`.
-
-### `api/sessions.py`
-
-Framework-neutral FastAPI routes. No pipecat imports.
-
-```
-GET  /sessions              list with metadata
-POST /sessions              create new (also creates opencode session)
-GET  /sessions/:id          metadata + transcript
-GET  /sessions/:id/events   SSE stream of live updates
-POST /sessions/:id/turn     text turn (voice path calls this after STT)
-POST /sessions/:id/cancel   interrupt current run
+```bash
+cd web
+npm install
+npm run dev
 ```
 
-### `voice/pipecat_adapter.py`
+Open `http://localhost:5173`.
 
-`OpencodeProcessor(FrameProcessor)` — implements `VoiceObserver`, bridges `OpencodeSession` events → `TTSSpeakFrame`s. The only place that translates between opencode's event model and pipecat's frame model.
+Set `ELEVEN_API_KEY` in `.env` before using transcription.
 
-### `voice/server.py`
+New-session model defaults live in
+`server/app/harness_model_defaults.py`. Each harness can name a preferred model
+with either a bare model id, such as `gpt-5.5`, or a provider-qualified OpenCode
+ref, such as `opencode-go/deepseek-v4-flash`. Friday still returns the full live
+provider catalog; the configured default only controls the initial selection in
+the new-session modal.
 
-FastAPI route `/api/offer` for WebRTC signaling. Assembles the pipecat pipeline per connection:
+By default the narrator sends every user turn to the coding provider without an
+immediate canned acknowledgement, then asks an OpenRouter-compatible
+chat-completions model whether to speak for progress/final events from
+deterministic snapshots. The narrator model is prompted to return plain
+conversational prose for TTS instead of copying Markdown, code blocks, command
+output, or structured provider summaries. Set an OpenRouter key in `.env`:
 
-```
-transport.input() → STT → user_aggregator → OpencodeProcessor → tts → transport.output()
-```
-
-Uses `SmallWebRTCTransport`. See `~/Projects/pipecat/examples/transports/transports-small-webrtc.py` for the connection lifecycle (offer/renegotiate, `pcs_map`, background task pattern).
-
----
-
-## Session persistence model
-
-```
-opencode HTTP server  (long-lived, external process)
-    ↑  long-lived SSE
-OpencodeSession       (lives in SessionRegistry, survives voice disconnects)
-    ↑  attach/detach
-Pipecat pipeline      (ephemeral, one per WebRTC connection)
-    ↑  WebRTC
-Browser
+```dotenv
+FRIDAY_NARRATOR_BRAIN=openai_compatible
+FRIDAY_NARRATOR_LLM_PROVIDER=openai_compatible
+OPENROUTER_API_KEY=...
 ```
 
-Voice client disconnects → pipeline torn down → `OpencodeSession.detach()` → session unaffected.
-Voice client reconnects → new pipeline → `OpencodeSession.attach()` → picks up where it left off.
-Server restarts → `SessionRegistry` rehydrates from sqlite.
+The default non-sensitive narrator settings are hard-coded as
+`https://openrouter.ai/api/v1` and `openai/gpt-4o-mini`. If no narrator API
+key is present, Friday falls back to the evented narrator: no progress chatter
+and provider finals spoken as-is.
 
----
+The same narrator brain can also use the running OpenCode server as its JSON
+LLM backend:
 
-## Frontend (web/)
+```dotenv
+FRIDAY_NARRATOR_BRAIN=openai_compatible
+FRIDAY_NARRATOR_LLM_PROVIDER=opencode_server
+FRIDAY_NARRATOR_OPENCODE_BASE_URL=http://127.0.0.1:4096
+# Optional; omit to use OpenCode's default model.
+FRIDAY_NARRATOR_OPENCODE_MODEL=provider/model
+FRIDAY_NARRATOR_OPENCODE_AGENT=build
+```
 
-Vite + React, TypeScript strict. No Next.js.
+The OpenCode backend creates a short-lived session for each narrator decision,
+asks for the same schema-shaped JSON object, denies discovered tools by default,
+and deletes the temporary session after parsing the response.
 
-Pages:
-- `/` — `SessionsList.tsx`: REST-backed list. No voice-ui-kit imports.
-- `/s/:id` — `VoiceRoom.tsx`: composes `voice-ui-kit` primitives with session header. Only page that imports voice-ui-kit.
-- `/s/:id/transcript` — `SessionView.tsx`: read-only transcript. No voice-ui-kit imports.
+To compare narrator LLM backends against the same sample snapshots:
 
-`hooks/useVoiceState.ts` wraps voice-ui-kit hooks. All voice-ui-kit coupling is confined to `VoiceRoom.tsx` and this hook.
+```bash
+uv run python scripts/probe-narrator-llms.py --trials 2
+```
 
-App state flows through REST + SSE (`/sessions/:id/events`). RTVI is not used for app data.
+The probe auto-selects `opencode-go/deepseek-v4-flash` when that model is
+available from the local OpenCode server.
 
-Reference: `~/Projects/voice-ui-kit/examples/04-vite/` for how to wire voice-ui-kit in a Vite app.
+## Production hosting
 
----
+For the sas cutover, build the frontend and serve it from FastAPI rather than
+running Vite in production:
 
-## Testing approach
+```dotenv
+FRIDAY_WEB_DIST=/home/sas/projects/friday/web/dist
+FRIDAY_CORS_ORIGINS=https://friday.ultron.sh
+```
 
-**Every change must be tested before reporting done.** This means:
+Use separate LiveKit URLs in production. The backend and agent should talk to
+LiveKit locally, while the browser receives the Cloudflare WSS hostname:
 
-- `core/` modules: run `pytest` against the specific module. Spin a subagent, call real functions, assert real behavior.
-- `api/` routes: start FastAPI with `uvicorn`, hit endpoints with `httpx`, verify JSON shape and SSE stream events.
-- `voice/` integration: this requires audio — test the pipeline connection lifecycle (connect, send a text frame, verify TTS output frame, disconnect) without needing a real microphone.
-- Frontend: start dev server (`pnpm dev`), open in browser, exercise the golden path.
+```dotenv
+LIVEKIT_URL=ws://127.0.0.1:7880
+LIVEKIT_INTERNAL_URL=ws://127.0.0.1:7880
+LIVEKIT_PUBLIC_URL=wss://friday-livekit.ultron.sh
+FRIDAY_API_BASE_URL=http://127.0.0.1:8765
+```
 
-Do not report a feature working based on reading the code. Run it.
+`friday-livekit.ultron.sh` must not sit behind the normal Cloudflare Access
+login wall; LiveKit room JWTs authenticate room joins. See
+`livekit.production.example.yaml` for the expected self-hosted LiveKit port
+shape.
 
----
+For stale local dev processes, use:
 
-## Linting and type rules
+```bash
+make refresh
+```
 
-- Python: `ruff` for linting, `mypy` with `strict=true`. No `# type: ignore` without a comment explaining why.
-- TypeScript: `strict: true` in tsconfig. No `any` without justification.
-- Max function length: 40 lines. If a function is longer, split it.
-- Max file length: 300 lines. If a file is longer, extract a module.
-- These limits are enforced by CI. Don't leave violations expecting a separate cleanup pass.
+That resets local API/agent/web processes and ensures LiveKit is running without
+tearing down Docker. Use `make nuke` only when you want to stop LiveKit too.
+The default API command intentionally runs without hot reload so code edits do
+not interrupt live voice turns. Use `make api-reload` only when you explicitly
+want FastAPI reload behavior.
 
----
+Each `make refresh` run writes durable logs under `.friday/runs/<run-id>/` and
+updates `.friday/runs/current` plus `.friday/logs/current` to point at the latest
+run. The compatibility paths `.friday/logs/api.log`, `.friday/logs/agent.log`,
+`.friday/logs/opencode.log`, and `.friday/logs/web.log` point at the current
+run's logs. From any Codex session, use:
 
-## Anti-patterns — avoid these
+```bash
+make logs
+```
 
-- Session state on a `FrameProcessor` instance — state lives in `OpencodeSession` and sqlite, not on the pipeline
-- RTVI custom messages for app data — use REST/SSE on dedicated endpoints
-- `pipecat.frames` imports outside `voice/`
-- Letting one page component own both session logic and voice UI — compose primitives
-- Pipecat-specific event shapes in sqlite — use the typed events from `core/events.py`
+That prints the current run metadata and recent tails for OpenCode, FastAPI, the
+LiveKit agent, and the frontend.
 
----
+ElevenLabs realtime STT is configured with provider-side VAD by default:
 
-## Reference repos
+```dotenv
+ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS=0.3
+ELEVENLABS_MIN_SILENCE_DURATION_MS=300
+FRIDAY_COMMIT_STT_FLUSH_DURATION_SECS=0.3
+```
 
-| Repo | What to read |
-|------|--------------|
-| `~/Projects/pipecat` | `examples/transports/transports-small-webrtc.py`, `src/pipecat/transports/smallwebrtc/` |
-| `~/Projects/voice-ui-kit` | `examples/04-vite/` |
-| `~/Projects/friday/backend/src` | `agent/opencodeAdapter.ts` (port to core/opencode_session.py), `pipelines/speakingPolicy.ts`, `pipelines/ttsChunker.ts` |
+That keeps ElevenLabs committing transcript segments on short pauses instead of
+waiting for its long automatic commit path. Friday still treats the user turn as
+complete only when the browser sends `end_turn`.
 
-The friday `wsServer.ts`, `protocol.ts`, `stt/`, `tts/`, and all frontend code are **discarded** — replaced by pipecat + voice-ui-kit.
+For Docker-based local development, `docker-compose.yml` starts LiveKit with
+`--node-ip 127.0.0.1` so same-host browser clients receive reachable ICE
+candidates instead of the container bridge IP.
 
----
+## Checks
 
-## Build steps (in order)
+```bash
+uv run mypy
+cd web && npm run typecheck && npm run build
+```
 
-Each step is independently testable without touching audio.
+## Self-Test
 
-1. **`core/opencode_session.py`** — port the opencode SSE adapter, CLI harness (`friday attach <id>`)
-2. **`core/session_registry.py` + sqlite** — persistence, `friday list` / `friday new`
-3. **`api/sessions.py`** — REST + SSE surface
-4. **`voice/`** — pipecat pipeline, WebRTC signaling
-5. **`web/`** — Vite frontend
+With LiveKit, the API, the agent, and the web dev server running, the app can
+drive a real voice turn through Playwright:
 
-Do not start step N until step N-1 passes its tests.
+```bash
+cd web
+npm run friday:self-test -- --headless
+```
+
+From the repo root, the same check is available as:
+
+```bash
+make self-test
+```
+
+The runner generates speech with `say`, feeds it to Chromium as a fake
+microphone, holds the room's push-to-talk button, and waits for a provider
+`text_final` response. It writes screenshots plus `summary.json` and
+`timeline.jsonl` under `artifacts/self-tests/`. See
+`web/scripts/SELF-TEST.md` for flags and prerequisites.

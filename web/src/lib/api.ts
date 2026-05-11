@@ -1,27 +1,19 @@
-import { fridayBaseUrl } from './env';
-
-// The *only* file allowed to touch global fetch — enforced by ESLint's
-// no-restricted-syntax rule. Every other module goes through the
-// helpers below.
-//
-// Why a wrapper at all: keeps JSON parsing, error surfacing, and
-// auth-header injection in one place. When Step 6 lands a bearer
-// token, this is the one file that changes.
+import { fridayBaseUrl } from '@/lib/env';
 
 export interface ApiError extends Error {
-  status: number;
   body: unknown;
+  status: number;
 }
 
-class ApiErrorImpl extends Error implements ApiError {
-  status: number;
+class HttpError extends Error implements ApiError {
   body: unknown;
+  status: number;
 
   constructor(message: string, status: number, body: unknown) {
     super(message);
     this.name = 'ApiError';
-    this.status = status;
     this.body = body;
+    this.status = status;
   }
 }
 
@@ -34,68 +26,89 @@ export function isApiError(error: unknown): error is ApiError {
   );
 }
 
-export function apiUrl(path: string): string {
-  if (!path.startsWith('/')) {
-    throw new Error(`api path must start with "/": ${path}`);
+export function getErrorMessage(error: unknown): string {
+  if (isApiError(error)) {
+    return error.message;
   }
-  return `${fridayBaseUrl}${path}`;
+
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  return 'Something went wrong while talking to the API.';
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const url = apiUrl(path);
-  const init: RequestInit = {
-    method,
+  const response = await fetch(buildApiUrl(path), {
+    body: body === undefined ? undefined : JSON.stringify(body),
     headers: {
       Accept: 'application/json',
-      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
     },
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-  };
+    method,
+  });
 
-  const res = await fetch(url, init);
-
-  // 202/204 may be empty — return undefined typed as T; the caller's
-  // type contract owns whether that's safe.
-  if (res.status === 204) {
+  if (response.status === 204) {
     return undefined as T;
   }
 
-  let parsed: unknown = null;
-  const text = await res.text();
-  if (text) {
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      // Non-JSON body — keep the raw text on the error for context.
-      parsed = text;
+  const text = await response.text();
+  const payload = parseResponseBody(text);
+
+  if (!response.ok) {
+    throw new HttpError(resolveErrorMessage(payload, response), response.status, payload);
+  }
+
+  return payload as T;
+}
+
+function buildApiUrl(path: string): string {
+  if (!path.startsWith('/')) {
+    throw new Error(`API paths must start with "/". Received "${path}".`);
+  }
+
+  return `${fridayBaseUrl}${path}`;
+}
+
+function parseResponseBody(body: string): unknown {
+  if (!body) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(body) as unknown;
+  } catch {
+    return body;
+  }
+}
+
+function resolveErrorMessage(body: unknown, response: Response): string {
+  if (typeof body === 'string' && body.trim()) {
+    return body;
+  }
+
+  const record = typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : null;
+  if (record) {
+    const detail = record.detail;
+    if (typeof detail === 'string' && detail.trim()) {
+      return detail;
     }
   }
 
-  if (!res.ok) {
-    const message =
-      parsed &&
-      typeof parsed === 'object' &&
-      'detail' in parsed &&
-      typeof parsed.detail === 'string'
-        ? parsed.detail
-        : `${res.status.toString()} ${res.statusText}`;
-    throw new ApiErrorImpl(message, res.status, parsed);
-  }
-
-  return parsed as T;
+  return `${response.status} ${response.statusText}`;
 }
 
 export const apiClient = {
+  delete<T>(path: string): Promise<T> {
+    return request<T>('DELETE', path);
+  },
   get<T>(path: string): Promise<T> {
     return request<T>('GET', path);
-  },
-  post<T>(path: string, body?: unknown): Promise<T> {
-    return request<T>('POST', path, body);
   },
   patch<T>(path: string, body?: unknown): Promise<T> {
     return request<T>('PATCH', path, body);
   },
-  delete<T>(path: string): Promise<T> {
-    return request<T>('DELETE', path);
+  post<T>(path: string, body?: unknown): Promise<T> {
+    return request<T>('POST', path, body);
   },
 };
