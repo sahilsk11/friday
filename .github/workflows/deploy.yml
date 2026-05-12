@@ -38,6 +38,7 @@ jobs:
 
       - name: run friday playbook role
         env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN_FOR_OVERLORD }}
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
           ansible-playbook ansible/playbook.yml -i ansible/inventory.yml \
