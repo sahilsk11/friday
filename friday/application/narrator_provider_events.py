@@ -6,7 +6,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from friday.application.narrator_state import NarrationState
-from friday.domain.repositories import NarratorRepository, StoredNarratorEvent, StoredSession
+from friday.application.narrator_turns import ProviderFinalRecord
+from friday.domain.repositories import (
+    NarratorRepository,
+    StoredNarratorEvent,
+    StoredSession,
+)
 from friday.domain.state import AgentState
 
 
@@ -18,12 +23,14 @@ class ProviderEventIngestor:
         get_narration_state: Callable[[str], NarrationState],
         schedule_progress: Callable[..., None],
         cancel_progress: Callable[[str], None],
+        record_provider_final: Callable[..., ProviderFinalRecord | None],
         emit_final_for_text: Callable[..., Awaitable[StoredNarratorEvent | None]],
     ) -> None:
         self._store = store
         self._get_narration_state = get_narration_state
         self._schedule_progress = schedule_progress
         self._cancel_progress = cancel_progress
+        self._record_provider_final = record_provider_final
         self._emit_final_for_text = emit_final_for_text
 
     async def on_text_delta(self, stored: StoredSession, text: str) -> None:
@@ -37,28 +44,24 @@ class ProviderEventIngestor:
             return
         self._cancel_progress(stored.id)
         state = self._get_narration_state(stored.id)
-        turn_id = state.active_turn_id
-        provider_event = self._store.append_provider_event(
-            session_id=stored.id,
-            provider_session_id=stored.provider_session_id,
-            event_type="final",
-            summary=text,
-            payload={"turn_id": turn_id} if turn_id is not None else None,
+        provider_final = self._record_provider_final(
+            stored=stored,
+            final_text=text,
+            active_turn_id=state.active_turn_id,
         )
-        if turn_id is not None:
-            self._store.mark_turn_provider_final(
-                turn_id=turn_id,
-                provider_final_text=text,
-                provider_final_event_id=provider_event.id,
-            )
+        if provider_final is None:
+            return
         await self._emit_final_for_text(
             stored,
-            final_text=text,
-            turn_id=turn_id,
+            final_text=provider_final.final_text,
+            turn_id=provider_final.turn_id,
             source="narrator_final",
-            extra_payload={"provider_session_id": stored.provider_session_id},
+            extra_payload={
+                "provider_session_id": stored.provider_session_id,
+                "provider_final_event_id": provider_final.provider_final_event_id,
+            },
         )
-        if state.active_turn_id == turn_id:
+        if state.active_turn_id == provider_final.turn_id:
             state.active_turn_id = None
 
     async def on_reasoning(self, stored: StoredSession, text: str) -> None:
