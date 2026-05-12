@@ -77,7 +77,6 @@ class NarratorManager:
         )
         self._recovery = NarratorRecoveryService(
             store=store,
-            require_provider=self._require_provider,
             emit_final_for_text=self._emit_final_for_text,
         )
 
@@ -333,6 +332,13 @@ class NarratorManager:
         source: str,
         extra_payload: dict[str, Any] | None = None,
     ) -> StoredNarratorEvent | None:
+        if turn_id is None:
+            logger.warning(
+                "dropping narrator final without turn id | session=%s source=%s",
+                stored.id,
+                source,
+            )
+            return None
         snapshot = self._snapshot_builder.build(
             stored,
             decision_type="final_response",

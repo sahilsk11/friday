@@ -436,7 +436,6 @@ def create_app() -> FastAPI:
     ) -> NarratorEventsResponse:
         manager = get_narrator_manager(fastapi_request)
         try:
-            await manager.recover_missing_final(session_id)
             events = manager.list_events(
                 session_id=session_id,
                 after_id=max(after_id, 0),
