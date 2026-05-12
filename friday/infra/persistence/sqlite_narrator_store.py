@@ -463,6 +463,30 @@ class NarratorStore(NarratorRepository):
             )
         return _parse_turn(row) if row is not None else None
 
+    def latest_active_turn(
+        self,
+        *,
+        session_id: str,
+        provider_session_id: str,
+    ) -> StoredTurn | None:
+        with self._lock:
+            row = (
+                self._require_conn()
+                .execute(
+                    """
+                SELECT * FROM narrator_turns
+                WHERE session_id = ?
+                  AND provider_session_id = ?
+                  AND status NOT IN ('completed', 'cancelled', 'error')
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                    (session_id, provider_session_id),
+                )
+                .fetchone()
+            )
+        return _parse_turn(row) if row is not None else None
+
     def update_turn_status(
         self,
         *,
@@ -570,33 +594,6 @@ class NarratorStore(NarratorRepository):
             )
         turns = [_parse_turn(row) for row in rows]
         return [turn for turn in turns if turn.updated_at.timestamp() <= cutoff]
-
-    def turns_missing_provider_final(
-        self,
-        *,
-        session_id: str,
-        min_age_seconds: float,
-        limit: int = 5,
-    ) -> list[StoredTurn]:
-        cutoff = utc_now().timestamp() - min_age_seconds
-        with self._lock:
-            rows = (
-                self._require_conn()
-                .execute(
-                    """
-                SELECT * FROM narrator_turns
-                WHERE session_id = ?
-                  AND provider_final_text IS NULL
-                  AND status IN ('submitted', 'running')
-                ORDER BY created_at ASC
-                LIMIT ?
-                """,
-                    (session_id, limit),
-                )
-                .fetchall()
-            )
-        turns = [_parse_turn(row) for row in rows]
-        return [turn for turn in turns if turn.created_at.timestamp() <= cutoff]
 
     def _touch_session(self, session_id: str, now: datetime) -> None:
         self._require_conn().execute(

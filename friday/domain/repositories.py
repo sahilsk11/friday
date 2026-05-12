@@ -173,6 +173,13 @@ class TurnRepository(Protocol):
 
     def latest_turn(self, session_id: str) -> StoredTurn | None: ...
 
+    def latest_active_turn(
+        self,
+        *,
+        session_id: str,
+        provider_session_id: str,
+    ) -> StoredTurn | None: ...
+
     def update_turn_status(
         self,
         *,
@@ -202,14 +209,6 @@ class TurnRepository(Protocol):
         *,
         session_id: str,
         min_provider_final_age_seconds: float,
-        limit: int = 5,
-    ) -> list[StoredTurn]: ...
-
-    def turns_missing_provider_final(
-        self,
-        *,
-        session_id: str,
-        min_age_seconds: float,
         limit: int = 5,
     ) -> list[StoredTurn]: ...
 

@@ -13,6 +13,7 @@ from friday.application.narrator_provider_events import ProviderEventIngestor
 from friday.application.narrator_recovery import NarratorRecoveryService
 from friday.application.narrator_snapshots import NarratorSnapshotBuilder
 from friday.application.narrator_state import NarrationState
+from friday.application.narrator_turns import NarratorTurnLifecycle
 from friday.domain.provider import ModelCatalog, ModelChoice, Provider, ProviderSession, Unsubscribe
 from friday.domain.provider_registry import ProviderRegistry
 from friday.domain.repositories import (
@@ -59,6 +60,7 @@ class NarratorManager:
             get_narration_state=self._narration_state,
             get_provider_state=self._current_provider_state,
         )
+        self._turns = NarratorTurnLifecycle(store=store)
         self._progress = NarratorProgressScheduler(
             store=store,
             brain=self._brain,
@@ -73,11 +75,11 @@ class NarratorManager:
             get_narration_state=self._narration_state,
             schedule_progress=self._progress.schedule,
             cancel_progress=self._progress.cancel,
+            record_provider_final=self._turns.record_provider_final,
             emit_final_for_text=self._emit_final_for_text,
         )
         self._recovery = NarratorRecoveryService(
             store=store,
-            require_provider=self._require_provider,
             emit_final_for_text=self._emit_final_for_text,
         )
 
@@ -177,16 +179,9 @@ class NarratorManager:
         narration_state.last_progress_reasoning_event_id = None
         narration_state.active_turn_id = turn_id
 
-        self._store.append_message(
-            session_id=session_id,
-            role="user",
-            content=text,
-            source=source,
-        )
-        self._store.create_turn(
+        self._turns.start_turn(
+            stored=stored,
             turn_id=turn_id,
-            session_id=session_id,
-            provider_session_id=stored.provider_session_id,
             user_text=text,
             source=source,
         )
@@ -245,10 +240,10 @@ class NarratorManager:
         self._require_session(session_id)
         return self._store.update_session_title(session_id=session_id, title=title)
 
-    async def recover_missing_final(self, session_id: str) -> None:
+    async def recover_missing_final(self, session_id: str) -> list[StoredNarratorEvent]:
         stored = self._require_session(session_id)
         await self._bind_provider(stored)
-        await self._recovery.recover_missing_final(stored)
+        return await self._recovery.recover_missing_final(stored)
 
     async def _resolve_provider(self, *, session_id: str | None, harness: str | None) -> Provider:
         if harness is not None:
@@ -333,6 +328,13 @@ class NarratorManager:
         source: str,
         extra_payload: dict[str, Any] | None = None,
     ) -> StoredNarratorEvent | None:
+        if turn_id is None:
+            logger.warning(
+                "dropping narrator final without turn id | session=%s source=%s",
+                stored.id,
+                source,
+            )
+            return None
         snapshot = self._snapshot_builder.build(
             stored,
             decision_type="final_response",
@@ -362,7 +364,7 @@ class NarratorManager:
         if turn_id is not None:
             self._store.mark_turn_completed(
                 turn_id=turn_id,
-                narrator_final_text=decision.text,
+                narrator_final_text=event.text or decision.text,
                 narrator_final_event_id=event.id,
             )
         return event
