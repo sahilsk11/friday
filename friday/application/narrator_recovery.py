@@ -19,14 +19,15 @@ class NarratorRecoveryService:
         self._store = store
         self._emit_final_for_text = emit_final_for_text
 
-    async def recover_missing_final(self, stored: StoredSession) -> None:
+    async def recover_missing_final(self, stored: StoredSession) -> list[StoredNarratorEvent]:
+        recovered: list[StoredNarratorEvent] = []
         for turn in self._store.recoverable_turns(
             session_id=stored.id,
             min_provider_final_age_seconds=_FINAL_RECOVERY_MIN_AGE_SECS,
         ):
             if not turn.provider_final_text:
                 continue
-            await self._emit_final_for_text(
+            event = await self._emit_final_for_text(
                 stored,
                 final_text=turn.provider_final_text,
                 turn_id=turn.id,
@@ -36,6 +37,9 @@ class NarratorRecoveryService:
                     "recovered_provider_event_id": turn.provider_final_event_id,
                 },
             )
+            if event is not None:
+                recovered.append(event)
+        return recovered
 
 
 __all__ = ["NarratorRecoveryService"]

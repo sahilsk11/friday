@@ -434,12 +434,7 @@ def create_app() -> FastAPI:
     ) -> NarratorEventsResponse:
         manager = get_narrator_manager(fastapi_request)
         try:
-            await manager.recover_missing_final(session_id)
-            events = manager.list_events(
-                session_id=session_id,
-                after_id=0,
-                limit=100,
-            )
+            events = await manager.recover_missing_final(session_id)
         except KeyError as err:
             raise HTTPException(status_code=404, detail=f"unknown session: {session_id!r}") from err
         return NarratorEventsResponse(
