@@ -424,6 +424,28 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=f"unknown session: {session_id!r}") from err
         return NarratorEventsResponse(events=[_narrator_event_response(event)])
 
+    @app.post(
+        "/api/narrator/sessions/{session_id}/recover-final",
+        response_model=NarratorEventsResponse,
+    )
+    async def recover_narrator_final(
+        session_id: str,
+        fastapi_request: Request,
+    ) -> NarratorEventsResponse:
+        manager = get_narrator_manager(fastapi_request)
+        try:
+            await manager.recover_missing_final(session_id)
+            events = manager.list_events(
+                session_id=session_id,
+                after_id=0,
+                limit=100,
+            )
+        except KeyError as err:
+            raise HTTPException(status_code=404, detail=f"unknown session: {session_id!r}") from err
+        return NarratorEventsResponse(
+            events=[_narrator_event_response(event) for event in events],
+        )
+
     @app.get(
         "/api/narrator/sessions/{session_id}/events",
         response_model=NarratorEventsResponse,

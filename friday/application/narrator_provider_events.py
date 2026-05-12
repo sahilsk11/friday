@@ -6,7 +6,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from friday.application.narrator_state import NarrationState
-from friday.domain.repositories import NarratorRepository, StoredNarratorEvent, StoredSession
+from friday.domain.repositories import (
+    NarratorRepository,
+    StoredNarratorEvent,
+    StoredSession,
+    StoredTurn,
+)
 from friday.domain.state import AgentState
 
 
@@ -37,7 +42,7 @@ class ProviderEventIngestor:
             return
         self._cancel_progress(stored.id)
         state = self._get_narration_state(stored.id)
-        turn_id = state.active_turn_id
+        turn_id = self._resolve_final_turn_id(stored, state)
         provider_event = self._store.append_provider_event(
             session_id=stored.id,
             provider_session_id=stored.provider_session_id,
@@ -60,6 +65,19 @@ class ProviderEventIngestor:
         )
         if state.active_turn_id == turn_id:
             state.active_turn_id = None
+
+    def _resolve_final_turn_id(
+        self,
+        stored: StoredSession,
+        state: NarrationState,
+    ) -> str | None:
+        if state.active_turn_id is not None:
+            return state.active_turn_id
+        latest_turn = self._store.latest_turn(stored.id)
+        if not _is_active_provider_turn(latest_turn, stored):
+            return None
+        assert latest_turn is not None
+        return latest_turn.id
 
     async def on_reasoning(self, stored: StoredSession, text: str) -> None:
         summary = _summarize_reasoning(text)
@@ -141,6 +159,14 @@ class ProviderEventIngestor:
 
 
 __all__ = ["ProviderEventIngestor"]
+
+
+def _is_active_provider_turn(turn: StoredTurn | None, stored: StoredSession) -> bool:
+    if turn is None:
+        return False
+    if turn.provider_session_id != stored.provider_session_id:
+        return False
+    return turn.status not in {"completed", "cancelled", "error"}
 
 
 def _summarize_reasoning(text: str) -> str | None:
