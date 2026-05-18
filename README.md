@@ -1,6 +1,9 @@
-# Friday LiveKit PoC
+# Friday
 
-Minimal greenfield LiveKit proof of concept for Friday voice sessions.
+Friday is a LiveKit-powered voice workspace for coding sessions. It pairs a
+browser voice room with a FastAPI backend, a Python LiveKit agent, provider
+adapters for coding tools, durable transcript/session state, and narrator logic
+that turns provider activity into spoken feedback.
 
 ## Architecture
 
