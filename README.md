@@ -10,7 +10,7 @@ that turns provider activity into spoken feedback.
 - LiveKit media server runs as a separate service.
 - Friday FastAPI backend creates Friday sessions and LiveKit room tokens.
 - Each Friday session maps to one LiveKit room.
-- Browser joins the room with `livekit-client`, publishes microphone audio, and sends push-to-talk commands to the agent over LiveKit RPC.
+- Browser joins the room with `livekit-client`, publishes microphone audio, and sends turn-control commands to the agent over LiveKit RPC.
 - Python LiveKit agent joins each room through LiveKit Agents automatic dispatch.
 - Agent uses ElevenLabs STT with provider-side VAD commits and logs Friday turn commits.
 - FastAPI owns the narrator bridge, persists Friday's spoken transcript, forwards
@@ -184,7 +184,7 @@ make self-test
 ```
 
 The runner generates speech with `say`, feeds it to Chromium as a fake
-microphone, holds the room's push-to-talk button, and waits for a provider
+microphone, toggles the room's talk button, and waits for a provider
 `text_final` response. It writes screenshots plus `summary.json` and
 `timeline.jsonl` under `artifacts/self-tests/`. See
 `web/scripts/SELF-TEST.md` for flags and prerequisites.

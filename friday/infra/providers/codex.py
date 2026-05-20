@@ -284,7 +284,7 @@ _CODEX_MODELS: list[ModelInfo] = [
         provider_id="openai",
         provider_name="OpenAI",
         model_id="gpt-5.5",
-        model_name="GPT-5.5",
+        model_name="GPT-5.5 Codex",
     ),
     ModelInfo(
         provider_id="openai",
@@ -303,6 +303,12 @@ _CODEX_MODELS: list[ModelInfo] = [
         provider_name="OpenAI",
         model_id="gpt-5.3-codex",
         model_name="GPT-5.3 Codex",
+    ),
+    ModelInfo(
+        provider_id="openai",
+        provider_name="OpenAI",
+        model_id="gpt-5.3-codex-spark",
+        model_name="GPT-5.3 Codex Spark",
     ),
     ModelInfo(
         provider_id="openai",

@@ -301,6 +301,9 @@ function FridayRoomLayout({
     microphoneTrack,
   } = useLocalParticipant();
   const [isHolding, setIsHolding] = useState(false);
+  const [turnControlPending, setTurnControlPending] = useState<
+    "starting" | "ending" | null
+  >(null);
   const [audioPlaybackReady, setAudioPlaybackReady] = useState(false);
   const [activeConversationTab, setActiveConversationTab] =
     useState<ConversationTab>("narrator");
@@ -327,7 +330,6 @@ function FridayRoomLayout({
   const hasAgentParticipant = Boolean(primaryAgent);
   const narratorEventCursorRef = useRef(0);
   const seenNarratorEventIdsRef = useRef(new Set<number>());
-  const keyboardTurnActiveRef = useRef(false);
   const narratorFeedRef = useRef<HTMLDivElement | null>(null);
   const providerFeedRef = useRef<HTMLDivElement | null>(null);
 
@@ -743,7 +745,7 @@ function FridayRoomLayout({
   useEffect(() => {
     if (connectionState !== ConnectionState.Connected) {
       setIsHolding(false);
-      keyboardTurnActiveRef.current = false;
+      setTurnControlPending(null);
       setVoiceStage(
         "idle",
         connectionState === ConnectionState.Disconnected
@@ -871,7 +873,11 @@ function FridayRoomLayout({
   }, [lastMicrophoneError, onLog]);
 
   const startTurn = useCallback(async () => {
-    if (connectionState !== ConnectionState.Connected || isHolding) {
+    if (
+      connectionState !== ConnectionState.Connected ||
+      isHolding ||
+      turnControlPending !== null
+    ) {
       return;
     }
 
@@ -888,6 +894,7 @@ function FridayRoomLayout({
     }
 
     try {
+      setTurnControlPending("starting");
       setVoiceStage("starting", "Opening the microphone.");
       console.info("[Friday voice] start_turn requested");
       if (!isMicrophoneEnabled) {
@@ -917,6 +924,8 @@ function FridayRoomLayout({
             ? error.message
             : "LiveKit rejected the turn start request.",
       });
+    } finally {
+      setTurnControlPending(null);
     }
   }, [
     callTurnControlRpc,
@@ -927,14 +936,20 @@ function FridayRoomLayout({
     localParticipant,
     onLog,
     setVoiceStage,
+    turnControlPending,
   ]);
 
   const endTurn = useCallback(async () => {
-    if (connectionState !== ConnectionState.Connected || !isHolding) {
+    if (
+      connectionState !== ConnectionState.Connected ||
+      !isHolding ||
+      turnControlPending !== null
+    ) {
       return;
     }
 
     try {
+      setTurnControlPending("ending");
       setIsHolding(false);
       setVoiceStage("sending", "Sending the end-of-turn command.");
       console.info("[Friday voice] end_turn requested");
@@ -961,6 +976,8 @@ function FridayRoomLayout({
             ? error.message
             : "LiveKit rejected the turn end request.",
       });
+    } finally {
+      setTurnControlPending(null);
     }
   }, [
     callTurnControlRpc,
@@ -969,7 +986,17 @@ function FridayRoomLayout({
     localParticipant,
     onLog,
     setVoiceStage,
+    turnControlPending,
   ]);
+
+  const toggleTurn = useCallback(() => {
+    if (isHolding) {
+      void endTurn();
+      return;
+    }
+
+    void startTurn();
+  }, [endTurn, isHolding, startTurn]);
 
   const cancelTurn = useCallback(async () => {
     if (connectionState !== ConnectionState.Connected) {
@@ -978,6 +1005,7 @@ function FridayRoomLayout({
 
     try {
       setIsHolding(false);
+      setTurnControlPending(null);
       setVoiceStage("idle", "Cancelling the active turn.");
       await callTurnControlRpc("cancel_turn");
       await localParticipant.setMicrophoneEnabled(false);
@@ -1151,6 +1179,7 @@ function FridayRoomLayout({
 
   const disconnectVoice = useCallback(async () => {
     setIsHolding(false);
+    setTurnControlPending(null);
     setVoiceStage("idle", "Voice is disconnecting.");
     try {
       await localParticipant.setMicrophoneEnabled(false);
@@ -1169,6 +1198,7 @@ function FridayRoomLayout({
 
   const reconnectVoice = useCallback(() => {
     onConnectionRequestedChange(true);
+    setTurnControlPending(null);
     setVoiceStage("idle", "Reconnecting voice.");
     onLog({
       title: "Reconnecting voice",
@@ -1187,10 +1217,7 @@ function FridayRoomLayout({
 
       if (event.code === "Space") {
         event.preventDefault();
-        if (!keyboardTurnActiveRef.current) {
-          keyboardTurnActiveRef.current = true;
-          void startTurn();
-        }
+        void toggleTurn();
       }
 
       if (event.key === "Escape") {
@@ -1199,30 +1226,11 @@ function FridayRoomLayout({
       }
     };
 
-    const handleKeyUp = (event: KeyboardEvent) => {
-      if (event.code !== "Space") {
-        return;
-      }
-      if (isTextEntryTarget(event.target)) {
-        return;
-      }
-
-      event.preventDefault();
-      if (!keyboardTurnActiveRef.current) {
-        return;
-      }
-
-      keyboardTurnActiveRef.current = false;
-      void endTurn();
-    };
-
     window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [cancelTurn, endTurn, startTurn]);
+  }, [cancelTurn, toggleTurn]);
 
   const connectionTone =
     connectionState === ConnectionState.Connected
@@ -1348,23 +1356,19 @@ function FridayRoomLayout({
             className="friday-room__button friday-room__button--primary"
             disabled={
               connectionState !== ConnectionState.Connected ||
-              !hasAgentParticipant
+              !hasAgentParticipant ||
+              turnControlPending !== null
             }
-            onPointerCancel={() => void cancelTurn()}
-            onPointerDown={(event) => {
-              event.preventDefault();
-              event.currentTarget.setPointerCapture(event.pointerId);
-              void startTurn();
-            }}
-            onPointerUp={(event) => {
-              if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                event.currentTarget.releasePointerCapture(event.pointerId);
-              }
-              void endTurn();
-            }}
+            onClick={toggleTurn}
             type="button"
           >
-            {isHolding ? "Release to send" : "Start (space)"}
+            {turnControlPending === "starting"
+              ? "Starting..."
+              : turnControlPending === "ending"
+                ? "Sending..."
+                : isHolding
+                  ? "Send"
+                  : "Start"}
           </button>
 
           <button
@@ -1947,7 +1951,7 @@ function getRoomStatus({
 
   if (isHolding) {
     return {
-      description: "Microphone is hot. Release to send the turn.",
+      description: "Microphone is hot. Tap send to finish the turn.",
       label: "listening",
     };
   }

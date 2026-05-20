@@ -12,7 +12,7 @@ import { useHarnessesQuery, useModelsQuery } from '@/features/sessions/hooks';
 import { getErrorMessage } from '@/lib/api';
 import { sessionQueryKeys, type SessionRouteState } from '@/types/api';
 
-const DEFAULT_DIRECTORY = '/Users/sahil/portfolio/friday-v3';
+const DEFAULT_DIRECTORY = '/home/sahil/projects';
 
 interface NewSessionModalProps {
   onOpenChange: (open: boolean) => void;
