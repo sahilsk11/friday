@@ -477,28 +477,20 @@ async function fillCreateSessionForm(page) {
 }
 
 async function holdToTalk(page) {
-  const talkButton = page.getByRole("button", { name: /start|hold to talk/i });
+  const talkButton = page.getByRole("button", { name: /^start$/i });
   await talkButton.waitFor({ state: "visible", timeout: 30_000 });
   await expectEnabled(talkButton, 30_000);
 
   await waitForAgent(page);
   await screenshot(page, "before-hold");
 
-  const box = await talkButton.boundingBox();
-  if (!box) {
-    throw new Error(
-      "Push-to-talk button did not have a clickable bounding box.",
-    );
-  }
-
   trace("hold-start", { holdMs: HOLD_MS });
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await page.mouse.down();
+  await talkButton.click();
   await page.waitForTimeout(750);
   observed.openedTurn = true;
   trace("hold-opened", summarizeUi(await readUi(page)));
   await page.waitForTimeout(HOLD_MS);
-  await page.mouse.up();
+  await page.getByRole("button", { name: /^send$/i }).click();
   observed.sentTurn = true;
   trace("hold-complete", summarizeUi(await readUi(page)));
   await screenshot(page, "after-release");
@@ -598,7 +590,7 @@ async function expectEnabled(locator, timeoutMs) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(
-    "Timed out waiting for hold-to-talk button to become enabled.",
+    "Timed out waiting for talk button to become enabled.",
   );
 }
 
